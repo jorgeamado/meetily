@@ -30,3 +30,23 @@ export function isOllamaNotInstalledError(errorMessage: string): boolean {
 
   return patterns.some(pattern => lowerError.includes(pattern));
 }
+
+const SPEAKER_COLOR_CLASSES = [
+  'text-blue-500',
+  'text-purple-500',
+  'text-emerald-500',
+  'text-amber-500',
+  'text-pink-500',
+  'text-cyan-500',
+];
+
+/**
+ * Deterministically maps a speaker label to a subtle, stable Tailwind text color class.
+ */
+export function getSpeakerColorClass(speaker: string): string {
+  let hash = 0;
+  for (let i = 0; i < speaker.length; i++) {
+    hash = (hash * 31 + speaker.charCodeAt(i)) | 0;
+  }
+  return SPEAKER_COLOR_CLASSES[Math.abs(hash) % SPEAKER_COLOR_CLASSES.length];
+}

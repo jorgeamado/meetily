@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { RefreshCw, Globe, Loader2, AlertCircle, CheckCircle2, X, Cpu } from 'lucide-react';
+import { RefreshCw, Globe, Loader2, AlertCircle, CheckCircle2, X, Cpu, Users } from 'lucide-react';
 import {
   Dialog,
   DialogContent,
@@ -9,6 +9,8 @@ import {
   DialogTitle,
 } from '../ui/dialog';
 import { Button } from '../ui/button';
+import { Switch } from '../ui/switch';
+import { Input } from '../ui/input';
 import {
   Select,
   SelectContent,
@@ -51,6 +53,20 @@ interface RetranscriptionError {
   error: string;
 }
 
+interface DiarizeOptions {
+  enabled: boolean;
+  numSpeakers: number | null;
+  threshold: number | null;
+}
+
+const SENSITIVITY_THRESHOLDS = {
+  merge: 0.65,
+  balanced: 0.5,
+  split: 0.35,
+} as const;
+
+type SensitivityOption = keyof typeof SENSITIVITY_THRESHOLDS;
+
 export function RetranscribeDialog({
   open,
   onOpenChange,
@@ -63,6 +79,9 @@ export function RetranscribeDialog({
   const [progress, setProgress] = useState<RetranscriptionProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedLang, setSelectedLang] = useState(selectedLanguage || 'auto');
+  const [diarizeEnabled, setDiarizeEnabled] = useState(false);
+  const [numSpeakers, setNumSpeakers] = useState('');
+  const [sensitivity, setSensitivity] = useState<SensitivityOption>('balanced');
 
   // Use centralized model fetching hook
   const {
@@ -112,6 +131,9 @@ export function RetranscribeDialog({
       setProgress(null);
       setError(null);
       setSelectedLang(selectedLanguage || 'auto');
+      setDiarizeEnabled(false);
+      setNumSpeakers('');
+      setSensitivity('balanced');
 
       // Fetch available models using centralized hook
       fetchModels();
@@ -208,10 +230,18 @@ export function RetranscribeDialog({
 
     try {
       const languageToSend = isParakeetModel ? null : selectedLang === 'auto' ? null : selectedLang;
+      const parsedNumSpeakers = numSpeakers.trim() === '' ? null : parseInt(numSpeakers, 10);
+      const diarize: DiarizeOptions = {
+        enabled: diarizeEnabled,
+        numSpeakers: diarizeEnabled && parsedNumSpeakers && parsedNumSpeakers > 0 ? parsedNumSpeakers : null,
+        threshold: diarizeEnabled ? SENSITIVITY_THRESHOLDS[sensitivity] : null,
+      };
+
       await Analytics.track('enhance_transcript_started', {
         language: isParakeetModel ? 'auto' : (selectedLang === 'auto' ? 'auto' : selectedLang),
         model_provider: selectedModelDetails?.provider || '',
-        model_name: selectedModelDetails?.name || ''
+        model_name: selectedModelDetails?.name || '',
+        diarize_enabled: diarizeEnabled.toString(),
       });
 
       await invoke('start_retranscription_command', {
@@ -220,6 +250,7 @@ export function RetranscribeDialog({
         language: languageToSend,
         model: selectedModelDetails?.name || null,
         provider: selectedModelDetails?.provider || null,
+        diarize,
       });
     } catch (err: any) {
       setIsProcessing(false);
@@ -357,6 +388,48 @@ export function RetranscribeDialog({
               <p className="text-xs text-muted-foreground">
                 Choose a transcription model
               </p>
+            </div>
+          )}
+
+          {!isProcessing && !error && (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Users className="h-4 w-4 text-muted-foreground" />
+                  <span className="text-sm font-medium">Identify speakers (beta)</span>
+                </div>
+                <Switch checked={diarizeEnabled} onCheckedChange={setDiarizeEnabled} />
+              </div>
+              {diarizeEnabled && (
+                <div className="space-y-3 pl-6">
+                  <div className="space-y-1">
+                    <span className="text-xs font-medium">Number of speakers</span>
+                    <Input
+                      type="number"
+                      min={1}
+                      placeholder="Auto"
+                      value={numSpeakers}
+                      onChange={(e) => setNumSpeakers(e.target.value)}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Leave empty to auto-detect — auto usually works better
+                    </p>
+                  </div>
+                  <div className="space-y-1">
+                    <span className="text-xs font-medium">Sensitivity</span>
+                    <Select value={sensitivity} onValueChange={(v) => setSensitivity(v as SensitivityOption)}>
+                      <SelectTrigger className="w-full">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="merge">Merge-prone (fewer speakers)</SelectItem>
+                        <SelectItem value="balanced">Balanced</SelectItem>
+                        <SelectItem value="split">Split-prone (more speakers)</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+              )}
             </div>
           )}
 

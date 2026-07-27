@@ -1,6 +1,7 @@
 // Retranscription module - allows re-processing stored audio with different settings
 
 use crate::audio::decoder::decode_audio_file;
+use crate::audio::diarization::{self, DiarizeOptions};
 use crate::audio::vad::get_speech_chunks_with_progress;
 use super::common::{create_transcript_segments, split_segment_at_silence, write_transcripts_json};
 use super::constants::AUDIO_EXTENSIONS;
@@ -86,6 +87,12 @@ pub fn cancel_retranscription() {
     RETRANSCRIPTION_CANCELLED.store(true, Ordering::SeqCst);
 }
 
+/// Check whether cancellation has been requested (used by the diarization sidecar
+/// to know when to kill the running helper process)
+pub(crate) fn is_cancellation_requested() -> bool {
+    RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst)
+}
+
 /// Start retranscription of a meeting's audio
 pub async fn start_retranscription<R: Runtime>(
     app: AppHandle<R>,
@@ -94,6 +101,7 @@ pub async fn start_retranscription<R: Runtime>(
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    diarize: Option<DiarizeOptions>,
 ) -> Result<RetranscriptionResult> {
     // Acquire guard - ensures flag is cleared even on panic/early return
     let _guard = RetranscriptionGuard::acquire().map_err(|e| anyhow!(e))?;
@@ -102,7 +110,7 @@ pub async fn start_retranscription<R: Runtime>(
     RETRANSCRIPTION_CANCELLED.store(false, Ordering::SeqCst);
 
     let use_parakeet = provider.as_deref() == Some("parakeet");
-    let result = run_retranscription(app.clone(), meeting_id.clone(), meeting_folder_path, language, model, provider).await;
+    let result = run_retranscription(app.clone(), meeting_id.clone(), meeting_folder_path, language, model, provider, diarize).await;
 
     // Unload the engine after the batch job (success, failure, or cancellation)
     super::common::unload_engine_after_batch(use_parakeet).await;
@@ -176,16 +184,18 @@ async fn run_retranscription<R: Runtime>(
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    diarize: Option<DiarizeOptions>,
 ) -> Result<RetranscriptionResult> {
     let folder_path = PathBuf::from(&meeting_folder_path);
     let audio_path = find_audio_file(&folder_path)?;
 
     // Determine which provider to use (default to whisper)
     let use_parakeet = provider.as_deref() == Some("parakeet");
+    let diarize_opts = diarize.unwrap_or_default();
 
     info!(
-        "Starting retranscription for meeting {} with language {:?}, model {:?}, provider {:?}",
-        meeting_id, language, model, provider
+        "Starting retranscription for meeting {} with language {:?}, model {:?}, provider {:?}, diarize {:?}",
+        meeting_id, language, model, provider, diarize_opts
     );
 
     // Emit progress: decoding
@@ -224,6 +234,13 @@ async fn run_retranscription<R: Runtime>(
     .await
     .map_err(|e| anyhow!("Resample task panicked: {}", e))?;
     info!("Converted to 16kHz mono format: {} samples", audio_samples.len());
+
+    // Keep a copy of the full audio for diarization, which runs independently of VAD/whisper
+    let audio_samples_for_diarization = if diarize_opts.enabled {
+        Some(audio_samples.clone())
+    } else {
+        None
+    };
 
     emit_progress(&app, &meeting_id, "vad", 20, "Detecting speech segments...");
 
@@ -296,7 +313,49 @@ async fn run_retranscription<R: Runtime>(
         return Err(anyhow!("No speech detected in audio file"));
     }
 
-    emit_progress(&app, &meeting_id, "transcribing", 25, "Loading transcription engine...");
+    // Run speaker diarization (if enabled) before transcription. Failures here must
+    // not fail the whole retranscription - we just fall back to no speaker labels.
+    let (transcribe_start, transcribe_span): (u32, u32) = if diarize_opts.enabled { (35, 45) } else { (25, 55) };
+    let mut diarized_segments: Vec<diarization::DiarizedSegment> = Vec::new();
+
+    if let Some(samples) = &audio_samples_for_diarization {
+        emit_progress(&app, &meeting_id, "diarizing", 25, "Identifying speakers...");
+
+        if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
+            return Err(anyhow!("Retranscription cancelled"));
+        }
+
+        let app_for_diarize = app.clone();
+        let meeting_id_for_diarize = meeting_id.clone();
+        let diarize_result = diarization::diarize(samples, &diarize_opts, &app, |pct, msg| {
+            let overall = 25 + (pct * 10 / 100).min(10);
+            emit_progress(&app_for_diarize, &meeting_id_for_diarize, "diarizing", overall, msg);
+        })
+        .await;
+
+        match diarize_result {
+            Ok((segments, num_speakers)) => {
+                info!(
+                    "Speaker diarization found {} speaker(s) across {} segments",
+                    num_speakers,
+                    segments.len()
+                );
+                diarized_segments = segments;
+            }
+            Err(e) => {
+                warn!("Speaker diarization failed, continuing without speaker labels: {}", e);
+                emit_progress(
+                    &app,
+                    &meeting_id,
+                    "diarizing",
+                    35,
+                    "Speaker identification failed, continuing without speaker labels",
+                );
+            }
+        }
+    }
+
+    emit_progress(&app, &meeting_id, "transcribing", transcribe_start, "Loading transcription engine...");
 
     // Initialize the appropriate engine once (not per-segment)
     let whisper_engine = if !use_parakeet {
@@ -345,8 +404,8 @@ async fn run_retranscription<R: Runtime>(
             return Err(anyhow!("Retranscription cancelled"));
         }
 
-        // Calculate progress (25% to 80% range for transcription)
-        let progress = 25 + ((i as f32 / processable_count as f32) * 55.0) as u32;
+        // Calculate progress (transcribe_start% to 80% range for transcription)
+        let progress = transcribe_start + ((i as f32 / processable_count as f32) * transcribe_span as f32) as u32;
         let segment_duration_sec = (segment.end_timestamp_ms - segment.start_timestamp_ms) / 1000.0;
         emit_progress(
             &app,
@@ -440,9 +499,17 @@ async fn run_retranscription<R: Runtime>(
         .map_err(|e| anyhow!("Failed to delete existing transcripts: {}", e))?;
 
     for segment in &segments {
+        let speaker = match (segment.audio_start_time, segment.audio_end_time) {
+            (Some(start), Some(end)) if !diarized_segments.is_empty() => {
+                diarization::assign_speaker_label(start, end, &diarized_segments)
+                    .map(diarization::speaker_label)
+            }
+            _ => None,
+        };
+
         sqlx::query(
-            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration)
-             VALUES (?, ?, ?, ?, ?, ?, ?)"
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
         )
         .bind(&segment.id)
         .bind(&meeting_id)
@@ -451,6 +518,7 @@ async fn run_retranscription<R: Runtime>(
         .bind(segment.audio_start_time)
         .bind(segment.audio_end_time)
         .bind(segment.duration)
+        .bind(speaker)
         .execute(&mut *tx)
         .await
         .map_err(|e| anyhow!("Failed to insert transcript: {}", e))?;
@@ -783,6 +851,7 @@ pub async fn start_retranscription_command<R: Runtime>(
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    diarize: Option<DiarizeOptions>,
 ) -> Result<RetranscriptionStarted, String> {
 
     // Check if retranscription is already in progress (guard will be acquired in start_retranscription)
@@ -802,6 +871,7 @@ pub async fn start_retranscription_command<R: Runtime>(
             language,
             model,
             provider,
+            diarize,
         )
         .await;
 
