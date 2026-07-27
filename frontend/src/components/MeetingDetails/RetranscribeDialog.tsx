@@ -83,12 +83,14 @@ interface DiarizeOptions {
   embeddingModel: string | null;
 }
 
-// Calibrated on a real 4-person call (2026-07-27): lower values fragment
-// real speakers into phantom clusters; 0.9 kept all real speakers separate.
+// Calibrated on a real 4-person call (2026-07-27) with the campplus zh-en
+// advanced model: 0.9 fragmented it into 16 phantom speakers, 1.1 matched the
+// speakers who actually talked, 1.2 over-merged to 2. These values are
+// model-specific; recalibrate if the embedding model changes.
 const SENSITIVITY_THRESHOLDS = {
-  merge: 0.95,
-  balanced: 0.9,
-  split: 0.8,
+  merge: 1.2,
+  balanced: 1.1,
+  split: 1.0,
 } as const;
 
 type SensitivityOption = keyof typeof SENSITIVITY_THRESHOLDS;
