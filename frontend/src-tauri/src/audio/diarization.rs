@@ -5,13 +5,43 @@ use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
 use log::{debug, warn};
 use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, Runtime};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, BufWriter};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::process::Command;
 use uuid::Uuid;
+
+const DIARIZE_PROGRESS_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HelperProgress {
+    Percent(u32),
+    Heartbeat,
+}
+
+fn parse_progress_line(line: &str) -> Option<HelperProgress> {
+    let value: i32 = line.strip_prefix("PROGRESS ")?.trim().parse().ok()?;
+    match value {
+        -1 => Some(HelperProgress::Heartbeat),
+        0..=100 => Some(HelperProgress::Percent(value as u32)),
+        _ => None,
+    }
+}
+
+fn format_elapsed(elapsed: Duration) -> String {
+    let total_secs = elapsed.as_secs();
+    let mins = total_secs / 60;
+    let secs = total_secs % 60;
+    if mins > 0 {
+        format!("{}m {}s", mins, secs)
+    } else {
+        format!("{}s", secs)
+    }
+}
 
 const SEGMENTATION_MODEL_URL: &str =
     "https://huggingface.co/csukuangfj/sherpa-onnx-pyannote-segmentation-3-0/resolve/main/model.onnx";
@@ -89,7 +119,10 @@ pub async fn diarize<R: Runtime>(
         .await
         .with_context(|| format!("Failed to write temp diarization wav: {}", temp_path.display()))?;
 
-    let result = run_diarize_helper(&temp_path, &models, opts).await;
+    let result = run_diarize_helper(&temp_path, &models, opts, |pct, msg| {
+        on_progress(50 + pct / 2, msg);
+    })
+    .await;
     let _ = tokio::fs::remove_file(&temp_path).await;
 
     let output = result?;
@@ -379,7 +412,12 @@ fn resolve_diarize_helper_binary() -> Result<PathBuf> {
     ))
 }
 
-async fn run_diarize_helper(wav_path: &Path, models: &ModelPaths, opts: &DiarizeOptions) -> Result<HelperOutput> {
+async fn run_diarize_helper(
+    wav_path: &Path,
+    models: &ModelPaths,
+    opts: &DiarizeOptions,
+    mut on_progress: impl FnMut(u32, &str) + Send,
+) -> Result<HelperOutput> {
     let binary = resolve_diarize_helper_binary()?;
 
     let mut command = Command::new(&binary);
@@ -408,18 +446,37 @@ async fn run_diarize_helper(wav_path: &Path, models: &ModelPaths, opts: &Diarize
         .with_context(|| format!("Failed to spawn diarize-helper at {}", binary.display()))?;
 
     let mut stdout = child.stdout.take().ok_or_else(|| anyhow!("Failed to capture diarize-helper stdout"))?;
-    let mut stderr = child.stderr.take().ok_or_else(|| anyhow!("Failed to capture diarize-helper stderr"))?;
+    let stderr = child.stderr.take().ok_or_else(|| anyhow!("Failed to capture diarize-helper stderr"))?;
 
     let stdout_task = tokio::spawn(async move {
         let mut buf = String::new();
         stdout.read_to_string(&mut buf).await.map(|_| buf)
     });
+
+    let progress_queue: Arc<Mutex<VecDeque<HelperProgress>>> = Arc::new(Mutex::new(VecDeque::new()));
+    let progress_queue_for_task = progress_queue.clone();
     let stderr_task = tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
         let mut buf = String::new();
-        stderr.read_to_string(&mut buf).await.map(|_| buf)
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => match parse_progress_line(&line) {
+                    Some(event) => progress_queue_for_task.lock().unwrap().push_back(event),
+                    None => {
+                        buf.push_str(&line);
+                        buf.push('\n');
+                    }
+                },
+                Ok(None) => break,
+                Err(_) => break,
+            }
+        }
+        buf
     });
 
     let start = Instant::now();
+    let mut last_known_pct: u32 = 0;
+    let mut last_progress_at = Instant::now();
     let status = loop {
         if start.elapsed() > DIARIZE_TIMEOUT {
             let _ = child.kill().await;
@@ -429,6 +486,31 @@ async fn run_diarize_helper(wav_path: &Path, models: &ModelPaths, opts: &Diarize
             let _ = child.kill().await;
             return Err(anyhow!("Retranscription cancelled"));
         }
+
+        {
+            let mut queue = progress_queue.lock().unwrap();
+            while let Some(event) = queue.pop_front() {
+                last_progress_at = Instant::now();
+                match event {
+                    HelperProgress::Percent(pct) => {
+                        last_known_pct = pct;
+                        on_progress(pct, &format!("Identifying speakers... ({}%)", pct));
+                    }
+                    HelperProgress::Heartbeat => {
+                        on_progress(last_known_pct, "Identifying speakers...");
+                    }
+                }
+            }
+        }
+
+        if last_progress_at.elapsed() > DIARIZE_PROGRESS_IDLE_TIMEOUT {
+            on_progress(
+                last_known_pct,
+                &format!("Identifying speakers... ({})", format_elapsed(start.elapsed())),
+            );
+            last_progress_at = Instant::now();
+        }
+
         match tokio::time::timeout(Duration::from_millis(300), child.wait()).await {
             Ok(status_result) => break status_result.context("Failed to wait for diarize-helper")?,
             Err(_) => continue,
@@ -441,8 +523,7 @@ async fn run_diarize_helper(wav_path: &Path, models: &ModelPaths, opts: &Diarize
         .context("Failed reading diarize-helper stdout")?;
     let stderr_output = stderr_task
         .await
-        .context("diarize-helper stderr reader task panicked")?
-        .unwrap_or_default();
+        .context("diarize-helper stderr reader task panicked")?;
 
     if !stderr_output.trim().is_empty() {
         debug!("diarize-helper stderr: {}", stderr_output.trim());
@@ -500,6 +581,34 @@ mod tests {
 
     fn seg(start: f32, end: f32, speaker: usize) -> DiarizedSegment {
         DiarizedSegment { start, end, speaker }
+    }
+
+    #[test]
+    fn parses_percent_progress_line() {
+        assert_eq!(parse_progress_line("PROGRESS 0"), Some(HelperProgress::Percent(0)));
+        assert_eq!(parse_progress_line("PROGRESS 42"), Some(HelperProgress::Percent(42)));
+        assert_eq!(parse_progress_line("PROGRESS 100"), Some(HelperProgress::Percent(100)));
+    }
+
+    #[test]
+    fn parses_heartbeat_progress_line() {
+        assert_eq!(parse_progress_line("PROGRESS -1"), Some(HelperProgress::Heartbeat));
+    }
+
+    #[test]
+    fn rejects_out_of_range_and_malformed_lines() {
+        assert_eq!(parse_progress_line("PROGRESS 101"), None);
+        assert_eq!(parse_progress_line("PROGRESS -2"), None);
+        assert_eq!(parse_progress_line("PROGRESS abc"), None);
+        assert_eq!(parse_progress_line("using 8 threads"), None);
+        assert_eq!(parse_progress_line(""), None);
+    }
+
+    #[test]
+    fn formats_elapsed_time() {
+        assert_eq!(format_elapsed(Duration::from_secs(5)), "5s");
+        assert_eq!(format_elapsed(Duration::from_secs(65)), "1m 5s");
+        assert_eq!(format_elapsed(Duration::from_secs(135)), "2m 15s");
     }
 
     #[test]

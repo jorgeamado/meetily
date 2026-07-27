@@ -1,13 +1,117 @@
+use std::ffi::CString;
+use std::os::raw::{c_float, c_void};
 use std::path::PathBuf;
 
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use serde::Serialize;
-use sherpa_onnx::{
-    FastClusteringConfig, OfflineSpeakerDiarization, OfflineSpeakerDiarizationConfig,
-    OfflineSpeakerSegmentationModelConfig, OfflineSpeakerSegmentationPyannoteModelConfig,
-    SpeakerEmbeddingExtractorConfig,
-};
+use sherpa_onnx_sys as sys;
+
+extern "C" {
+    fn SherpaOnnxOfflineSpeakerDiarizationProcessWithCallback(
+        sd: *const sys::OfflineSpeakerDiarization,
+        samples: *const c_float,
+        n: i32,
+        callback: extern "C" fn(i32, i32, *mut c_void) -> i32,
+        arg: *mut c_void,
+    ) -> *const sys::OfflineSpeakerDiarizationResult;
+}
+
+struct ProgressState {
+    last_pct: i32,
+}
+
+extern "C" fn diarization_progress_callback(
+    num_processed_chunks: i32,
+    num_total_chunks: i32,
+    arg: *mut c_void,
+) -> i32 {
+    if num_total_chunks <= 0 {
+        return 0;
+    }
+    let state = unsafe { &mut *(arg as *mut ProgressState) };
+    let pct = ((num_processed_chunks as i64 * 100) / num_total_chunks as i64).clamp(0, 100) as i32;
+    if pct > state.last_pct {
+        state.last_pct = pct;
+        eprintln!("PROGRESS {}", pct);
+    }
+    0
+}
+
+struct Diarizer(*const sys::OfflineSpeakerDiarization);
+
+impl Diarizer {
+    fn create(config: &sys::OfflineSpeakerDiarizationConfig) -> Option<Self> {
+        let ptr = unsafe { sys::SherpaOnnxCreateOfflineSpeakerDiarization(config) };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(Self(ptr))
+        }
+    }
+
+    fn sample_rate(&self) -> i32 {
+        unsafe { sys::SherpaOnnxOfflineSpeakerDiarizationGetSampleRate(self.0) }
+    }
+
+    fn process_with_progress(&self, samples: &[f32]) -> Option<DiarizationResult> {
+        let mut state = ProgressState { last_pct: -1 };
+        let ptr = unsafe {
+            SherpaOnnxOfflineSpeakerDiarizationProcessWithCallback(
+                self.0,
+                samples.as_ptr(),
+                samples.len() as i32,
+                diarization_progress_callback,
+                &mut state as *mut ProgressState as *mut c_void,
+            )
+        };
+        if ptr.is_null() {
+            None
+        } else {
+            Some(DiarizationResult(ptr))
+        }
+    }
+}
+
+impl Drop for Diarizer {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.0.is_null() {
+                sys::SherpaOnnxDestroyOfflineSpeakerDiarization(self.0);
+            }
+        }
+    }
+}
+
+struct DiarizationResult(*const sys::OfflineSpeakerDiarizationResult);
+
+impl DiarizationResult {
+    fn sort_by_start_time(&self) -> Vec<sys::OfflineSpeakerDiarizationSegment> {
+        let n = unsafe { sys::SherpaOnnxOfflineSpeakerDiarizationResultGetNumSegments(self.0) };
+        if n <= 0 {
+            return Vec::new();
+        }
+        unsafe {
+            let p = sys::SherpaOnnxOfflineSpeakerDiarizationResultSortByStartTime(self.0);
+            if p.is_null() {
+                return Vec::new();
+            }
+            let segments = std::slice::from_raw_parts(p, n as usize).to_vec();
+            sys::SherpaOnnxOfflineSpeakerDiarizationDestroySegment(p);
+            segments
+        }
+    }
+}
+
+impl Drop for DiarizationResult {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.0.is_null() {
+                sys::SherpaOnnxOfflineSpeakerDiarizationDestroyResult(self.0);
+            }
+        }
+    }
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "diarize-helper")]
@@ -99,30 +203,34 @@ fn run(args: Args) -> Result<Output> {
         .unwrap_or(4) as i32;
     eprintln!("using {} threads", num_threads);
 
-    let config = OfflineSpeakerDiarizationConfig {
-        segmentation: OfflineSpeakerSegmentationModelConfig {
-            pyannote: OfflineSpeakerSegmentationPyannoteModelConfig {
-                model: Some(
-                    args.segmentation_model
-                        .to_str()
-                        .context("segmentation-model path is not valid UTF-8")?
-                        .to_string(),
-                ),
+    let seg_model_str = args
+        .segmentation_model
+        .to_str()
+        .context("segmentation-model path is not valid UTF-8")?;
+    let emb_model_str = args
+        .embedding_model
+        .to_str()
+        .context("embedding-model path is not valid UTF-8")?;
+    let seg_model = CString::new(seg_model_str).context("segmentation-model path contains a NUL byte")?;
+    let emb_model = CString::new(emb_model_str).context("embedding-model path contains a NUL byte")?;
+    let cpu_provider = CString::new("cpu").expect("static string has no NUL byte");
+
+    let config = sys::OfflineSpeakerDiarizationConfig {
+        segmentation: sys::OfflineSpeakerSegmentationModelConfig {
+            pyannote: sys::OfflineSpeakerSegmentationPyannoteModelConfig {
+                model: seg_model.as_ptr(),
             },
             num_threads,
-            ..Default::default()
+            debug: 0,
+            provider: cpu_provider.as_ptr(),
         },
-        embedding: SpeakerEmbeddingExtractorConfig {
-            model: Some(
-                args.embedding_model
-                    .to_str()
-                    .context("embedding-model path is not valid UTF-8")?
-                    .to_string(),
-            ),
+        embedding: sys::SpeakerEmbeddingExtractorConfig {
+            model: emb_model.as_ptr(),
             num_threads,
-            ..Default::default()
+            debug: 0,
+            provider: cpu_provider.as_ptr(),
         },
-        clustering: FastClusteringConfig {
+        clustering: sys::FastClusteringConfig {
             num_clusters: args.num_speakers.unwrap_or(-1),
             threshold: args.threshold,
         },
@@ -131,7 +239,7 @@ fn run(args: Args) -> Result<Output> {
     };
 
     eprintln!("creating offline speaker diarizer");
-    let diarizer = OfflineSpeakerDiarization::create(&config)
+    let diarizer = Diarizer::create(&config)
         .context("failed to create offline speaker diarization pipeline")?;
 
     let expected_rate = diarizer.sample_rate();
@@ -149,7 +257,7 @@ fn run(args: Args) -> Result<Output> {
     );
 
     let result = diarizer
-        .process(&samples)
+        .process_with_progress(&samples)
         .context("diarization processing failed")?;
 
     let raw_segments = result.sort_by_start_time();
