@@ -6,6 +6,7 @@ import { ConfidenceIndicator } from './ConfidenceIndicator';
 import { Tooltip, TooltipContent, TooltipTrigger } from './ui/tooltip';
 import { RecordingStatusBar } from './RecordingStatusBar';
 import { motion, AnimatePresence } from 'framer-motion';
+import { getSpeakerColorClass } from '@/lib/utils';
 
 interface TranscriptViewProps {
   transcripts: Transcript[];
@@ -273,6 +274,9 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({ transcripts, isR
         const sizerText = cleanStopWords(isStreaming ? streamingTranscript.fullText : transcript.text)
           || (originalWasEmpty && !isStreaming ? '[Silence]' : '');
 
+        const previousSpeaker = index > 0 ? transcripts[index - 1].speaker : undefined;
+        const showSpeaker = !!transcript.speaker && transcript.speaker !== previousSpeaker;
+
         return (
           <motion.div
             key={transcript.id ? `${transcript.id}-${index}` : `transcript-${index}`}
@@ -281,6 +285,11 @@ export const TranscriptView: React.FC<TranscriptViewProps> = ({ transcripts, isR
             transition={{ duration: 0.15 }}
             className="mb-3"
           >
+            {showSpeaker && (
+              <span className={`block text-[10px] font-semibold uppercase tracking-wide mb-1 ml-[58px] ${getSpeakerColorClass(transcript.speaker!)}`}>
+                {transcript.speaker}
+              </span>
+            )}
             <div className="flex items-start gap-2">
               <Tooltip>
                 <TooltipTrigger>

@@ -170,6 +170,55 @@ else
     exit 1
 fi
 
+# Build diarize-helper
+echo ""
+echo -e "${BLUE}🗣️  Building diarize-helper sidecar (release)...${NC}"
+
+DIARIZE_HELPER_DIR="diarize-helper"
+if [ ! -d "$DIARIZE_HELPER_DIR" ]; then
+    SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
+    DIARIZE_HELPER_DIR="$SCRIPT_DIR/../diarize-helper"
+fi
+
+if [ ! -d "$DIARIZE_HELPER_DIR" ]; then
+    echo -e "${RED}❌ Could not find diarize-helper directory${NC}"
+    exit 1
+fi
+
+(cd "$DIARIZE_HELPER_DIR" && cargo build --release)
+
+if [ $? -ne 0 ]; then
+    echo -e "${RED}❌ Failed to build diarize-helper${NC}"
+    exit 1
+fi
+
+echo -e "${GREEN}✅ diarize-helper built successfully${NC}"
+
+find "$BINARIES_DIR" -name "diarize-helper*" -delete
+
+DIARIZE_BASE_BINARY="diarize-helper"
+DIARIZE_SIDECAR_BINARY="diarize-helper-$TARGET_TRIPLE"
+
+if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "win32" ]]; then
+    DIARIZE_BASE_BINARY="diarize-helper.exe"
+    DIARIZE_SIDECAR_BINARY="diarize-helper-$TARGET_TRIPLE.exe"
+fi
+
+DIARIZE_SRC_PATH="$WORKSPACE_ROOT/target/release/$DIARIZE_BASE_BINARY"
+DIARIZE_DEST_PATH="$BINARIES_DIR/$DIARIZE_SIDECAR_BINARY"
+
+if [ ! -f "$DIARIZE_SRC_PATH" ]; then
+    DIARIZE_SRC_PATH="target/release/$DIARIZE_BASE_BINARY"
+fi
+
+if [ -f "$DIARIZE_SRC_PATH" ]; then
+    cp "$DIARIZE_SRC_PATH" "$DIARIZE_DEST_PATH"
+    echo -e "${GREEN}✅ Copied binary to $DIARIZE_DEST_PATH${NC}"
+else
+    echo -e "${RED}❌ Binary not found at $DIARIZE_SRC_PATH${NC}"
+    exit 1
+fi
+
 # Build using npm scripts
 echo -e "${BLUE}Building complete Tauri application...${NC}"
 echo ""
