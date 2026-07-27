@@ -58,6 +58,7 @@ interface DiarizeOptions {
   enabled: boolean;
   numSpeakers: number | null;
   threshold: number | null;
+  embeddingModel: string | null;
 }
 
 const SENSITIVITY_THRESHOLDS = {
@@ -83,6 +84,7 @@ export function RetranscribeDialog({
   const [diarizeEnabled, setDiarizeEnabled] = useState(true);
   const [numSpeakers, setNumSpeakers] = useState('');
   const [sensitivity, setSensitivity] = useState<SensitivityOption>('balanced');
+  const [embeddingModel, setEmbeddingModel] = useState<string>('campplus');
 
   // Use centralized model fetching hook
   const {
@@ -109,11 +111,13 @@ export function RetranscribeDialog({
       setDiarizeEnabled(settings.enabled);
       setNumSpeakers(settings.numSpeakers != null ? String(settings.numSpeakers) : '');
       setSensitivity(settings.sensitivity);
+      setEmbeddingModel(settings.embeddingModel);
     } catch (err) {
       console.error('Failed to load diarization settings:', err);
       setDiarizeEnabled(true);
       setNumSpeakers('');
       setSensitivity('balanced');
+      setEmbeddingModel('campplus');
     }
   };
 
@@ -248,6 +252,7 @@ export function RetranscribeDialog({
         enabled: diarizeEnabled,
         numSpeakers: diarizeEnabled && parsedNumSpeakers && parsedNumSpeakers > 0 ? parsedNumSpeakers : null,
         threshold: diarizeEnabled ? SENSITIVITY_THRESHOLDS[sensitivity] : null,
+        embeddingModel: diarizeEnabled ? embeddingModel : null,
       };
 
       await Analytics.track('enhance_transcript_started', {

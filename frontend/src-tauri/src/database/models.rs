@@ -137,4 +137,7 @@ pub struct TranscriptSetting {
     #[sqlx(rename = "diarizationSensitivity")]
     #[serde(rename = "diarizationSensitivity")]
     pub diarization_sensitivity: String,
+    #[sqlx(rename = "diarizationEmbeddingModel")]
+    #[serde(rename = "diarizationEmbeddingModel")]
+    pub diarization_embedding_model: String,
 }

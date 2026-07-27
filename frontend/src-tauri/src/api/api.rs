@@ -117,6 +117,8 @@ pub struct DiarizationSettings {
     #[serde(rename = "numSpeakers")]
     pub num_speakers: Option<i64>,
     pub sensitivity: String,
+    #[serde(rename = "embeddingModel")]
+    pub embedding_model: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -707,11 +709,13 @@ pub async fn api_get_diarization_settings<R: Runtime>(
             enabled: config.diarization_enabled,
             num_speakers: config.diarization_num_speakers,
             sensitivity: config.diarization_sensitivity,
+            embedding_model: config.diarization_embedding_model,
         }),
         Ok(None) => Ok(DiarizationSettings {
             enabled: true,
             num_speakers: None,
             sensitivity: "balanced".to_string(),
+            embedding_model: crate::audio::diarization::DEFAULT_EMBEDDING_MODEL.to_string(),
         }),
         Err(e) => {
             log_error!("Failed to get diarization settings: {}", e);
@@ -727,14 +731,20 @@ pub async fn api_save_diarization_settings<R: Runtime>(
     enabled: bool,
     num_speakers: Option<i64>,
     sensitivity: String,
+    embedding_model: String,
     _auth_token: Option<String>,
 ) -> Result<serde_json::Value, String> {
     log_info!("api_save_diarization_settings called (native)");
     let pool = state.db_manager.pool();
 
-    if let Err(e) =
-        SettingsRepository::save_diarization_settings(pool, enabled, num_speakers, &sensitivity)
-            .await
+    if let Err(e) = SettingsRepository::save_diarization_settings(
+        pool,
+        enabled,
+        num_speakers,
+        &sensitivity,
+        &embedding_model,
+    )
+    .await
     {
         log_error!("Failed to save diarization settings: {}", e);
         return Err(e.to_string());

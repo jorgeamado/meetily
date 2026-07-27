@@ -45,6 +45,7 @@ export interface DiarizationSettings {
   enabled: boolean;
   numSpeakers: number | null;
   sensitivity: 'merge' | 'balanced' | 'split';
+  embeddingModel: 'campplus' | 'eres2net';
 }
 
 /**
@@ -94,6 +95,7 @@ export class ConfigService {
       enabled: settings.enabled,
       numSpeakers: settings.numSpeakers,
       sensitivity: settings.sensitivity,
+      embeddingModel: settings.embeddingModel,
     });
   }
 

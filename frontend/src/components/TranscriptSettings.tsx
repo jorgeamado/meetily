@@ -11,6 +11,7 @@ import { ParakeetModelManager } from './ParakeetModelManager';
 import { configService } from '@/services/configService';
 
 type SensitivityOption = 'merge' | 'balanced' | 'split';
+type EmbeddingModelOption = 'campplus' | 'eres2net';
 
 
 export interface TranscriptModelProps {
@@ -34,6 +35,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
     const [diarizationEnabled, setDiarizationEnabled] = useState(true);
     const [numSpeakers, setNumSpeakers] = useState('');
     const [sensitivity, setSensitivity] = useState<SensitivityOption>('balanced');
+    const [embeddingModel, setEmbeddingModel] = useState<EmbeddingModelOption>('campplus');
 
     // Load saved speaker identification defaults on mount
     useEffect(() => {
@@ -44,17 +46,19 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                 setDiarizationEnabled(settings.enabled);
                 setNumSpeakers(settings.numSpeakers != null ? String(settings.numSpeakers) : '');
                 setSensitivity(settings.sensitivity);
+                setEmbeddingModel(settings.embeddingModel);
             })
             .catch((err) => console.error('Failed to load diarization settings:', err));
         return () => { cancelled = true; };
     }, []);
 
-    const saveDiarizationSettings = (overrides: Partial<{ enabled: boolean; numSpeakers: number | null; sensitivity: SensitivityOption }>) => {
+    const saveDiarizationSettings = (overrides: Partial<{ enabled: boolean; numSpeakers: number | null; sensitivity: SensitivityOption; embeddingModel: EmbeddingModelOption }>) => {
         const parsedNumSpeakers = numSpeakers.trim() === '' ? null : parseInt(numSpeakers, 10);
         configService.saveDiarizationSettings({
             enabled: overrides.enabled ?? diarizationEnabled,
             numSpeakers: overrides.numSpeakers !== undefined ? overrides.numSpeakers : (parsedNumSpeakers && parsedNumSpeakers > 0 ? parsedNumSpeakers : null),
             sensitivity: overrides.sensitivity ?? sensitivity,
+            embeddingModel: overrides.embeddingModel ?? embeddingModel,
         }).catch((err) => console.error('Failed to save diarization settings:', err));
     };
 
@@ -66,6 +70,11 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
     const handleSensitivityChange = (value: SensitivityOption) => {
         setSensitivity(value);
         saveDiarizationSettings({ sensitivity: value });
+    };
+
+    const handleEmbeddingModelChange = (value: EmbeddingModelOption) => {
+        setEmbeddingModel(value);
+        saveDiarizationSettings({ embeddingModel: value });
     };
 
     const handleNumSpeakersBlur = () => {
@@ -310,6 +319,23 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                             <SelectItem value="split">Split-prone (more speakers)</SelectItem>
                                         </SelectContent>
                                     </Select>
+                                </div>
+                                <div>
+                                    <Label className="block text-sm font-medium text-gray-700 mb-1">
+                                        Speaker model
+                                    </Label>
+                                    <Select value={embeddingModel} onValueChange={(v) => handleEmbeddingModelChange(v as EmbeddingModelOption)}>
+                                        <SelectTrigger className="mx-1 w-64 focus:ring-1 focus:ring-blue-500 focus:border-blue-500">
+                                            <SelectValue />
+                                        </SelectTrigger>
+                                        <SelectContent>
+                                            <SelectItem value="campplus">Fast (recommended)</SelectItem>
+                                            <SelectItem value="eres2net">Accurate (slower)</SelectItem>
+                                        </SelectContent>
+                                    </Select>
+                                    <p className="text-xs text-gray-500 mt-1 mx-1">
+                                        Fast is ~35% quicker on real calls with similar or better speaker separation.
+                                    </p>
                                 </div>
                             </div>
                         )}

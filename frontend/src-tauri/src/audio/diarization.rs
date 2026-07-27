@@ -45,14 +45,44 @@ fn format_elapsed(elapsed: Duration) -> String {
 
 const SEGMENTATION_MODEL_URL: &str =
     "https://huggingface.co/csukuangfj/sherpa-onnx-pyannote-segmentation-3-0/resolve/main/model.onnx";
-const EMBEDDING_MODEL_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx";
 
 const SEGMENTATION_MODEL_FILENAME: &str = "segmentation-3.0.onnx";
-const EMBEDDING_MODEL_FILENAME: &str = "eres2net-base-sv-3dspeaker-16k.onnx";
 
-// Expected sizes: ~5.99MB and ~39.6MB. Use a conservative floor to detect partial downloads.
+// Expected sizes: ~5.99MB and ~39.6MB/~28.3MB. Use a conservative floor to detect partial downloads.
 const SEGMENTATION_MODEL_MIN_BYTES: u64 = 5_000_000;
-const EMBEDDING_MODEL_MIN_BYTES: u64 = 35_000_000;
+const EMBEDDING_MODEL_MIN_BYTES: u64 = 25_000_000;
+
+pub const DEFAULT_EMBEDDING_MODEL: &str = "campplus";
+
+struct EmbeddingModelSpec {
+    key: &'static str,
+    url: &'static str,
+    filename: &'static str,
+}
+
+const EMBEDDING_MODELS: &[EmbeddingModelSpec] = &[
+    EmbeddingModelSpec {
+        key: "campplus",
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx",
+        filename: "campplus-zh-en-advanced-16k.onnx",
+    },
+    EmbeddingModelSpec {
+        key: "eres2net",
+        url: "https://github.com/k2-fsa/sherpa-onnx/releases/download/speaker-recongition-models/3dspeaker_speech_eres2net_base_sv_zh-cn_3dspeaker_16k.onnx",
+        filename: "eres2net-base-sv-3dspeaker-16k.onnx",
+    },
+];
+
+fn resolve_embedding_model(key: Option<&str>) -> &'static EmbeddingModelSpec {
+    let key = key.unwrap_or(DEFAULT_EMBEDDING_MODEL);
+    EMBEDDING_MODELS.iter().find(|m| m.key == key).unwrap_or_else(|| {
+        warn!("Unknown speaker embedding model key '{}', defaulting to '{}'", key, DEFAULT_EMBEDDING_MODEL);
+        EMBEDDING_MODELS
+            .iter()
+            .find(|m| m.key == DEFAULT_EMBEDDING_MODEL)
+            .expect("default embedding model must exist in catalog")
+    })
+}
 
 const DIARIZE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 
@@ -62,6 +92,7 @@ pub struct DiarizeOptions {
     pub enabled: bool,
     pub num_speakers: Option<u32>,
     pub threshold: Option<f32>,
+    pub embedding_model: Option<String>,
 }
 
 impl Default for DiarizeOptions {
@@ -70,6 +101,7 @@ impl Default for DiarizeOptions {
             enabled: false,
             num_speakers: None,
             threshold: None,
+            embedding_model: None,
         }
     }
 }
@@ -109,7 +141,7 @@ pub async fn diarize<R: Runtime>(
     mut on_progress: impl FnMut(u32, &str) + Send,
 ) -> Result<(Vec<DiarizedSegment>, u32)> {
     on_progress(0, "Preparing speaker diarization models...");
-    let models = ensure_models(app, |pct, msg| on_progress(pct / 2, msg)).await?;
+    let models = ensure_models(app, opts.embedding_model.as_deref(), |pct, msg| on_progress(pct / 2, msg)).await?;
 
     on_progress(50, "Identifying speakers...");
 
@@ -181,6 +213,7 @@ fn models_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf> {
 
 async fn ensure_models<R: Runtime>(
     app: &AppHandle<R>,
+    embedding_model_key: Option<&str>,
     mut on_progress: impl FnMut(u32, &str) + Send,
 ) -> Result<ModelPaths> {
     let dir = models_dir(app)?;
@@ -188,8 +221,9 @@ async fn ensure_models<R: Runtime>(
         .await
         .with_context(|| format!("Failed to create diarization models dir: {}", dir.display()))?;
 
+    let embedding_model = resolve_embedding_model(embedding_model_key);
     let segmentation = dir.join(SEGMENTATION_MODEL_FILENAME);
-    let embedding = dir.join(EMBEDDING_MODEL_FILENAME);
+    let embedding = dir.join(embedding_model.filename);
 
     if !is_valid_file(&segmentation, SEGMENTATION_MODEL_MIN_BYTES).await {
         download_file(SEGMENTATION_MODEL_URL, &segmentation, |pct| {
@@ -199,7 +233,7 @@ async fn ensure_models<R: Runtime>(
     }
 
     if !is_valid_file(&embedding, EMBEDDING_MODEL_MIN_BYTES).await {
-        download_file(EMBEDDING_MODEL_URL, &embedding, |pct| {
+        download_file(embedding_model.url, &embedding, |pct| {
             on_progress(50 + pct / 2, "Downloading speaker embedding model...")
         })
         .await?;
@@ -645,6 +679,14 @@ mod tests {
     fn speaker_label_is_one_based() {
         assert_eq!(speaker_label(0), "Speaker 1");
         assert_eq!(speaker_label(1), "Speaker 2");
+    }
+
+    #[test]
+    fn resolves_known_and_unknown_embedding_model_keys() {
+        assert_eq!(resolve_embedding_model(Some("campplus")).filename, "campplus-zh-en-advanced-16k.onnx");
+        assert_eq!(resolve_embedding_model(Some("eres2net")).filename, "eres2net-base-sv-3dspeaker-16k.onnx");
+        assert_eq!(resolve_embedding_model(Some("bogus")).filename, "campplus-zh-en-advanced-16k.onnx");
+        assert_eq!(resolve_embedding_model(None).filename, "campplus-zh-en-advanced-16k.onnx");
     }
 
     #[test]
