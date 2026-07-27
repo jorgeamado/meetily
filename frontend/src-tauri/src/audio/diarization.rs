@@ -103,6 +103,10 @@ pub struct DiarizeOptions {
     pub num_speakers: Option<u32>,
     pub threshold: Option<f32>,
     pub embedding_model: Option<String>,
+    /// Ask the local LLM to double-check tight speaker handovers
+    /// (None = default on when a model is downloaded).
+    #[serde(default)]
+    pub llm_refine: Option<bool>,
 }
 
 impl Default for DiarizeOptions {
@@ -112,6 +116,7 @@ impl Default for DiarizeOptions {
             num_speakers: None,
             threshold: None,
             embedding_model: None,
+            llm_refine: None,
         }
     }
 }
@@ -227,28 +232,62 @@ pub struct WordSpan {
 /// single misattributed tokens.
 const MIN_TURN_MS: f64 = 350.0;
 
-/// Split one transcribed block into per-speaker rows using its token
+/// One speaker's run of consecutive tokens inside a transcribed block, with
+/// the tokens kept so downstream passes (LLM boundary refinement) can move
+/// words across turn boundaries without re-deriving timestamps.
+#[derive(Debug, Clone)]
+pub struct SpeakerTurn {
+    pub text: String,
+    pub start_ms: f64,
+    pub end_ms: f64,
+    pub speaker: Option<usize>,
+    pub words: Vec<WordSpan>,
+}
+
+impl SpeakerTurn {
+    /// Recompute text and time bounds from the current word list. Text is not
+    /// trimmed here: tokens keep their leading whitespace so words can move
+    /// between turns losslessly; trim at display/save time.
+    pub fn rebuild_from_words(&mut self) {
+        self.text = self.words.iter().map(|w| w.text.as_str()).collect();
+        if let (Some(first), Some(last)) = (self.words.first(), self.words.last()) {
+            self.start_ms = first.start_ms;
+            self.end_ms = self.words.iter().fold(last.end_ms, |acc, w| acc.max(w.end_ms));
+        }
+    }
+}
+
+/// Split one transcribed block into per-speaker turns using its token
 /// timestamps. A block that spans a speaker change otherwise gets a single
 /// label (whoever talked longest), silently attributing the other person's
-/// words to them. Rows may only begin at a token that starts a word (leading
+/// words to them. Turns may only begin at a token that starts a word (leading
 /// whitespace), so a split can never land mid-word.
 ///
-/// `words` carry absolute ms on the recording timeline; returned tuples are
-/// (text, start_ms, end_ms, speaker_index).
-pub fn split_block_by_speaker(
+/// A sub-MIN_TURN_MS turn is folded into its predecessor only when it is a
+/// same-speaker "sandwich blip" (previous and next turns belong to one
+/// speaker, the short run to another) — a lone misattributed token. A short
+/// turn at a genuine handover (different speakers on both sides) is kept:
+/// folding there is exactly how the first word of the next speaker gets glued
+/// to the previous one.
+pub fn split_block_into_turns(
     block_text: &str,
     block_start_ms: f64,
     block_end_ms: f64,
     words: &[WordSpan],
     diarized: &[DiarizedSegment],
-) -> Vec<(String, f64, f64, Option<usize>)> {
+) -> Vec<SpeakerTurn> {
     let whole_block = |txt: &str| {
-        vec![(
-            txt.to_string(),
-            block_start_ms,
-            block_end_ms,
-            assign_speaker_label(block_start_ms / 1000.0, block_end_ms / 1000.0, diarized),
-        )]
+        vec![SpeakerTurn {
+            text: txt.to_string(),
+            start_ms: block_start_ms,
+            end_ms: block_end_ms,
+            speaker: assign_speaker_label(
+                block_start_ms / 1000.0,
+                block_end_ms / 1000.0,
+                diarized,
+            ),
+            words: words.to_vec(),
+        }]
     };
     if diarized.is_empty() || words.len() < 2 {
         return whole_block(block_text);
@@ -272,53 +311,79 @@ pub fn split_block_by_speaker(
     }
 
     // Group consecutive tokens by speaker; switch only at a word-start token
-    struct Turn {
-        text: String,
-        start_ms: f64,
-        end_ms: f64,
-        speaker: usize,
-    }
-    let mut turns: Vec<Turn> = Vec::new();
+    let mut turns: Vec<SpeakerTurn> = Vec::new();
     for (i, w) in words.iter().enumerate() {
         let spk = speakers[i].expect("all tokens assigned above");
         let word_start = i == 0 || w.text.starts_with(char::is_whitespace);
         match turns.last_mut() {
-            Some(turn) if turn.speaker == spk || !word_start => {
+            Some(turn) if turn.speaker == Some(spk) || !word_start => {
                 turn.text.push_str(&w.text);
                 turn.end_ms = turn.end_ms.max(w.end_ms);
+                turn.words.push(w.clone());
             }
-            _ => turns.push(Turn {
+            _ => turns.push(SpeakerTurn {
                 text: w.text.clone(),
                 start_ms: w.start_ms,
                 end_ms: w.end_ms,
-                speaker: spk,
+                speaker: Some(spk),
+                words: vec![w.clone()],
             }),
         }
     }
 
-    // Fold sub-MIN_TURN_MS turns into the previous turn, then merge adjacent
-    // turns that ended up with the same speaker
-    let mut folded: Vec<Turn> = Vec::new();
-    for turn in turns {
+    // Fold sandwich blips into the previous turn and merge adjacent turns
+    // that share a speaker
+    let next_speakers: Vec<Option<usize>> = turns
+        .iter()
+        .skip(1)
+        .map(|t| t.speaker)
+        .chain(std::iter::once(None))
+        .collect();
+    let mut folded: Vec<SpeakerTurn> = Vec::new();
+    for (turn, next_speaker) in turns.into_iter().zip(next_speakers) {
+        let is_blip = turn.end_ms - turn.start_ms < MIN_TURN_MS
+            && folded.last().map(|p| p.speaker) == Some(next_speaker);
         match folded.last_mut() {
-            Some(prev)
-                if turn.end_ms - turn.start_ms < MIN_TURN_MS || prev.speaker == turn.speaker =>
-            {
+            Some(prev) if prev.speaker == turn.speaker || is_blip => {
                 prev.text.push_str(&turn.text);
                 prev.end_ms = prev.end_ms.max(turn.end_ms);
+                prev.words.extend(turn.words);
             }
             _ => folded.push(turn),
         }
     }
 
     folded
-        .into_iter()
+}
+
+/// Tuple-shaped wrapper around [`split_block_into_turns`]:
+/// (text, start_ms, end_ms, speaker_index), trimmed and non-empty.
+pub fn split_block_by_speaker(
+    block_text: &str,
+    block_start_ms: f64,
+    block_end_ms: f64,
+    words: &[WordSpan],
+    diarized: &[DiarizedSegment],
+) -> Vec<(String, f64, f64, Option<usize>)> {
+    turns_to_rows(&split_block_into_turns(
+        block_text,
+        block_start_ms,
+        block_end_ms,
+        words,
+        diarized,
+    ))
+}
+
+/// Collapse turns to display rows: trimmed text, empty turns dropped.
+pub fn turns_to_rows(turns: &[SpeakerTurn]) -> Vec<(String, f64, f64, Option<usize>)> {
+    turns
+        .iter()
         .map(|t| {
             (
                 t.text.trim().to_string(),
                 t.start_ms,
                 t.end_ms,
-                Some(t.speaker),
+                t.speaker,
             )
         })
         .filter(|(text, _, _, _)| !text.is_empty())
@@ -868,6 +933,40 @@ mod tests {
         let rows = split_block_by_speaker("ignored", 0.0, 2100.0, &words, &diar);
         assert_eq!(rows.len(), 1, "tiny turn should fold: {:?}", rows);
         assert_eq!(rows[0].3, Some(0));
+    }
+
+    #[test]
+    fn split_block_keeps_short_turn_at_genuine_handover() {
+        // A short final turn whose neighbors are DIFFERENT speakers is a real
+        // handover start (e.g. "Sorry?"), not a blip — it must not be folded
+        // into the previous speaker.
+        let words = vec![
+            w("Long", 0.0, 600.0),
+            w(" story", 600.0, 1300.0),
+            w(" here", 1300.0, 2000.0),
+            w(" Sorry?", 2100.0, 2400.0), // 300ms from the other speaker
+        ];
+        let diar = vec![d(0.0, 2.0, 0), d(2.05, 2.4, 1)];
+        let rows = split_block_by_speaker("ignored", 0.0, 2400.0, &words, &diar);
+        assert_eq!(rows.len(), 2, "short handover turn must survive: {:?}", rows);
+        assert_eq!(rows[1].0, "Sorry?");
+        assert_eq!(rows[1].3, Some(1));
+    }
+
+    #[test]
+    fn split_block_turns_carry_their_words() {
+        let words = vec![
+            w("Have", 0.0, 300.0),
+            w(" you", 300.0, 900.0),
+            w(" Actually", 2000.0, 2500.0),
+            w(" missing", 2500.0, 3400.0),
+        ];
+        let diar = vec![d(0.0, 1.0, 0), d(1.9, 3.5, 1)];
+        let turns = split_block_into_turns("ignored", 0.0, 3400.0, &words, &diar);
+        assert_eq!(turns.len(), 2);
+        assert_eq!(turns[0].words.len(), 2);
+        assert_eq!(turns[1].words.len(), 2);
+        assert_eq!(turns[1].words[0].text, " Actually");
     }
 
     #[test]

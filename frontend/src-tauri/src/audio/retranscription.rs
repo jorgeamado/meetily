@@ -1,6 +1,7 @@
 // Retranscription module - allows re-processing stored audio with different settings
 
 use crate::audio::decoder::decode_audio_file;
+use crate::audio::boundary_refine;
 use crate::audio::diarization::{self, DiarizeOptions};
 use crate::audio::vad::get_speech_chunks_with_progress;
 use super::common::{create_transcript_segments, split_segment_at_silence, write_transcripts_json};
@@ -526,27 +527,59 @@ async fn run_retranscription<R: Runtime>(
     // Split blocks that span speaker changes into per-turn rows using token
     // timestamps, so one row never mixes two speakers' words. Blocks without
     // token data (Parakeet) keep whole-block max-overlap labeling.
-    let labeled_blocks: Vec<(String, f64, f64, Option<usize>)> = all_transcripts
+    let mut turns: Vec<diarization::SpeakerTurn> = all_transcripts
         .iter()
         .flat_map(|(text, start_ms, end_ms, words)| {
             if diarized_segments.is_empty() {
-                vec![(text.clone(), *start_ms, *end_ms, None)]
-            } else if words.is_empty() {
-                vec![(
-                    text.clone(),
+                vec![diarization::SpeakerTurn {
+                    text: text.clone(),
+                    start_ms: *start_ms,
+                    end_ms: *end_ms,
+                    speaker: None,
+                    words: words.clone(),
+                }]
+            } else {
+                diarization::split_block_into_turns(
+                    text,
                     *start_ms,
                     *end_ms,
-                    diarization::assign_speaker_label(
-                        *start_ms / 1000.0,
-                        *end_ms / 1000.0,
-                        &diarized_segments,
-                    ),
-                )]
-            } else {
-                diarization::split_block_by_speaker(text, *start_ms, *end_ms, words, &diarized_segments)
+                    words,
+                    &diarized_segments,
+                )
             }
         })
         .collect();
+
+    // Second opinion on tight speaker handovers: the acoustic diarizer often
+    // hands the next speaker's first word to the previous one. A local LLM
+    // picks the natural cut from numbered candidates; text can only be
+    // re-partitioned between rows, never altered.
+    if diarize_opts.llm_refine.unwrap_or(true) && !diarized_segments.is_empty() {
+        emit_progress(&app, &meeting_id, "saving", 80, "Refining speaker boundaries...");
+        let app_for_refine = app.clone();
+        let meeting_id_for_refine = meeting_id.clone();
+        let stats = boundary_refine::refine_turns(
+            &app,
+            &mut turns,
+            || RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst),
+            move |done, total| {
+                emit_progress(
+                    &app_for_refine,
+                    &meeting_id_for_refine,
+                    "saving",
+                    80 + (5 * done / total.max(1)) as u32,
+                    &format!("Refining speaker boundaries ({}/{})...", done, total),
+                );
+            },
+        )
+        .await;
+        info!(
+            "Boundary refinement: {} tight boundaries, {} queried, {} moved, {} failures",
+            stats.boundaries, stats.queried, stats.moved, stats.failures
+        );
+    }
+
+    let labeled_blocks: Vec<(String, f64, f64, Option<usize>)> = diarization::turns_to_rows(&turns);
 
     // Create transcript segments with proper timestamps from VAD
     let plain_blocks: Vec<(String, f64, f64)> = labeled_blocks
