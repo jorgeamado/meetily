@@ -128,4 +128,13 @@ pub struct TranscriptSetting {
     #[sqlx(rename = "openaiApiKey")]
     #[serde(rename = "openaiApiKey")]
     pub openai_api_key: Option<String>,
+    #[sqlx(rename = "diarizationEnabled")]
+    #[serde(rename = "diarizationEnabled")]
+    pub diarization_enabled: bool,
+    #[sqlx(rename = "diarizationNumSpeakers")]
+    #[serde(rename = "diarizationNumSpeakers")]
+    pub diarization_num_speakers: Option<i64>,
+    #[sqlx(rename = "diarizationSensitivity")]
+    #[serde(rename = "diarizationSensitivity")]
+    pub diarization_sensitivity: String,
 }

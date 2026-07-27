@@ -41,6 +41,12 @@ export interface RecordingPreferences {
   preferred_system_device: string | null;
 }
 
+export interface DiarizationSettings {
+  enabled: boolean;
+  numSpeakers: number | null;
+  sensitivity: 'merge' | 'balanced' | 'split';
+}
+
 /**
  * Configuration Service
  * Singleton service for managing app configuration
@@ -68,6 +74,27 @@ export class ConfigService {
    */
   async getRecordingPreferences(): Promise<RecordingPreferences> {
     return invoke<RecordingPreferences>('get_recording_preferences');
+  }
+
+  /**
+   * Get saved speaker diarization defaults
+   * @returns Promise with { enabled, numSpeakers, sensitivity }
+   */
+  async getDiarizationSettings(): Promise<DiarizationSettings> {
+    return invoke<DiarizationSettings>('api_get_diarization_settings');
+  }
+
+  /**
+   * Save speaker diarization defaults
+   * @param settings - DiarizationSettings to save
+   * @returns Promise with result status
+   */
+  async saveDiarizationSettings(settings: DiarizationSettings): Promise<{ status: string; message: string }> {
+    return invoke<{ status: string; message: string }>('api_save_diarization_settings', {
+      enabled: settings.enabled,
+      numSpeakers: settings.numSpeakers,
+      sensitivity: settings.sensitivity,
+    });
   }
 
   /**

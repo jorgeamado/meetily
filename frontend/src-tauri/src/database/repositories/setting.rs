@@ -172,6 +172,32 @@ impl SettingsRepository {
         Ok(())
     }
 
+    pub async fn save_diarization_settings(
+        pool: &SqlitePool,
+        enabled: bool,
+        num_speakers: Option<i64>,
+        sensitivity: &str,
+    ) -> std::result::Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO transcript_settings (id, provider, model, diarizationEnabled, diarizationNumSpeakers, diarizationSensitivity)
+            VALUES ('1', 'parakeet', $1, $2, $3, $4)
+            ON CONFLICT(id) DO UPDATE SET
+                diarizationEnabled = excluded.diarizationEnabled,
+                diarizationNumSpeakers = excluded.diarizationNumSpeakers,
+                diarizationSensitivity = excluded.diarizationSensitivity
+            "#,
+        )
+        .bind(crate::config::DEFAULT_PARAKEET_MODEL)
+        .bind(enabled)
+        .bind(num_speakers)
+        .bind(sensitivity)
+        .execute(pool)
+        .await?;
+
+        Ok(())
+    }
+
     pub async fn save_transcript_api_key(
         pool: &SqlitePool,
         provider: &str,
