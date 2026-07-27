@@ -94,6 +94,11 @@ fn read_wav_as_f32_mono(path: &PathBuf) -> Result<(Vec<f32>, u32)> {
 fn run(args: Args) -> Result<Output> {
     let (samples, sample_rate) = read_wav_as_f32_mono(&args.audio)?;
 
+    let num_threads = std::thread::available_parallelism()
+        .map(|n| n.get().min(8))
+        .unwrap_or(4) as i32;
+    eprintln!("using {} threads", num_threads);
+
     let config = OfflineSpeakerDiarizationConfig {
         segmentation: OfflineSpeakerSegmentationModelConfig {
             pyannote: OfflineSpeakerSegmentationPyannoteModelConfig {
@@ -104,6 +109,7 @@ fn run(args: Args) -> Result<Output> {
                         .to_string(),
                 ),
             },
+            num_threads,
             ..Default::default()
         },
         embedding: SpeakerEmbeddingExtractorConfig {
@@ -113,6 +119,7 @@ fn run(args: Args) -> Result<Output> {
                     .context("embedding-model path is not valid UTF-8")?
                     .to_string(),
             ),
+            num_threads,
             ..Default::default()
         },
         clustering: FastClusteringConfig {
