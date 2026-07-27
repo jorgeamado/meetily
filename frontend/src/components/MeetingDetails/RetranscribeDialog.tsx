@@ -54,6 +54,28 @@ interface RetranscriptionError {
   error: string;
 }
 
+function ProgressRow({ label, data }: { label: string; data: RetranscriptionProgress }) {
+  return (
+    <div className="space-y-2">
+      <div className="relative">
+        <div className="w-full bg-gray-200 rounded-full h-3">
+          <div
+            className="bg-blue-600 h-3 rounded-full transition-all duration-300 ease-out"
+            style={{ width: `${Math.min(data.progress_percentage, 100)}%` }}
+          />
+        </div>
+        <div className="flex justify-between text-xs text-gray-600 mt-1">
+          <span>{label}</span>
+          <span>{Math.round(data.progress_percentage)}%</span>
+        </div>
+      </div>
+      <p className="text-sm text-muted-foreground text-center">
+        {data.message}
+      </p>
+    </div>
+  );
+}
+
 interface DiarizeOptions {
   enabled: boolean;
   numSpeakers: number | null;
@@ -61,10 +83,12 @@ interface DiarizeOptions {
   embeddingModel: string | null;
 }
 
+// Calibrated on a real 4-person call (2026-07-27): lower values fragment
+// real speakers into phantom clusters; 0.9 kept all real speakers separate.
 const SENSITIVITY_THRESHOLDS = {
-  merge: 0.65,
-  balanced: 0.5,
-  split: 0.35,
+  merge: 0.95,
+  balanced: 0.9,
+  split: 0.8,
 } as const;
 
 type SensitivityOption = keyof typeof SENSITIVITY_THRESHOLDS;
@@ -78,7 +102,8 @@ export function RetranscribeDialog({
 }: RetranscribeDialogProps) {
   const { selectedLanguage, transcriptModelConfig } = useConfig();
   const [isProcessing, setIsProcessing] = useState(false);
-  const [progress, setProgress] = useState<RetranscriptionProgress | null>(null);
+  const [progressByStage, setProgressByStage] = useState<Record<string, RetranscriptionProgress>>({});
+  const [currentStage, setCurrentStage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedLang, setSelectedLang] = useState(selectedLanguage || 'auto');
   const [diarizeEnabled, setDiarizeEnabled] = useState(true);
@@ -147,7 +172,8 @@ export function RetranscribeDialog({
     if (open && !wasOpen) {
       resetSelection();
       setIsProcessing(false);
-      setProgress(null);
+      setProgressByStage({});
+      setCurrentStage(null);
       setError(null);
       setSelectedLang(selectedLanguage || 'auto');
       loadDiarizationDefaults();
@@ -170,7 +196,8 @@ export function RetranscribeDialog({
         'retranscription-progress',
         (event) => {
           if (event.payload.meeting_id === meetingId) {
-            setProgress(event.payload);
+            setProgressByStage((prev) => ({ ...prev, [event.payload.stage]: event.payload }));
+            setCurrentStage(event.payload.stage);
           }
         }
       );
@@ -243,7 +270,8 @@ export function RetranscribeDialog({
 
     setIsProcessing(true);
     setError(null);
-    setProgress(null);
+    setProgressByStage({});
+    setCurrentStage(null);
 
     try {
       const languageToSend = isParakeetModel ? null : selectedLang === 'auto' ? null : selectedLang;
@@ -284,7 +312,8 @@ export function RetranscribeDialog({
       try {
         await invoke('cancel_retranscription_command');
         setIsProcessing(false);
-        setProgress(null);
+        setProgressByStage({});
+        setCurrentStage(null);
         toast.info('Retranscription cancelled');
       } catch (err) {
         console.error('Failed to cancel retranscription:', err);
@@ -312,6 +341,14 @@ export function RetranscribeDialog({
       event.preventDefault();
     }
   };
+
+  const transcribingProgress = progressByStage['transcribing'];
+  const diarizingProgress = progressByStage['diarizing'];
+  const showBothStages =
+    (currentStage === 'transcribing' || currentStage === 'diarizing') &&
+    !!transcribingProgress &&
+    !!diarizingProgress;
+  const currentProgress = currentStage ? progressByStage[currentStage] : null;
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
@@ -341,7 +378,7 @@ export function RetranscribeDialog({
           </DialogTitle>
           <DialogDescription>
             {isProcessing
-              ? progress?.message || 'Processing audio...'
+              ? currentProgress?.message || 'Processing audio...'
               : error
                 ? 'An error occurred during retranscription'
                 : 'Re-process the audio with different language settings'}
@@ -451,24 +488,15 @@ export function RetranscribeDialog({
             </div>
           )}
 
-          {isProcessing && progress && (
-            <div className="space-y-2">
-              <div className="relative">
-                <div className="w-full bg-gray-200 rounded-full h-3">
-                  <div
-                    className="bg-blue-600 h-3 rounded-full transition-all duration-300 ease-out"
-                    style={{ width: `${Math.min(progress.progress_percentage, 100)}%` }}
-                  />
-                </div>
-                <div className="flex justify-between text-xs text-gray-600 mt-1">
-                  <span>{progress.stage}</span>
-                  <span>{Math.round(progress.progress_percentage)}%</span>
-                </div>
-              </div>
-              <p className="text-sm text-muted-foreground text-center">
-                {progress.message}
-              </p>
+          {isProcessing && showBothStages && (
+            <div className="space-y-4">
+              <ProgressRow label="Transcribing" data={transcribingProgress} />
+              <ProgressRow label="Identifying speakers" data={diarizingProgress} />
             </div>
+          )}
+
+          {isProcessing && !showBothStages && currentProgress && (
+            <ProgressRow label={currentProgress.stage} data={currentProgress} />
           )}
 
           {error && (
@@ -508,7 +536,8 @@ export function RetranscribeDialog({
               <Button
                 onClick={() => {
                   setError(null);
-                  setProgress(null);
+                  setProgressByStage({});
+                  setCurrentStage(null);
                 }}
                 variant="outline"
               >

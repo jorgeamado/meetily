@@ -313,49 +313,56 @@ async fn run_retranscription<R: Runtime>(
         return Err(anyhow!("No speech detected in audio file"));
     }
 
-    // Run speaker diarization (if enabled) before transcription. Failures here must
-    // not fail the whole retranscription - we just fall back to no speaker labels.
-    let (transcribe_start, transcribe_span): (u32, u32) = if diarize_opts.enabled { (35, 45) } else { (25, 55) };
-    let mut diarized_segments: Vec<diarization::DiarizedSegment> = Vec::new();
-
-    if let Some(samples) = &audio_samples_for_diarization {
-        emit_progress(&app, &meeting_id, "diarizing", 25, "Identifying speakers...");
-
-        if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
-            return Err(anyhow!("Retranscription cancelled"));
-        }
-
-        let app_for_diarize = app.clone();
-        let meeting_id_for_diarize = meeting_id.clone();
-        let diarize_result = diarization::diarize(samples, &diarize_opts, &app, |pct, msg| {
-            let overall = 25 + (pct * 10 / 100).min(10);
-            emit_progress(&app_for_diarize, &meeting_id_for_diarize, "diarizing", overall, msg);
-        })
-        .await;
-
-        match diarize_result {
-            Ok((segments, num_speakers)) => {
-                info!(
-                    "Speaker diarization found {} speaker(s) across {} segments",
-                    num_speakers,
-                    segments.len()
-                );
-                diarized_segments = segments;
+    // Run speaker diarization (if enabled) concurrently with transcription below. Failures
+    // here must not fail the whole retranscription - we just fall back to no speaker labels.
+    let mut diarize_handle: Option<tauri::async_runtime::JoinHandle<Vec<diarization::DiarizedSegment>>> =
+        if let Some(samples) = audio_samples_for_diarization {
+            if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
+                return Err(anyhow!("Retranscription cancelled"));
             }
-            Err(e) => {
-                warn!("Speaker diarization failed, continuing without speaker labels: {}", e);
-                emit_progress(
-                    &app,
-                    &meeting_id,
-                    "diarizing",
-                    35,
-                    "Speaker identification failed, continuing without speaker labels",
-                );
-            }
-        }
-    }
 
-    emit_progress(&app, &meeting_id, "transcribing", transcribe_start, "Loading transcription engine...");
+            let app_for_diarize = app.clone();
+            let meeting_id_for_diarize = meeting_id.clone();
+            let diarize_opts_for_task = diarize_opts.clone();
+
+            Some(tauri::async_runtime::spawn(async move {
+                let diarize_result = diarization::diarize(
+                    &samples,
+                    &diarize_opts_for_task,
+                    &app_for_diarize,
+                    |pct, msg| {
+                        emit_progress(&app_for_diarize, &meeting_id_for_diarize, "diarizing", pct, msg);
+                    },
+                )
+                .await;
+
+                match diarize_result {
+                    Ok((segments, num_speakers)) => {
+                        info!(
+                            "Speaker diarization found {} speaker(s) across {} segments",
+                            num_speakers,
+                            segments.len()
+                        );
+                        segments
+                    }
+                    Err(e) => {
+                        warn!("Speaker diarization failed, continuing without speaker labels: {}", e);
+                        emit_progress(
+                            &app_for_diarize,
+                            &meeting_id_for_diarize,
+                            "diarizing",
+                            100,
+                            "Speaker identification failed, continuing without speaker labels",
+                        );
+                        Vec::new()
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+
+    emit_progress(&app, &meeting_id, "transcribing", 0, "Loading transcription engine...");
 
     // Initialize the appropriate engine once (not per-segment)
     let whisper_engine = if !use_parakeet {
@@ -401,11 +408,14 @@ async fn run_retranscription<R: Runtime>(
     for (i, segment) in processable_segments.iter().enumerate() {
         // Check for cancellation before each segment
         if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
+            if let Some(handle) = diarize_handle.take() {
+                let _ = handle.await;
+            }
             return Err(anyhow!("Retranscription cancelled"));
         }
 
-        // Calculate progress (transcribe_start% to 80% range for transcription)
-        let progress = transcribe_start + ((i as f32 / processable_count as f32) * transcribe_span as f32) as u32;
+        // Calculate progress (0-100 range, own to the "transcribing" stage)
+        let progress = ((i as u64 * 100) / processable_count as u64) as u32;
         let segment_duration_sec = (segment.end_timestamp_ms - segment.start_timestamp_ms) / 1000.0;
         emit_progress(
             &app,
@@ -472,8 +482,34 @@ async fn run_retranscription<R: Runtime>(
 
     // Check for cancellation
     if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
+        if let Some(handle) = diarize_handle.take() {
+            let _ = handle.await;
+        }
         return Err(anyhow!("Retranscription cancelled"));
     }
+
+    // Await diarization (runs concurrently with the transcription above) before
+    // moving past the dual-progress phase; a failed or panicked task just means
+    // no speaker labels. The spawned task keeps emitting "diarizing" progress
+    // while we wait, so the UI stays live until it finishes.
+    let diarized_segments: Vec<diarization::DiarizedSegment> = if let Some(handle) = diarize_handle {
+        match handle.await {
+            Ok(segments) => segments,
+            Err(join_err) => {
+                warn!("Speaker diarization task panicked: {}", join_err);
+                emit_progress(
+                    &app,
+                    &meeting_id,
+                    "diarizing",
+                    100,
+                    "Speaker identification failed, continuing without speaker labels",
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
 
     emit_progress(&app, &meeting_id, "saving", 80, "Saving transcripts...");
 
