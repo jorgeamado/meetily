@@ -51,6 +51,9 @@ pub mod retranscription;
 // Speaker diarization (sherpa-onnx sidecar for the retranscription pipeline)
 pub mod diarization;
 
+// LLM tie-breaker for speaker-turn boundaries after diarization
+pub mod boundary_refine;
+
 // Import module (import external audio files as new meetings)
 pub mod import;
 

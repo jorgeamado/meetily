@@ -81,6 +81,7 @@ interface DiarizeOptions {
   numSpeakers: number | null;
   threshold: number | null;
   embeddingModel: string | null;
+  llmRefine: boolean | null;
 }
 
 // Calibrated on a real 4-person call (2026-07-27) with the campplus zh-en
@@ -112,6 +113,7 @@ export function RetranscribeDialog({
   const [numSpeakers, setNumSpeakers] = useState('');
   const [sensitivity, setSensitivity] = useState<SensitivityOption>('balanced');
   const [embeddingModel, setEmbeddingModel] = useState<string>('campplus');
+  const [llmRefine, setLlmRefine] = useState(true);
 
   // Use centralized model fetching hook
   const {
@@ -283,6 +285,7 @@ export function RetranscribeDialog({
         numSpeakers: diarizeEnabled && parsedNumSpeakers && parsedNumSpeakers > 0 ? parsedNumSpeakers : null,
         threshold: diarizeEnabled ? SENSITIVITY_THRESHOLDS[sensitivity] : null,
         embeddingModel: diarizeEnabled ? embeddingModel : null,
+        llmRefine: diarizeEnabled ? llmRefine : null,
       };
 
       await Analytics.track('enhance_transcript_started', {
@@ -484,6 +487,15 @@ export function RetranscribeDialog({
                         <SelectItem value="split">Split-prone (more speakers)</SelectItem>
                       </SelectContent>
                     </Select>
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="space-y-0.5">
+                      <span className="text-xs font-medium">AI boundary check</span>
+                      <p className="text-xs text-muted-foreground">
+                        Local LLM double-checks fast speaker handovers (words never change)
+                      </p>
+                    </div>
+                    <Switch checked={llmRefine} onCheckedChange={setLlmRefine} />
                   </div>
                 </div>
               )}

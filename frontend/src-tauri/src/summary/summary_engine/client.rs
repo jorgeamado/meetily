@@ -245,6 +245,61 @@ pub async fn generate_with_builtin(
     }
 }
 
+/// Tiny constrained generation for classification-style micro-queries
+/// (e.g. speaker-boundary tie-breaking): greedy decoding, caller-set token
+/// cap and timeout. Shares the sidecar with summary generation, so the model
+/// stays warm across a run of queries.
+pub async fn generate_micro(
+    app_data_dir: &PathBuf,
+    model_name: &str,
+    system_prompt: &str,
+    user_prompt: &str,
+    max_tokens: i32,
+    timeout: Duration,
+) -> Result<String> {
+    let model_def = models::get_model_by_name(model_name)
+        .ok_or_else(|| anyhow!("Unknown model: {}", model_name))?;
+    let model_path = get_cached_model_path(app_data_dir, model_name)?;
+    let formatted_prompt = models::format_prompt(&model_def.template, system_prompt, user_prompt)?;
+
+    let manager = {
+        let mut global_manager = SIDECAR_MANAGER.lock().await;
+        if global_manager.is_none() {
+            let new_manager = SidecarManager::new(app_data_dir.clone())?;
+            *global_manager = Some(Arc::new(new_manager));
+        }
+        global_manager.clone().unwrap()
+    };
+    manager.ensure_running(model_path.clone()).await?;
+
+    let request = Request::Generate {
+        prompt: formatted_prompt,
+        max_tokens: Some(max_tokens),
+        context_size: Some(model_def.context_size),
+        model_path: Some(model_path.to_string_lossy().to_string()),
+        temperature: Some(0.0), // greedy
+        top_k: Some(1),
+        top_p: Some(1.0),
+        presence_penalty: Some(0.0),
+        frequency_penalty: Some(0.0),
+        repeat_penalty: Some(1.0),
+        penalty_last_n: Some(0),
+        stop_tokens: Some(model_def.sampling.stop_tokens.clone()),
+    };
+    let response_json = manager
+        .send_request(serde_json::to_string(&request)?, timeout)
+        .await?;
+    let response: Response = serde_json::from_str(&response_json)
+        .with_context(|| format!("Failed to parse response: {}", response_json))?;
+    match response {
+        Response::Response { text, error } => match error {
+            Some(err_msg) => Err(anyhow!("Generation failed: {}", err_msg)),
+            None => Ok(text),
+        },
+        Response::Error { message } => Err(anyhow!("Sidecar error: {}", message)),
+    }
+}
+
 /// Shutdown the global sidecar (graceful cleanup)
 /// Detaches the current manager and spawns a background task to drain active requests
 pub async fn shutdown_sidecar_gracefully() -> Result<()> {
