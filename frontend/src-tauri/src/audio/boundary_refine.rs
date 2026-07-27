@@ -35,8 +35,19 @@ const MAX_SHIFT_WORDS: usize = 2;
 /// Words of context shown on each side of a candidate cut.
 const CONTEXT_WORDS: usize = 12;
 
+/// A short turn attributed to speaker B while both neighbors belong to
+/// speaker A is usually diarization noise cutting through the middle of A's
+/// sentence ("you should have | proper people | around you"). Turns up to
+/// this many words qualify for a merge query.
+const SANDWICH_MAX_WORDS: usize = 5;
+
+/// When the LLM picks the outermost cut option, the true boundary may lie
+/// further still — re-ask with the window recentered, up to this many rounds
+/// per boundary (reach: MAX_SHIFT_WORDS * MAX_ROUNDS words).
+const MAX_ROUNDS_PER_BOUNDARY: usize = 3;
+
 /// Hard caps so refinement never dominates a retranscription run.
-const MAX_QUERIES: usize = 24;
+const MAX_QUERIES: usize = 32;
 const TOTAL_BUDGET: Duration = Duration::from_secs(240);
 const PER_QUERY_TIMEOUT: Duration = Duration::from_secs(45);
 const MAX_CONSECUTIVE_FAILURES: usize = 2;
@@ -47,8 +58,10 @@ Answer with JSON only, no explanation.";
 #[derive(Debug, Default, Clone, Copy)]
 pub struct RefineStats {
     pub boundaries: usize,
+    pub sandwiches: usize,
     pub queried: usize,
     pub moved: usize,
+    pub merged: usize,
     pub failures: usize,
 }
 
@@ -182,16 +195,81 @@ fn build_prompt(left: &SpeakerTurn, right: &SpeakerTurn) -> Option<(String, Vec<
     Some((prompt, shifts))
 }
 
-/// Extract the chosen option from the model's reply. Accepts any text that
-/// contains "cut" followed by an integer.
-fn parse_cut(reply: &str) -> Option<usize> {
-    let idx = reply.find("cut")?;
-    let digits: String = reply[idx + 3..]
+/// Extract the integer following `key` in the model's reply. Accepts any
+/// text that contains the key followed by an integer, JSON or not.
+fn parse_key(reply: &str, key: &str) -> Option<usize> {
+    let idx = reply.find(key)?;
+    let digits: String = reply[idx + key.len()..]
         .chars()
         .skip_while(|c| !c.is_ascii_digit())
         .take_while(|c| c.is_ascii_digit())
         .collect();
     digits.parse().ok()
+}
+
+fn parse_cut(reply: &str) -> Option<usize> {
+    parse_key(reply, "cut")
+}
+
+/// The outermost options signal the true cut may lie beyond the window.
+fn is_extreme_shift(shift: i32, shifts: &[i32]) -> bool {
+    shift != 0 && (Some(&shift) == shifts.first() || Some(&shift) == shifts.last())
+}
+
+/// True when mid is a short different-speaker turn wedged inside one
+/// speaker's speech with tight gaps on both sides.
+fn is_sandwich(prev: &SpeakerTurn, mid: &SpeakerTurn, next: &SpeakerTurn) -> bool {
+    let (Some(p), Some(m), Some(n)) = (prev.speaker, mid.speaker, next.speaker) else {
+        return false;
+    };
+    if p != n || m == p || prev.words.is_empty() || mid.words.is_empty() || next.words.is_empty() {
+        return false;
+    }
+    if word_ranges(mid).len() > SANDWICH_MAX_WORDS {
+        return false;
+    }
+    let tight = |left: &SpeakerTurn, right: &SpeakerTurn| match (left.words.last(), right.words.first()) {
+        (Some(a), Some(b)) => b.start_ms - a.end_ms < TIGHT_GAP_MS,
+        _ => false,
+    };
+    tight(prev, mid) && tight(mid, next)
+}
+
+fn build_sandwich_prompt(prev: &SpeakerTurn, mid: &SpeakerTurn, next: &SpeakerTurn) -> String {
+    let tail = |t: &SpeakerTurn| {
+        let r = word_ranges(t);
+        let w = words_text(t, &r);
+        let start = w.len().saturating_sub(CONTEXT_WORDS);
+        let mut s = if start > 0 { String::from("... ") } else { String::new() };
+        s.push_str(&w[start..].join(" "));
+        s
+    };
+    let head = |t: &SpeakerTurn| {
+        let r = word_ranges(t);
+        let w = words_text(t, &r);
+        let end = CONTEXT_WORDS.min(w.len());
+        let mut s = w[..end].join(" ");
+        if end < w.len() {
+            s.push_str(" ...");
+        }
+        s
+    };
+    format!(
+        "In this transcript excerpt the middle line was attributed to a second speaker B interrupting speaker A:\n\nA: \"{}\"\nB: \"{}\"\nA: \"{}\"\n\nDoes the B line read as part of A's own continuous sentence (a diarization mistake) rather than another person actually speaking?\nReply with only JSON: {{\"merge\": 1}} if it is A's own sentence, {{\"merge\": 0}} if B is really another person.",
+        tail(prev),
+        mid.text.trim(),
+        head(next)
+    )
+}
+
+/// Fold turns[mid_idx] and turns[mid_idx + 1] into turns[mid_idx - 1].
+fn merge_sandwich(turns: &mut Vec<SpeakerTurn>, mid_idx: usize) {
+    let next = turns.remove(mid_idx + 1);
+    let mid = turns.remove(mid_idx);
+    let prev = &mut turns[mid_idx - 1];
+    prev.words.extend(mid.words);
+    prev.words.extend(next.words);
+    prev.rebuild_from_words();
 }
 
 /// Move whole words across the boundary according to `shift` (see
@@ -240,19 +318,63 @@ fn pick_model(app_data_dir: &PathBuf) -> Option<models::ModelDef> {
     available.into_iter().find(|m| downloaded(m))
 }
 
+/// Shared budget/failure tracking across both query passes.
+struct QueryCtx {
+    app_data_dir: PathBuf,
+    model_name: String,
+    started: Instant,
+    consecutive_failures: usize,
+}
+
+impl QueryCtx {
+    fn exhausted(&self, stats: &RefineStats) -> bool {
+        self.started.elapsed() > TOTAL_BUDGET
+            || self.consecutive_failures >= MAX_CONSECUTIVE_FAILURES
+            || stats.queried >= MAX_QUERIES
+    }
+
+    async fn ask(&mut self, prompt: &str, stats: &mut RefineStats) -> Option<String> {
+        stats.queried += 1;
+        match summary_engine::generate_micro(
+            &self.app_data_dir,
+            &self.model_name,
+            SYSTEM_PROMPT,
+            prompt,
+            16,
+            PER_QUERY_TIMEOUT,
+        )
+        .await
+        {
+            Ok(reply) => {
+                self.consecutive_failures = 0;
+                Some(reply)
+            }
+            Err(e) => {
+                warn!("Boundary refine: LLM query failed: {}", e);
+                stats.failures += 1;
+                self.consecutive_failures += 1;
+                None
+            }
+        }
+    }
+}
+
 /// Refine speaker-turn boundaries in place. Never fails the retranscription:
 /// any error just leaves the affected boundary as the acoustic pass set it.
+///
+/// Two passes: (1) phantom-interjection merge — a short turn wedged between
+/// two turns of one other speaker is folded back when the LLM reads it as
+/// that speaker's own sentence; (2) cut-position refinement — each remaining
+/// tight handover gets its cut re-chosen from ±MAX_SHIFT_WORDS candidates,
+/// recentering and re-asking when the LLM picks the outermost option.
 pub async fn refine_turns<R: Runtime>(
     app: &AppHandle<R>,
-    turns: &mut [SpeakerTurn],
+    turns: &mut Vec<SpeakerTurn>,
     cancelled: impl Fn() -> bool,
     mut on_progress: impl FnMut(usize, usize),
 ) -> RefineStats {
     let mut stats = RefineStats::default();
-
-    let boundaries = find_boundaries(turns);
-    stats.boundaries = boundaries.len();
-    if boundaries.is_empty() {
+    if turns.len() < 2 {
         return stats;
     }
 
@@ -261,85 +383,111 @@ pub async fn refine_turns<R: Runtime>(
         return stats;
     };
     let Some(model) = pick_model(&app_data_dir) else {
-        info!("Boundary refine: no local LLM downloaded, skipping {} boundaries", boundaries.len());
+        info!("Boundary refine: no local LLM downloaded, skipping");
         return stats;
     };
-    info!(
-        "Boundary refine: {} tight boundaries, using {}",
-        boundaries.len(),
-        model.name
-    );
+    let mut ctx = QueryCtx {
+        app_data_dir,
+        model_name: model.name.clone(),
+        started: Instant::now(),
+        consecutive_failures: 0,
+    };
 
-    let started = Instant::now();
-    let mut consecutive_failures = 0usize;
-    let total = boundaries.len();
-
-    for (done, boundary) in boundaries.iter().enumerate() {
-        if cancelled() {
-            info!("Boundary refine: cancelled after {} queries", stats.queried);
+    // Pass 1: phantom interjections
+    let mut i = 1;
+    while i + 1 < turns.len() {
+        if cancelled() || ctx.exhausted(&stats) {
             break;
         }
-        if started.elapsed() > TOTAL_BUDGET {
-            warn!(
-                "Boundary refine: budget exhausted after {} of {} boundaries",
-                done, total
-            );
-            break;
-        }
-        if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
-            warn!("Boundary refine: {} consecutive LLM failures, stopping", consecutive_failures);
-            break;
-        }
-        on_progress(done, total);
-
-        let (left_slice, right_slice) = turns.split_at_mut(boundary.left_idx + 1);
-        let left = &mut left_slice[boundary.left_idx];
-        let right = &mut right_slice[0];
-
-        let Some((prompt, shifts)) = build_prompt(left, right) else {
-            continue;
-        };
-        let keep_option = shifts.iter().position(|&s| s == 0).map(|p| p + 1);
-
-        stats.queried += 1;
-        match summary_engine::generate_micro(
-            &app_data_dir,
-            &model.name,
-            SYSTEM_PROMPT,
-            &prompt,
-            16,
-            PER_QUERY_TIMEOUT,
-        )
-        .await
-        {
-            Ok(reply) => {
-                consecutive_failures = 0;
-                match parse_cut(&reply) {
-                    Some(n) if (1..=shifts.len()).contains(&n) => {
-                        let shift = shifts[n - 1];
-                        if shift != 0 {
-                            info!(
-                                "Boundary refine: moving {} word(s) {} at {:.1}s ({:?} -> option {})",
-                                shift.abs(),
-                                if shift < 0 { "right" } else { "left" },
-                                right.start_ms / 1000.0,
-                                keep_option,
-                                n
-                            );
-                            apply_shift(left, right, shift);
-                            stats.moved += 1;
-                        }
+        if is_sandwich(&turns[i - 1], &turns[i], &turns[i + 1]) {
+            stats.sandwiches += 1;
+            let prompt = build_sandwich_prompt(&turns[i - 1], &turns[i], &turns[i + 1]);
+            if let Some(reply) = ctx.ask(&prompt, &mut stats).await {
+                match parse_key(&reply, "merge") {
+                    Some(1) => {
+                        info!(
+                            "Boundary refine: merging phantom interjection {:?} at {:.1}s",
+                            turns[i].text.trim(),
+                            turns[i].start_ms / 1000.0
+                        );
+                        merge_sandwich(turns, i);
+                        stats.merged += 1;
+                        // Same index now holds the following turn; re-check
+                        // without advancing
+                        continue;
                     }
+                    Some(0) => {}
                     other => {
-                        warn!("Boundary refine: unparseable reply {:?} ({:?})", reply, other);
+                        warn!("Boundary refine: unparseable merge reply {:?} ({:?})", reply, other);
                         stats.failures += 1;
                     }
                 }
             }
-            Err(e) => {
-                warn!("Boundary refine: LLM query failed: {}", e);
-                stats.failures += 1;
-                consecutive_failures += 1;
+        }
+        i += 1;
+    }
+
+    // Pass 2: cut positions on the (possibly merged) turn list
+    let boundaries = find_boundaries(turns);
+    stats.boundaries = boundaries.len();
+    info!(
+        "Boundary refine: {} sandwiches ({} merged), {} tight boundaries, model {}",
+        stats.sandwiches, stats.merged, stats.boundaries, ctx.model_name
+    );
+    let total = boundaries.len();
+
+    for (done, boundary) in boundaries.iter().enumerate() {
+        if cancelled() || ctx.exhausted(&stats) {
+            warn!(
+                "Boundary refine: stopping after {} of {} boundaries ({} queries)",
+                done, total, stats.queried
+            );
+            break;
+        }
+        on_progress(done, total);
+
+        let mut rounds = 0;
+        loop {
+            rounds += 1;
+            let (left_slice, right_slice) = turns.split_at_mut(boundary.left_idx + 1);
+            let left = &mut left_slice[boundary.left_idx];
+            let right = &mut right_slice[0];
+
+            let Some((prompt, shifts)) = build_prompt(left, right) else {
+                break;
+            };
+            let Some(reply) = ctx.ask(&prompt, &mut stats).await else {
+                break;
+            };
+            match parse_cut(&reply) {
+                Some(n) if (1..=shifts.len()).contains(&n) => {
+                    let shift = shifts[n - 1];
+                    if shift == 0 {
+                        break;
+                    }
+                    info!(
+                        "Boundary refine: moving {} word(s) {} at {:.1}s (round {})",
+                        shift.abs(),
+                        if shift < 0 { "right" } else { "left" },
+                        right.start_ms / 1000.0,
+                        rounds
+                    );
+                    apply_shift(left, right, shift);
+                    stats.moved += 1;
+                    // Outermost pick: the true cut may lie further out —
+                    // recenter and ask again
+                    if !is_extreme_shift(shift, &shifts)
+                        || rounds >= MAX_ROUNDS_PER_BOUNDARY
+                        || ctx.exhausted(&stats)
+                    {
+                        break;
+                    }
+                }
+                other => {
+                    warn!("Boundary refine: unparseable cut reply {:?} ({:?})", reply, other);
+                    stats.failures += 1;
+                    break;
+                }
             }
         }
     }
@@ -472,6 +620,92 @@ mod tests {
         assert_eq!(right.text.trim(), "moving along the street?");
         assert!((left.end_ms - 30300.0).abs() < 1e-6);
         assert!((right.start_ms - 30300.0).abs() < 1e-6);
+    }
+
+    // The real phantom-interjection case: "Yeah, you're right, but you
+    // should have | proper people | around you."
+    fn sandwich_turns() -> Vec<SpeakerTurn> {
+        vec![
+            turn(
+                vec![
+                    tok("Yeah,", 0.0, 300.0),
+                    tok(" you're", 300.0, 500.0),
+                    tok(" right,", 500.0, 800.0),
+                    tok(" but", 800.0, 900.0),
+                    tok(" you", 900.0, 1000.0),
+                    tok(" should", 1000.0, 1300.0),
+                    tok(" have", 1300.0, 1500.0),
+                ],
+                2,
+            ),
+            turn(vec![tok(" proper", 1600.0, 1900.0), tok(" people", 1900.0, 2300.0)], 1),
+            turn(
+                vec![
+                    tok(" around", 2400.0, 2700.0),
+                    tok(" you.", 2700.0, 3000.0),
+                    tok(" I", 3100.0, 3200.0),
+                    tok(" find", 3200.0, 3500.0),
+                ],
+                2,
+            ),
+        ]
+    }
+
+    #[test]
+    fn sandwich_detected_only_between_same_speaker_neighbors() {
+        let t = sandwich_turns();
+        assert!(is_sandwich(&t[0], &t[1], &t[2]));
+
+        let mut different = t.clone();
+        different[2].speaker = Some(0);
+        assert!(!is_sandwich(&different[0], &different[1], &different[2]));
+
+        let mut long_mid = t.clone();
+        long_mid[1] = turn(
+            (0..6).map(|k| tok(&format!(" w{}", k), 1600.0 + k as f64 * 100.0, 1700.0 + k as f64 * 100.0)).collect(),
+            1,
+        );
+        assert!(!is_sandwich(&long_mid[0], &long_mid[1], &long_mid[2]));
+    }
+
+    #[test]
+    fn sandwich_prompt_shows_three_lines() {
+        let t = sandwich_turns();
+        let prompt = build_sandwich_prompt(&t[0], &t[1], &t[2]);
+        assert!(prompt.contains("A: \"Yeah, you're right, but you should have\""));
+        assert!(prompt.contains("B: \"proper people\""));
+        assert!(prompt.contains("A: \"around you. I find\""));
+        assert!(prompt.contains("{\"merge\": 1}"));
+    }
+
+    #[test]
+    fn merge_sandwich_folds_three_turns_into_one() {
+        let mut t = sandwich_turns();
+        merge_sandwich(&mut t, 1);
+        assert_eq!(t.len(), 1);
+        assert_eq!(t[0].text.trim(), "Yeah, you're right, but you should have proper people around you. I find");
+        assert_eq!(t[0].speaker, Some(2));
+        assert!((t[0].end_ms - 3500.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn parse_key_reads_merge_replies() {
+        assert_eq!(parse_key("{\"merge\": 1}", "merge"), Some(1));
+        assert_eq!(parse_key("{\"merge\":0}", "merge"), Some(0));
+        assert_eq!(parse_key("nothing here", "merge"), None);
+    }
+
+    #[test]
+    fn extreme_shift_is_only_the_outermost_nonzero_options() {
+        let shifts = vec![-2, -1, 0, 1, 2];
+        assert!(is_extreme_shift(-2, &shifts));
+        assert!(is_extreme_shift(2, &shifts));
+        assert!(!is_extreme_shift(-1, &shifts));
+        assert!(!is_extreme_shift(1, &shifts));
+        assert!(!is_extreme_shift(0, &shifts));
+        // One-sided window: 0 can be an endpoint but is never "extreme"
+        assert!(!is_extreme_shift(0, &[0, 1, 2]));
+        assert!(is_extreme_shift(2, &[0, 1, 2]));
     }
 
     #[test]
