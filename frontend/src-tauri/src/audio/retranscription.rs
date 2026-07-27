@@ -574,8 +574,8 @@ async fn run_retranscription<R: Runtime>(
         )
         .await;
         info!(
-            "Boundary refinement: {} tight boundaries, {} queried, {} moved, {} failures",
-            stats.boundaries, stats.queried, stats.moved, stats.failures
+            "Boundary refinement: {} sandwiches ({} merged), {} tight boundaries, {} queried, {} moved, {} failures",
+            stats.sandwiches, stats.merged, stats.boundaries, stats.queried, stats.moved, stats.failures
         );
     }
 
