@@ -24,6 +24,7 @@ import { toast } from 'sonner';
 import { useConfig } from '@/contexts/ConfigContext';
 import { LANGUAGES } from '@/constants/languages';
 import { useTranscriptionModels, ModelOption } from '@/hooks/useTranscriptionModels';
+import { configService } from '@/services/configService';
 import Analytics from '@/lib/analytics';
 
 interface RetranscribeDialogProps {
@@ -102,6 +103,20 @@ export function RetranscribeDialog({
   // Track previous open state to only reset on closed→open transition
   const prevOpenRef = useRef(false);
 
+  const loadDiarizationDefaults = async () => {
+    try {
+      const settings = await configService.getDiarizationSettings();
+      setDiarizeEnabled(settings.enabled);
+      setNumSpeakers(settings.numSpeakers != null ? String(settings.numSpeakers) : '');
+      setSensitivity(settings.sensitivity);
+    } catch (err) {
+      console.error('Failed to load diarization settings:', err);
+      setDiarizeEnabled(true);
+      setNumSpeakers('');
+      setSensitivity('balanced');
+    }
+  };
+
   // Helper to get selected model details (memoized)
   const selectedModelDetails = useMemo((): ModelOption | undefined => {
     if (!selectedModelKey) return undefined;
@@ -131,9 +146,7 @@ export function RetranscribeDialog({
       setProgress(null);
       setError(null);
       setSelectedLang(selectedLanguage || 'auto');
-      setDiarizeEnabled(true);
-      setNumSpeakers('');
-      setSensitivity('balanced');
+      loadDiarizationDefaults();
 
       // Fetch available models using centralized hook
       fetchModels();

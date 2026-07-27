@@ -112,6 +112,14 @@ pub struct SaveTranscriptConfigRequest {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct DiarizationSettings {
+    pub enabled: bool,
+    #[serde(rename = "numSpeakers")]
+    pub num_speakers: Option<i64>,
+    pub sensitivity: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct DeleteMeetingRequest {
     pub meeting_id: String,
 }
@@ -682,6 +690,59 @@ pub async fn api_save_transcript_config<R: Runtime>(
     log_info!("Successfully saved transcript configuration.");
     Ok(
         serde_json::json!({ "status": "success", "message": "Transcript configuration saved successfully" }),
+    )
+}
+
+#[tauri::command]
+pub async fn api_get_diarization_settings<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    _auth_token: Option<String>,
+) -> Result<DiarizationSettings, String> {
+    log_info!("api_get_diarization_settings called (native)");
+    let pool = state.db_manager.pool();
+
+    match SettingsRepository::get_transcript_config(pool).await {
+        Ok(Some(config)) => Ok(DiarizationSettings {
+            enabled: config.diarization_enabled,
+            num_speakers: config.diarization_num_speakers,
+            sensitivity: config.diarization_sensitivity,
+        }),
+        Ok(None) => Ok(DiarizationSettings {
+            enabled: true,
+            num_speakers: None,
+            sensitivity: "balanced".to_string(),
+        }),
+        Err(e) => {
+            log_error!("Failed to get diarization settings: {}", e);
+            Err(e.to_string())
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn api_save_diarization_settings<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    enabled: bool,
+    num_speakers: Option<i64>,
+    sensitivity: String,
+    _auth_token: Option<String>,
+) -> Result<serde_json::Value, String> {
+    log_info!("api_save_diarization_settings called (native)");
+    let pool = state.db_manager.pool();
+
+    if let Err(e) =
+        SettingsRepository::save_diarization_settings(pool, enabled, num_speakers, &sensitivity)
+            .await
+    {
+        log_error!("Failed to save diarization settings: {}", e);
+        return Err(e.to_string());
+    }
+
+    log_info!("Successfully saved diarization settings.");
+    Ok(
+        serde_json::json!({ "status": "success", "message": "Diarization settings saved successfully" }),
     )
 }
 
