@@ -330,7 +330,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                         </SelectTrigger>
                                         <SelectContent>
                                             <SelectItem value="campplus">Fast (recommended)</SelectItem>
-                                            <SelectItem value="eres2net">Accurate (slower)</SelectItem>
+                                            <SelectItem value="eres2net">Alternative (slower)</SelectItem>
                                         </SelectContent>
                                     </Select>
                                     <p className="text-xs text-gray-500 mt-1 mx-1">

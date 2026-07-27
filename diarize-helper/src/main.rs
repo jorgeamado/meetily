@@ -128,7 +128,7 @@ struct Args {
     #[arg(long = "num-speakers")]
     num_speakers: Option<i32>,
 
-    #[arg(long, default_value_t = 0.9)]
+    #[arg(long, default_value_t = 1.1)]
     threshold: f32,
 
     #[arg(long = "min-duration-on", default_value_t = 0.3)]
@@ -199,14 +199,30 @@ fn read_wav_as_f32_mono(path: &PathBuf) -> Result<(Vec<f32>, u32)> {
     Ok((mono, spec.sample_rate))
 }
 
+/// Small ONNX ops in this pipeline synchronize heavily across the thread
+/// pool, and efficiency cores amplify the contention: on an M1, 4 P-core
+/// threads measured 2x faster than 8 mixed threads. Default to the
+/// performance-core count on Apple Silicon.
+fn default_num_threads() -> i32 {
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(out) = std::process::Command::new("sysctl")
+            .args(["-n", "hw.perflevel0.physicalcpu"])
+            .output()
+        {
+            if let Ok(p_cores) = String::from_utf8_lossy(&out.stdout).trim().parse::<i32>() {
+                return p_cores.clamp(1, 8);
+            }
+        }
+    }
+    let logical = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4) as i32;
+    (logical / 2).clamp(1, 4)
+}
+
 fn run(args: Args) -> Result<Output> {
     let (samples, sample_rate) = read_wav_as_f32_mono(&args.audio)?;
 
-    let num_threads = args.num_threads.unwrap_or_else(|| {
-        std::thread::available_parallelism()
-            .map(|n| n.get().min(8))
-            .unwrap_or(4) as i32
-    });
+    let num_threads = args.num_threads.unwrap_or_else(default_num_threads);
     eprintln!("using {} threads", num_threads);
 
     let seg_model_str = args
