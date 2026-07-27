@@ -214,6 +214,117 @@ pub fn speaker_label(speaker_index: usize) -> String {
     format!("Speaker {}", speaker_index + 1)
 }
 
+/// A whisper token with absolute timestamps on the recording timeline.
+#[derive(Debug, Clone)]
+pub struct WordSpan {
+    pub text: String,
+    pub start_ms: f64,
+    pub end_ms: f64,
+}
+
+/// Minimum duration for a speaker turn produced by splitting; shorter runs of
+/// tokens are folded into the neighboring turn to avoid label flicker on
+/// single misattributed tokens.
+const MIN_TURN_MS: f64 = 350.0;
+
+/// Split one transcribed block into per-speaker rows using its token
+/// timestamps. A block that spans a speaker change otherwise gets a single
+/// label (whoever talked longest), silently attributing the other person's
+/// words to them. Rows may only begin at a token that starts a word (leading
+/// whitespace), so a split can never land mid-word.
+///
+/// `words` carry absolute ms on the recording timeline; returned tuples are
+/// (text, start_ms, end_ms, speaker_index).
+pub fn split_block_by_speaker(
+    block_text: &str,
+    block_start_ms: f64,
+    block_end_ms: f64,
+    words: &[WordSpan],
+    diarized: &[DiarizedSegment],
+) -> Vec<(String, f64, f64, Option<usize>)> {
+    let whole_block = |txt: &str| {
+        vec![(
+            txt.to_string(),
+            block_start_ms,
+            block_end_ms,
+            assign_speaker_label(block_start_ms / 1000.0, block_end_ms / 1000.0, diarized),
+        )]
+    };
+    if diarized.is_empty() || words.len() < 2 {
+        return whole_block(block_text);
+    }
+
+    // Per-token speaker; tokens with no diarization overlap inherit their
+    // neighbor so pauses do not fragment a turn
+    let mut speakers: Vec<Option<usize>> = words
+        .iter()
+        .map(|w| assign_speaker_label(w.start_ms / 1000.0, w.end_ms / 1000.0, diarized))
+        .collect();
+    let Some(first_known) = speakers.iter().flatten().next().copied() else {
+        return whole_block(block_text);
+    };
+    let mut last = first_known;
+    for s in speakers.iter_mut() {
+        match *s {
+            Some(v) => last = v,
+            None => *s = Some(last),
+        }
+    }
+
+    // Group consecutive tokens by speaker; switch only at a word-start token
+    struct Turn {
+        text: String,
+        start_ms: f64,
+        end_ms: f64,
+        speaker: usize,
+    }
+    let mut turns: Vec<Turn> = Vec::new();
+    for (i, w) in words.iter().enumerate() {
+        let spk = speakers[i].expect("all tokens assigned above");
+        let word_start = i == 0 || w.text.starts_with(char::is_whitespace);
+        match turns.last_mut() {
+            Some(turn) if turn.speaker == spk || !word_start => {
+                turn.text.push_str(&w.text);
+                turn.end_ms = turn.end_ms.max(w.end_ms);
+            }
+            _ => turns.push(Turn {
+                text: w.text.clone(),
+                start_ms: w.start_ms,
+                end_ms: w.end_ms,
+                speaker: spk,
+            }),
+        }
+    }
+
+    // Fold sub-MIN_TURN_MS turns into the previous turn, then merge adjacent
+    // turns that ended up with the same speaker
+    let mut folded: Vec<Turn> = Vec::new();
+    for turn in turns {
+        match folded.last_mut() {
+            Some(prev)
+                if turn.end_ms - turn.start_ms < MIN_TURN_MS || prev.speaker == turn.speaker =>
+            {
+                prev.text.push_str(&turn.text);
+                prev.end_ms = prev.end_ms.max(turn.end_ms);
+            }
+            _ => folded.push(turn),
+        }
+    }
+
+    folded
+        .into_iter()
+        .map(|t| {
+            (
+                t.text.trim().to_string(),
+                t.start_ms,
+                t.end_ms,
+                Some(t.speaker),
+            )
+        })
+        .filter(|(text, _, _, _)| !text.is_empty())
+        .collect()
+}
+
 fn models_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf> {
     let base = app
         .path()
@@ -698,6 +809,84 @@ mod tests {
     #[test]
     fn empty_diarized_segments_returns_none() {
         assert_eq!(assign_speaker_label(0.0, 10.0, &[]), None);
+    }
+
+    fn w(text: &str, start_ms: f64, end_ms: f64) -> WordSpan {
+        WordSpan { text: text.to_string(), start_ms, end_ms }
+    }
+
+    fn d(start: f32, end: f32, speaker: usize) -> DiarizedSegment {
+        DiarizedSegment { start, end, speaker }
+    }
+
+    #[test]
+    fn split_block_separates_two_speakers_at_word_boundary() {
+        let words = vec![
+            w("Have", 0.0, 300.0),
+            w(" you", 300.0, 500.0),
+            w(" been?", 500.0, 900.0),
+            w(" Actually", 2000.0, 2500.0),
+            w(" missing", 2500.0, 3000.0),
+            w(" that", 3000.0, 3400.0),
+        ];
+        let diar = vec![d(0.0, 1.0, 0), d(1.9, 3.5, 1)];
+        let rows = split_block_by_speaker("ignored", 0.0, 3400.0, &words, &diar);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, "Have you been?");
+        assert_eq!(rows[0].3, Some(0));
+        assert_eq!(rows[1].0, "Actually missing that");
+        assert_eq!(rows[1].3, Some(1));
+        assert!(rows[0].2 <= rows[1].1 + 1.0);
+    }
+
+    #[test]
+    fn split_block_defers_switch_to_word_start() {
+        // Speaker changes mid-word (token without leading space): the split
+        // must wait for the next word-start token
+        let words = vec![
+            w("hel", 0.0, 200.0),
+            w("lo", 200.0, 1500.0),   // crosses into speaker 1 territory
+            w(" world", 1500.0, 2200.0),
+        ];
+        let diar = vec![d(0.0, 0.25, 0), d(0.25, 2.2, 1)];
+        let rows = split_block_by_speaker("ignored", 0.0, 2200.0, &words, &diar);
+        assert_eq!(rows.len(), 2, "rows: {:?}", rows);
+        assert_eq!(rows[0].0, "hello");
+        assert_eq!(rows[1].0, "world");
+    }
+
+    #[test]
+    fn split_block_folds_tiny_turns() {
+        let words = vec![
+            w("So", 0.0, 400.0),
+            w(" yeah", 400.0, 900.0),
+            w(" mm", 950.0, 1100.0),   // 150ms interjection from other speaker
+            w(" and", 1150.0, 1600.0),
+            w(" then", 1600.0, 2100.0),
+        ];
+        let diar = vec![d(0.0, 0.9, 0), d(0.95, 1.1, 1), d(1.15, 2.1, 0)];
+        let rows = split_block_by_speaker("ignored", 0.0, 2100.0, &words, &diar);
+        assert_eq!(rows.len(), 1, "tiny turn should fold: {:?}", rows);
+        assert_eq!(rows[0].3, Some(0));
+    }
+
+    #[test]
+    fn split_block_without_words_falls_back_to_whole_block() {
+        let diar = vec![d(0.0, 2.0, 1)];
+        let rows = split_block_by_speaker("whole text", 0.0, 2000.0, &[], &diar);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "whole text");
+        assert_eq!(rows[0].3, Some(1));
+    }
+
+    #[test]
+    fn split_block_single_speaker_stays_single_row() {
+        let words = vec![w("one", 0.0, 500.0), w(" two", 500.0, 1000.0)];
+        let diar = vec![d(0.0, 1.0, 2)];
+        let rows = split_block_by_speaker("ignored", 0.0, 1000.0, &words, &diar);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].0, "one two");
+        assert_eq!(rows[0].3, Some(2));
     }
 
     #[test]
