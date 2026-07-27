@@ -79,7 +79,7 @@ export function RetranscribeDialog({
   const [progress, setProgress] = useState<RetranscriptionProgress | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedLang, setSelectedLang] = useState(selectedLanguage || 'auto');
-  const [diarizeEnabled, setDiarizeEnabled] = useState(false);
+  const [diarizeEnabled, setDiarizeEnabled] = useState(true);
   const [numSpeakers, setNumSpeakers] = useState('');
   const [sensitivity, setSensitivity] = useState<SensitivityOption>('balanced');
 
@@ -131,7 +131,7 @@ export function RetranscribeDialog({
       setProgress(null);
       setError(null);
       setSelectedLang(selectedLanguage || 'auto');
-      setDiarizeEnabled(false);
+      setDiarizeEnabled(true);
       setNumSpeakers('');
       setSensitivity('balanced');
 
