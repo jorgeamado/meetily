@@ -32,14 +32,27 @@ const TIGHT_GAP_MS: f64 = 1200.0;
 /// How many words on each side of the current cut may move.
 const MAX_SHIFT_WORDS: usize = 2;
 
+/// Sentence-punctuation cut candidates are offered up to this many words
+/// from the current cut. A boundary error like "You think your hangovers
+/// are | worse now than when you were younger?" is 7 words off — no ±2
+/// option ever looks right, but "cut after 'younger?'" is instantly
+/// recognizable.
+const PUNCT_SHIFT_WORDS: usize = 8;
+
+/// Cap on options shown per query.
+const MAX_OPTIONS: usize = 7;
+
 /// Words of context shown on each side of a candidate cut.
 const CONTEXT_WORDS: usize = 12;
 
 /// A short turn attributed to speaker B while both neighbors belong to
 /// speaker A is usually diarization noise cutting through the middle of A's
 /// sentence ("you should have | proper people | around you"). Turns up to
-/// this many words qualify for a merge query.
-const SANDWICH_MAX_WORDS: usize = 5;
+/// this many words qualify for a merge query. Kept small on purpose: a
+/// 5-word turn like "Yeah, you're right, but you" is often a REAL response
+/// that merely reads like the surrounding speaker's discourse filler, and a
+/// text-only model cannot tell those apart.
+const SANDWICH_MAX_WORDS: usize = 3;
 
 /// When the LLM picks the outermost cut option, the true boundary may lie
 /// further still — re-ask with the window recentered, up to this many rounds
@@ -128,14 +141,45 @@ fn find_boundaries(turns: &[SpeakerTurn]) -> Vec<Boundary> {
     out
 }
 
+/// True when a word plausibly ends a sentence — a natural cut point.
+fn ends_sentence(word: &str) -> bool {
+    word.trim_end_matches(['"', '\'', ')', ']', '»'])
+        .ends_with(['.', '?', '!', '…'])
+}
+
 /// Candidate cut shifts for one boundary, in whole words. Negative = move
 /// that many of the left turn's final words to the right turn; positive =
 /// move that many of the right turn's leading words to the left. Each side
 /// must keep at least one word.
-fn candidate_shifts(left_words: usize, right_words: usize) -> Vec<i32> {
-    let take_left = MAX_SHIFT_WORDS.min(left_words.saturating_sub(1)) as i32;
-    let take_right = MAX_SHIFT_WORDS.min(right_words.saturating_sub(1)) as i32;
-    (-take_left..=take_right).collect()
+///
+/// The base set is every shift within ±MAX_SHIFT_WORDS; further out (to
+/// ±PUNCT_SHIFT_WORDS) only cuts falling right after sentence punctuation
+/// are offered, so long-range errors stay reachable without exploding the
+/// option list.
+fn candidate_shifts(l_words: &[String], r_words: &[String]) -> Vec<i32> {
+    let take_left = PUNCT_SHIFT_WORDS.min(l_words.len().saturating_sub(1)) as i32;
+    let take_right = PUNCT_SHIFT_WORDS.min(r_words.len().saturating_sub(1)) as i32;
+    // Last word on the A side if this shift were applied
+    let a_side_last = |s: i32| -> &str {
+        if s > 0 {
+            &r_words[s as usize - 1]
+        } else {
+            &l_words[(l_words.len() as i32 + s.min(0)) as usize - 1]
+        }
+    };
+    let mut shifts: Vec<i32> = (-take_left..=take_right)
+        .filter(|&s| s.unsigned_abs() as usize <= MAX_SHIFT_WORDS || ends_sentence(a_side_last(s)))
+        .collect();
+    // Too many options confuse a small model — keep 0, then the nearest
+    while shifts.len() > MAX_OPTIONS {
+        let farthest = shifts
+            .iter()
+            .copied()
+            .max_by_key(|&s| (s.unsigned_abs(), s != 0))
+            .unwrap();
+        shifts.retain(|&s| s != farthest);
+    }
+    shifts
 }
 
 /// Render the numbered options. Returns (prompt, shifts) — shifts[n-1] is the
@@ -143,12 +187,12 @@ fn candidate_shifts(left_words: usize, right_words: usize) -> Vec<i32> {
 fn build_prompt(left: &SpeakerTurn, right: &SpeakerTurn) -> Option<(String, Vec<i32>)> {
     let l_ranges = word_ranges(left);
     let r_ranges = word_ranges(right);
-    let shifts = candidate_shifts(l_ranges.len(), r_ranges.len());
+    let l_words = words_text(left, &l_ranges);
+    let r_words = words_text(right, &r_ranges);
+    let shifts = candidate_shifts(&l_words, &r_words);
     if shifts.len() < 2 {
         return None;
     }
-    let l_words = words_text(left, &l_ranges);
-    let r_words = words_text(right, &r_ranges);
 
     let mut prompt = String::from(
         "A transcript was split between two speakers A and B, but the split point may be off by a word or two. Pick the option where each speaker's words read as natural, complete utterances.\n\n",
@@ -463,6 +507,11 @@ pub async fn refine_turns<R: Runtime>(
                 Some(n) if (1..=shifts.len()).contains(&n) => {
                     let shift = shifts[n - 1];
                     if shift == 0 {
+                        info!(
+                            "Boundary refine: keeping cut at {:.1}s (round {})",
+                            right.start_ms / 1000.0,
+                            rounds
+                        );
                         break;
                     }
                     info!(
@@ -574,12 +623,89 @@ mod tests {
         assert!(is_tight_boundary(&left, &right).is_none());
     }
 
+    fn plain_words(n: usize) -> Vec<String> {
+        (0..n).map(|k| format!("w{}", k)).collect()
+    }
+
     #[test]
     fn candidate_shifts_respect_one_word_minimum() {
-        assert_eq!(candidate_shifts(6, 5), vec![-2, -1, 0, 1, 2]);
-        assert_eq!(candidate_shifts(1, 5), vec![0, 1, 2]);
-        assert_eq!(candidate_shifts(2, 1), vec![-1, 0]);
-        assert_eq!(candidate_shifts(1, 1), vec![0]);
+        assert_eq!(candidate_shifts(&plain_words(6), &plain_words(5)), vec![-2, -1, 0, 1, 2]);
+        assert_eq!(candidate_shifts(&plain_words(1), &plain_words(5)), vec![0, 1, 2]);
+        assert_eq!(candidate_shifts(&plain_words(2), &plain_words(1)), vec![-1, 0]);
+        assert_eq!(candidate_shifts(&plain_words(1), &plain_words(1)), vec![0]);
+    }
+
+    #[test]
+    fn punctuation_cut_candidates_reach_past_the_local_window() {
+        // The hangovers case: correct cut is 7 words into the right turn,
+        // right after "younger?"
+        let l_words: Vec<String> =
+            ["You", "think", "your", "hangovers", "are"].map(String::from).to_vec();
+        let r_words: Vec<String> = [
+            "worse", "now", "than", "when", "you", "were", "younger?", "Like,", "the", "main",
+            "problem", "is,",
+        ]
+        .map(String::from)
+        .to_vec();
+        let shifts = candidate_shifts(&l_words, &r_words);
+        assert!(shifts.contains(&7), "punct candidate after 'younger?' missing: {:?}", shifts);
+        assert!(shifts.len() <= MAX_OPTIONS);
+        // No punctuation on the left side within reach, so nothing beyond -2
+        assert_eq!(shifts.iter().copied().min(), Some(-2));
+    }
+
+    #[test]
+    fn hangovers_prompt_offers_the_full_question_option() {
+        let left = turn(
+            vec![
+                tok("You", 121000.0, 121200.0),
+                tok(" think", 121200.0, 121500.0),
+                tok(" your", 121500.0, 121700.0),
+                tok(" hangovers", 121700.0, 122300.0),
+                tok(" are", 122300.0, 122500.0),
+            ],
+            1,
+        );
+        let right = turn(
+            vec![
+                tok(" worse", 123000.0, 123300.0),
+                tok(" now", 123300.0, 123500.0),
+                tok(" than", 123500.0, 123700.0),
+                tok(" when", 123700.0, 123900.0),
+                tok(" you", 123900.0, 124000.0),
+                tok(" were", 124000.0, 124200.0),
+                tok(" younger?", 124200.0, 124800.0),
+                tok(" Like,", 125200.0, 125500.0),
+                tok(" the", 125500.0, 125600.0),
+                tok(" main", 125600.0, 125900.0),
+                tok(" problem", 125900.0, 126400.0),
+            ],
+            2,
+        );
+        let (prompt, shifts) = build_prompt(&left, &right).expect("prompt");
+        let full_q = shifts.iter().position(|&s| s == 7).expect("shift 7 offered") + 1;
+        assert!(prompt.contains(&format!(
+            "Option {}:\nA: \"You think your hangovers are worse now than when you were younger?\"\nB: \"Like, the main problem\"",
+            full_q
+        )), "prompt:\n{}", prompt);
+    }
+
+    #[test]
+    fn five_word_response_phrase_is_not_a_sandwich() {
+        // "Yeah, you're right, but you" is a REAL response — merging it was
+        // the regression in the 2nd meeting run
+        let mut t = sandwich_turns();
+        t[1] = turn(
+            vec![
+                tok(" Yeah,", 1600.0, 1700.0),
+                tok(" you're", 1700.0, 1800.0),
+                tok(" right,", 1800.0, 2000.0),
+                tok(" but", 2000.0, 2100.0),
+                tok(" you", 2100.0, 2300.0),
+            ],
+            1,
+        );
+        assert!(!is_sandwich(&t[0], &t[1], &t[2]));
     }
 
     #[test]
