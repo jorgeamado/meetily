@@ -1216,3 +1216,19 @@ pub async fn attempt_device_reconnect(
         }
     }
 }
+
+/// Toggle live transcription while recording. Audio capture and saving continue
+/// regardless; when disabled the pipeline skips VAD + transcription to keep CPU
+/// low, and Retranscribe can recover the transcript later.
+#[tauri::command]
+pub async fn set_live_transcription(enabled: bool) -> bool {
+    super::pipeline::set_live_transcription_enabled(enabled);
+    info!("Live transcription toggled: {}", if enabled { "on" } else { "off" });
+    enabled
+}
+
+/// Current state of the live transcription toggle
+#[tauri::command]
+pub async fn is_live_transcription_enabled() -> bool {
+    super::pipeline::is_live_transcription_enabled()
+}

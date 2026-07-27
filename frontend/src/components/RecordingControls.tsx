@@ -3,7 +3,7 @@
 import { invoke } from '@tauri-apps/api/core';
 import { appDataDir } from '@tauri-apps/api/path';
 import { useCallback, useEffect, useState, useRef } from 'react';
-import { Play, Pause, Square, Mic, AlertCircle, X } from 'lucide-react';
+import { Play, Pause, Square, Mic, AlertCircle, X, Captions, CaptionsOff } from 'lucide-react';
 import { ProcessRequest, SummaryResponse } from '@/types/summary';
 import { listen } from '@tauri-apps/api/event';
 import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
@@ -58,6 +58,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
   const [isValidatingModel, setIsValidatingModel] = useState(false);
   const [speechDetected, setSpeechDetected] = useState(false);
   const [deviceError, setDeviceError] = useState<{ title: string, message: string } | null>(null);
+  const [liveTranscription, setLiveTranscription] = useState(true);
 
   const currentTime = 0;
   const duration = 0;
@@ -82,6 +83,23 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
     };
     checkTauri();
   }, []);
+
+  // The toggle is backend state (survives component remounts) - sync on mount
+  useEffect(() => {
+    invoke<boolean>('is_live_transcription_enabled')
+      .then(setLiveTranscription)
+      .catch((error) => console.error('Failed to read live transcription state:', error));
+  }, []);
+
+  const handleToggleLiveTranscription = useCallback(async () => {
+    const next = !liveTranscription;
+    try {
+      await invoke('set_live_transcription', { enabled: next });
+      setLiveTranscription(next);
+    } catch (error) {
+      console.error('Failed to toggle live transcription:', error);
+    }
+  }, [liveTranscription]);
 
   const handleStartRecording = useCallback(async () => {
     if (isStarting || isValidatingModel) return;
@@ -466,6 +484,30 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
                         </TooltipTrigger>
                         <TooltipContent>
                           <p>Stop recording</p>
+                        </TooltipContent>
+                      </Tooltip>
+
+                      <Tooltip>
+                        <TooltipTrigger asChild>
+                          <button
+                            onClick={() => {
+                              Analytics.trackButtonClick('toggle_live_transcription', 'recording_controls');
+                              handleToggleLiveTranscription();
+                            }}
+                            className={`w-10 h-10 flex items-center justify-center ${liveTranscription
+                              ? 'bg-white border-2 border-gray-300 text-gray-600 hover:border-gray-400 hover:bg-gray-50'
+                              : 'bg-gray-100 border-2 border-gray-300 text-gray-400 hover:border-gray-400 hover:text-gray-500'
+                              } rounded-full transition-colors`}
+                          >
+                            {liveTranscription ? <Captions size={16} /> : <CaptionsOff size={16} />}
+                          </button>
+                        </TooltipTrigger>
+                        <TooltipContent>
+                          <p>
+                            {liveTranscription
+                              ? 'Turn off live transcription to save CPU - recording continues'
+                              : 'Live transcription is off - recording continues; turn back on'}
+                          </p>
                         </TooltipContent>
                       </Tooltip>
                     </>

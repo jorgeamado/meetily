@@ -605,6 +605,9 @@ pub fn run() {
             audio::recording_commands::pause_recording,
             audio::recording_commands::resume_recording,
             audio::recording_commands::is_recording_paused,
+            // Live transcription toggle (CPU saver - recording continues)
+            audio::recording_commands::set_live_transcription,
+            audio::recording_commands::is_live_transcription_enabled,
             audio::recording_commands::get_recording_state,
             audio::recording_commands::get_meeting_folder_path,
             // Reload sync commands (retrieve transcript history and meeting name)
