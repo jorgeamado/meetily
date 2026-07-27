@@ -66,7 +66,10 @@ pub fn whisper_context_acceleration_for(
     let use_gpu = !matches!(compiled_backend, WhisperCompiledBackend::Cpu);
     let fast_tier = matches!(performance_tier, PerformanceTier::High | PerformanceTier::Ultra);
     let flash_attn = match compiled_backend {
-        WhisperCompiledBackend::Metal | WhisperCompiledBackend::Cuda => fast_tier,
+        // Flash attention on Metal is a pure win at every tier - base chips
+        // (tiered Medium since chip-class detection) need the speedup most
+        WhisperCompiledBackend::Metal => true,
+        WhisperCompiledBackend::Cuda => fast_tier,
         WhisperCompiledBackend::Vulkan | WhisperCompiledBackend::HipBlas | WhisperCompiledBackend::Cpu => false,
     };
 
@@ -107,6 +110,24 @@ mod tests {
 
         assert!(params.use_gpu);
         assert!(!params.flash_attn);
+    }
+
+    #[test]
+    fn acceleration_metal_backend_enables_flash_attention_at_every_tier() {
+        for tier in [
+            PerformanceTier::Low,
+            PerformanceTier::Medium,
+            PerformanceTier::High,
+            PerformanceTier::Ultra,
+        ] {
+            let params = whisper_context_acceleration_for(
+                WhisperCompiledBackend::Metal,
+                GpuType::Metal,
+                tier,
+            );
+            assert!(params.use_gpu);
+            assert!(params.flash_attn, "flash attention should be on for Metal at {:?}", tier);
+        }
     }
 
     #[test]

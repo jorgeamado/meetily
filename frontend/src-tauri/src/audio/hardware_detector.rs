@@ -22,6 +22,13 @@ pub enum GpuType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppleChipClass {
+    Base,
+    Pro,
+    MaxOrUltra,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PerformanceTier {
     Low,      // CPU-only, limited resources
     Medium,   // CPU-only but powerful, or basic GPU
@@ -107,13 +114,56 @@ impl HardwareProfile {
 
     /// Detect available system memory in GB
     fn detect_memory_gb() -> u8 {
-        // Simple memory detection - could be enhanced with system-specific calls
-        match std::env::var("MEMORY_GB") {
-            Ok(mem_str) => mem_str.parse().unwrap_or(8),
-            Err(_) => {
-                // Default estimates based on common configurations
-                8 // Conservative default
+        if let Ok(mem_str) = std::env::var("MEMORY_GB") {
+            return mem_str.parse().unwrap_or(8);
+        }
+
+        #[cfg(target_os = "macos")]
+        {
+            if let Ok(output) = std::process::Command::new("sysctl").args(["-n", "hw.memsize"]).output() {
+                if let Ok(bytes) = String::from_utf8_lossy(&output.stdout).trim().parse::<u64>() {
+                    return (bytes / (1024 * 1024 * 1024)).min(255) as u8;
+                }
             }
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            if let Ok(meminfo) = std::fs::read_to_string("/proc/meminfo") {
+                if let Some(kb) = meminfo
+                    .lines()
+                    .find(|l| l.starts_with("MemTotal:"))
+                    .and_then(|l| l.split_whitespace().nth(1))
+                    .and_then(|v| v.parse::<u64>().ok())
+                {
+                    return (kb / (1024 * 1024)).min(255) as u8;
+                }
+            }
+        }
+
+        8 // Conservative default
+    }
+
+    /// Apple Silicon chip class parsed from the CPU brand string. Core/memory
+    /// counts cannot distinguish an M1 base from an M4 Max, but whisper
+    /// throughput differs ~5x between them, so tiering must use the variant.
+    #[cfg(target_os = "macos")]
+    fn apple_chip_class() -> AppleChipClass {
+        let brand = std::process::Command::new("sysctl")
+            .args(["-n", "machdep.cpu.brand_string"])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+            .unwrap_or_default();
+        Self::classify_apple_brand(&brand)
+    }
+
+    fn classify_apple_brand(brand: &str) -> AppleChipClass {
+        if brand.contains("Ultra") || brand.contains("Max") {
+            AppleChipClass::MaxOrUltra
+        } else if brand.contains("Pro") {
+            AppleChipClass::Pro
+        } else {
+            AppleChipClass::Base
         }
     }
 
@@ -121,6 +171,19 @@ impl HardwareProfile {
     fn calculate_performance_tier(cpu_cores: u8, gpu_type: &GpuType, memory_gb: u8) -> PerformanceTier {
         match gpu_type {
             GpuType::Metal => {
+                #[cfg(target_os = "macos")]
+                {
+                    let _ = (cpu_cores, memory_gb);
+                    // Whisper on Apple Silicon is GPU-bound; tier by chip variant.
+                    // A base M1 at beam 5 transcribes slower than realtime, while
+                    // a Max/Ultra handles it easily.
+                    return match Self::apple_chip_class() {
+                        AppleChipClass::MaxOrUltra => PerformanceTier::Ultra,
+                        AppleChipClass::Pro => PerformanceTier::High,
+                        AppleChipClass::Base => PerformanceTier::Medium,
+                    };
+                }
+                #[cfg(not(target_os = "macos"))]
                 if memory_gb >= 16 && cpu_cores >= 8 {
                     PerformanceTier::Ultra
                 } else {
@@ -278,6 +341,17 @@ mod tests {
     use super::*;
 
     #[test]
+    fn apple_brand_classification_maps_variants() {
+        assert_eq!(HardwareProfile::classify_apple_brand("Apple M1"), AppleChipClass::Base);
+        assert_eq!(HardwareProfile::classify_apple_brand("Apple M2"), AppleChipClass::Base);
+        assert_eq!(HardwareProfile::classify_apple_brand("Apple M1 Pro"), AppleChipClass::Pro);
+        assert_eq!(HardwareProfile::classify_apple_brand("Apple M3 Pro"), AppleChipClass::Pro);
+        assert_eq!(HardwareProfile::classify_apple_brand("Apple M1 Max"), AppleChipClass::MaxOrUltra);
+        assert_eq!(HardwareProfile::classify_apple_brand("Apple M2 Ultra"), AppleChipClass::MaxOrUltra);
+        assert_eq!(HardwareProfile::classify_apple_brand(""), AppleChipClass::Base);
+    }
+
+    #[test]
     fn test_hardware_detection() {
         let profile = HardwareProfile::detect();
         assert!(profile.cpu_cores > 0);
@@ -303,8 +377,16 @@ mod tests {
         let low_tier = HardwareProfile::calculate_performance_tier(2, &GpuType::None, 4);
         assert_eq!(low_tier, PerformanceTier::Low);
 
-        let high_tier = HardwareProfile::calculate_performance_tier(8, &GpuType::Metal, 16);
-        assert_eq!(high_tier, PerformanceTier::Ultra);
+        // On macOS the Metal tier comes from the chip variant (an M1 base and an
+        // M4 Max share core/memory shapes but differ ~5x in whisper throughput),
+        // so this machine-dependent path is covered by
+        // apple_brand_classification_maps_variants instead. Elsewhere the
+        // core/memory heuristic still applies.
+        #[cfg(not(target_os = "macos"))]
+        {
+            let high_tier = HardwareProfile::calculate_performance_tier(8, &GpuType::Metal, 16);
+            assert_eq!(high_tier, PerformanceTier::Ultra);
+        }
     }
 
     #[test]
