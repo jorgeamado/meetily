@@ -1637,7 +1637,7 @@ dependencies = [
  "hound",
  "serde",
  "serde_json",
- "sherpa-onnx",
+ "sherpa-onnx-sys",
 ]
 
 [[package]]
@@ -5838,17 +5838,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f40ca3c46823713e0d4209592e8d6e826aa57e928f09752619fc696c499637f6"
 dependencies = [
  "lazy_static",
-]
-
-[[package]]
-name = "sherpa-onnx"
-version = "1.13.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b142d3f255cb4e4b7808ea25869db6f5714e0a3550da355234483b4db552055"
-dependencies = [
- "serde",
- "serde_json",
- "sherpa-onnx-sys",
 ]
 
 [[package]]
