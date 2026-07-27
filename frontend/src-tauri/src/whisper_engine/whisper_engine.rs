@@ -514,6 +514,22 @@ impl WhisperEngine {
     
     /// Transcribe audio with streaming support for partial results and adaptive quality
     pub async fn transcribe_audio_with_confidence(&self, audio_data: Vec<f32>, language: Option<String>) -> Result<(String, f32, bool)> {
+        let (text, conf, is_partial, _) = self.transcribe_internal(audio_data, language).await?;
+        Ok((text, conf, is_partial))
+    }
+
+    /// Like transcribe_audio_with_confidence, but also returns per-token
+    /// timestamps (chunk-relative ms) for speaker-turn splitting.
+    pub async fn transcribe_audio_with_words(
+        &self,
+        audio_data: Vec<f32>,
+        language: Option<String>,
+    ) -> Result<(String, f32, Vec<crate::audio::diarization::WordSpan>)> {
+        let (text, conf, _, words) = self.transcribe_internal(audio_data, language).await?;
+        Ok((text, conf, words))
+    }
+
+    async fn transcribe_internal(&self, audio_data: Vec<f32>, language: Option<String>) -> Result<(String, f32, bool, Vec<crate::audio::diarization::WordSpan>)> {
         let ctx_lock = self.current_context.read().await;
         let ctx = ctx_lock.as_ref()
             .ok_or_else(|| anyhow!("No model loaded. Please load a model first."))?;
@@ -591,6 +607,7 @@ impl WhisperEngine {
         let mut result = String::new();
         let mut total_confidence = 0.0;
         let mut segment_count = 0;
+        let mut words: Vec<crate::audio::diarization::WordSpan> = Vec::new();
 
         let num_segments = num_segments?;
         for i in 0..num_segments {
@@ -616,6 +633,31 @@ impl WhisperEngine {
                 }
                 result.push_str(cleaned_text);
             }
+
+            // Collect token timestamps (centiseconds -> ms) for speaker-turn
+            // splitting; skip whisper's special/control tokens
+            if let Ok(n_tokens) = state.full_n_tokens(i) {
+                let mut last_end_ms = words.last().map(|w| w.end_ms).unwrap_or(0.0);
+                for j in 0..n_tokens {
+                    let tok_text = match state.full_get_token_text_lossy(i, j) {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    };
+                    if tok_text.starts_with("[_") || tok_text.starts_with("<|") {
+                        continue;
+                    }
+                    if let Ok(data) = state.full_get_token_data(i, j) {
+                        let start_ms = if data.t0 >= 0 { data.t0 as f64 * 10.0 } else { last_end_ms };
+                        let end_ms = if data.t1 >= 0 { data.t1 as f64 * 10.0 } else { start_ms };
+                        last_end_ms = end_ms;
+                        words.push(crate::audio::diarization::WordSpan {
+                            text: tok_text,
+                            start_ms,
+                            end_ms,
+                        });
+                    }
+                }
+            }
         }
 
         let final_result = result.trim().to_string();
@@ -627,7 +669,7 @@ impl WhisperEngine {
             0.0
         };
 
-        Ok((cleaned_result, avg_confidence, is_partial))
+        Ok((cleaned_result, avg_confidence, is_partial, words))
     }
 
     pub async fn transcribe_audio(&self, audio_data: Vec<f32>, language: Option<String>) -> Result<String> {

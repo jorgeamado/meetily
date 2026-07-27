@@ -402,7 +402,8 @@ async fn run_retranscription<R: Runtime>(
     info!("Processing {} segments (after splitting)", processable_count);
 
     // Process each speech segment with progress updates
-    let mut all_transcripts: Vec<(String, f64, f64)> = Vec::new(); // (text, start_ms, end_ms)
+    // (text, start_ms, end_ms, token spans in absolute ms for speaker splitting)
+    let mut all_transcripts: Vec<(String, f64, f64, Vec<diarization::WordSpan>)> = Vec::new();
     let mut total_confidence = 0.0f32;
 
     for (i, segment) in processable_segments.iter().enumerate() {
@@ -437,20 +438,29 @@ async fn run_retranscription<R: Runtime>(
         }
 
         // Transcribe this segment
-        let (text, conf) = if use_parakeet {
+        let (text, conf, words) = if use_parakeet {
             let engine = parakeet_engine.as_ref().unwrap();
             let text = engine
                 .transcribe_audio(segment.samples.clone())
                 .await
                 .map_err(|e| anyhow!("Parakeet transcription failed on segment {}: {}", i, e))?;
-            (text, 0.9f32)
+            (text, 0.9f32, Vec::new())
         } else {
             let engine = whisper_engine.as_ref().unwrap();
-            let (text, conf, _) = engine
-                .transcribe_audio_with_confidence(segment.samples.clone(), language.clone())
+            let (text, conf, words) = engine
+                .transcribe_audio_with_words(segment.samples.clone(), language.clone())
                 .await
                 .map_err(|e| anyhow!("Whisper transcription failed on segment {}: {}", i, e))?;
-            (text, conf)
+            // Token times are chunk-relative; shift onto the recording timeline
+            let words = words
+                .into_iter()
+                .map(|w| diarization::WordSpan {
+                    text: w.text,
+                    start_ms: w.start_ms + segment.start_timestamp_ms,
+                    end_ms: w.end_ms + segment.start_timestamp_ms,
+                })
+                .collect();
+            (text, conf, words)
         };
 
         // Skip empty transcripts
@@ -461,7 +471,7 @@ async fn run_retranscription<R: Runtime>(
                 i + 1, processable_count, segment_duration_sec, conf,
                 if trimmed.len() > 80 { let mut end = 80; while !trimmed.is_char_boundary(end) { end -= 1; } &trimmed[..end] } else { trimmed }
             );
-            all_transcripts.push((text, segment.start_timestamp_ms, segment.end_timestamp_ms));
+            all_transcripts.push((text, segment.start_timestamp_ms, segment.end_timestamp_ms, words));
             total_confidence += conf;
         } else {
             debug!("Segment {}/{}: {:.1}s — empty transcription", i + 1, processable_count, segment_duration_sec);
@@ -513,8 +523,37 @@ async fn run_retranscription<R: Runtime>(
 
     emit_progress(&app, &meeting_id, "saving", 80, "Saving transcripts...");
 
+    // Split blocks that span speaker changes into per-turn rows using token
+    // timestamps, so one row never mixes two speakers' words. Blocks without
+    // token data (Parakeet) keep whole-block max-overlap labeling.
+    let labeled_blocks: Vec<(String, f64, f64, Option<usize>)> = all_transcripts
+        .iter()
+        .flat_map(|(text, start_ms, end_ms, words)| {
+            if diarized_segments.is_empty() {
+                vec![(text.clone(), *start_ms, *end_ms, None)]
+            } else if words.is_empty() {
+                vec![(
+                    text.clone(),
+                    *start_ms,
+                    *end_ms,
+                    diarization::assign_speaker_label(
+                        *start_ms / 1000.0,
+                        *end_ms / 1000.0,
+                        &diarized_segments,
+                    ),
+                )]
+            } else {
+                diarization::split_block_by_speaker(text, *start_ms, *end_ms, words, &diarized_segments)
+            }
+        })
+        .collect();
+
     // Create transcript segments with proper timestamps from VAD
-    let segments = create_transcript_segments(&all_transcripts);
+    let plain_blocks: Vec<(String, f64, f64)> = labeled_blocks
+        .iter()
+        .map(|(t, s, e, _)| (t.clone(), *s, *e))
+        .collect();
+    let segments = create_transcript_segments(&plain_blocks);
 
     // Save to database
     let app_state = app
@@ -534,14 +573,8 @@ async fn run_retranscription<R: Runtime>(
         .await
         .map_err(|e| anyhow!("Failed to delete existing transcripts: {}", e))?;
 
-    for segment in &segments {
-        let speaker = match (segment.audio_start_time, segment.audio_end_time) {
-            (Some(start), Some(end)) if !diarized_segments.is_empty() => {
-                diarization::assign_speaker_label(start, end, &diarized_segments)
-                    .map(diarization::speaker_label)
-            }
-            _ => None,
-        };
+    for (segment, (_, _, _, speaker_idx)) in segments.iter().zip(labeled_blocks.iter()) {
+        let speaker = speaker_idx.map(diarization::speaker_label);
 
         sqlx::query(
             "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker)
