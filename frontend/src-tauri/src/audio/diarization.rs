@@ -84,7 +84,17 @@ fn resolve_embedding_model(key: Option<&str>) -> &'static EmbeddingModelSpec {
     })
 }
 
-const DIARIZE_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Kill the helper only when it stops reporting progress. Long meetings
+/// legitimately run for 30+ minutes, so a fixed wall-clock cap is wrong; the
+/// generous stall window covers silent phases (model load, final clustering)
+/// that emit no PROGRESS lines.
+const DIARIZE_STALL_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+
+/// Absolute safety net for a wedged-but-chatty helper, scaled with input
+/// length: at least 30 minutes, otherwise 1.5x the audio duration.
+fn diarize_hard_cap(audio_secs: f64) -> Duration {
+    Duration::from_secs((30 * 60).max((audio_secs * 1.5) as u64))
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -151,7 +161,8 @@ pub async fn diarize<R: Runtime>(
         .await
         .with_context(|| format!("Failed to write temp diarization wav: {}", temp_path.display()))?;
 
-    let result = run_diarize_helper(&temp_path, &models, opts, |pct, msg| {
+    let audio_secs = samples_16k_mono.len() as f64 / 16000.0;
+    let result = run_diarize_helper(&temp_path, &models, opts, audio_secs, |pct, msg| {
         on_progress(50 + pct / 2, msg);
     })
     .await;
@@ -450,6 +461,7 @@ async fn run_diarize_helper(
     wav_path: &Path,
     models: &ModelPaths,
     opts: &DiarizeOptions,
+    audio_secs: f64,
     mut on_progress: impl FnMut(u32, &str) + Send,
 ) -> Result<HelperOutput> {
     let binary = resolve_diarize_helper_binary()?;
@@ -509,12 +521,24 @@ async fn run_diarize_helper(
     });
 
     let start = Instant::now();
+    let hard_cap = diarize_hard_cap(audio_secs);
     let mut last_known_pct: u32 = 0;
-    let mut last_progress_at = Instant::now();
+    // Real progress events from the helper; drives the stall detector
+    let mut last_event_at = Instant::now();
+    // UI update cadence only; must not feed the stall detector
+    let mut last_display_at = Instant::now();
     let status = loop {
-        if start.elapsed() > DIARIZE_TIMEOUT {
+        if start.elapsed() > hard_cap {
             let _ = child.kill().await;
-            return Err(anyhow!("diarize-helper timed out after {:?}", DIARIZE_TIMEOUT));
+            return Err(anyhow!("diarize-helper exceeded hard cap of {:?}", hard_cap));
+        }
+        if last_event_at.elapsed() > DIARIZE_STALL_TIMEOUT {
+            let _ = child.kill().await;
+            return Err(anyhow!(
+                "diarize-helper made no progress for {:?} (last at {}%)",
+                DIARIZE_STALL_TIMEOUT,
+                last_known_pct
+            ));
         }
         if super::retranscription::is_cancellation_requested() {
             let _ = child.kill().await;
@@ -524,7 +548,8 @@ async fn run_diarize_helper(
         {
             let mut queue = progress_queue.lock().unwrap();
             while let Some(event) = queue.pop_front() {
-                last_progress_at = Instant::now();
+                last_event_at = Instant::now();
+                last_display_at = Instant::now();
                 match event {
                     HelperProgress::Percent(pct) => {
                         last_known_pct = pct;
@@ -537,12 +562,12 @@ async fn run_diarize_helper(
             }
         }
 
-        if last_progress_at.elapsed() > DIARIZE_PROGRESS_IDLE_TIMEOUT {
+        if last_display_at.elapsed() > DIARIZE_PROGRESS_IDLE_TIMEOUT {
             on_progress(
                 last_known_pct,
                 &format!("Identifying speakers... ({})", format_elapsed(start.elapsed())),
             );
-            last_progress_at = Instant::now();
+            last_display_at = Instant::now();
         }
 
         match tokio::time::timeout(Duration::from_millis(300), child.wait()).await {

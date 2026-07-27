@@ -136,6 +136,10 @@ struct Args {
 
     #[arg(long = "min-duration-off", default_value_t = 0.5)]
     min_duration_off: f32,
+
+    /// Override the ONNX intra-op thread count (default: min(cores, 8))
+    #[arg(long = "num-threads")]
+    num_threads: Option<i32>,
 }
 
 #[derive(Serialize)]
@@ -198,9 +202,11 @@ fn read_wav_as_f32_mono(path: &PathBuf) -> Result<(Vec<f32>, u32)> {
 fn run(args: Args) -> Result<Output> {
     let (samples, sample_rate) = read_wav_as_f32_mono(&args.audio)?;
 
-    let num_threads = std::thread::available_parallelism()
-        .map(|n| n.get().min(8))
-        .unwrap_or(4) as i32;
+    let num_threads = args.num_threads.unwrap_or_else(|| {
+        std::thread::available_parallelism()
+            .map(|n| n.get().min(8))
+            .unwrap_or(4) as i32
+    });
     eprintln!("using {} threads", num_threads);
 
     let seg_model_str = args
