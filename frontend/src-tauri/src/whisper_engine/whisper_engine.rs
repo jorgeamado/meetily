@@ -37,6 +37,9 @@ pub struct WhisperEngine {
     models_dir: PathBuf,
     current_context: Arc<RwLock<Option<WhisperContext>>>,
     current_model: Arc<RwLock<Option<String>>>,
+    // Whether the loaded context has DTW token timestamps enabled (mutually
+    // exclusive with flash attention; used by retranscription only)
+    current_dtw: Arc<RwLock<bool>>,
     available_models: Arc<RwLock<HashMap<String, ModelInfo>>>,
     // State tracking for smart logging
     last_transcription_was_short: Arc<RwLock<bool>>,
@@ -153,6 +156,7 @@ impl WhisperEngine {
             models_dir,
             current_context: Arc::new(RwLock::new(None)),
             current_model: Arc::new(RwLock::new(None)),
+            current_dtw: Arc::new(RwLock::new(false)),
             available_models: Arc::new(RwLock::new(HashMap::new())),
             // Initialize state tracking
             last_transcription_was_short: Arc::new(RwLock::new(false)),
@@ -259,21 +263,69 @@ impl WhisperEngine {
     }
     
     pub async fn load_model(&self, model_name: &str) -> Result<()> {
+        self.load_model_with_dtw(model_name, false).await
+    }
+
+    /// Whether the currently loaded context has DTW token timestamps enabled
+    pub async fn is_dtw_enabled(&self) -> bool {
+        *self.current_dtw.read().await
+    }
+
+    /// DTW alignment-heads preset for a model name; None when the model has no
+    /// preset (DTW stays off and flash attention stays on)
+    fn dtw_preset_for(model_name: &str) -> Option<whisper_rs::DtwModelPreset> {
+        use whisper_rs::DtwModelPreset as P;
+        let n = model_name.to_lowercase();
+        if n.contains("turbo") {
+            return None; // no aheads preset for turbo in whisper-rs 0.13
+        }
+        Some(if n.contains("large-v3") {
+            P::LargeV3
+        } else if n.contains("large-v2") {
+            P::LargeV2
+        } else if n.contains("large-v1") || n.contains("large") {
+            P::LargeV1
+        } else if n.contains("medium.en") {
+            P::MediumEn
+        } else if n.contains("medium") {
+            P::Medium
+        } else if n.contains("small.en") {
+            P::SmallEn
+        } else if n.contains("small") {
+            P::Small
+        } else if n.contains("base.en") {
+            P::BaseEn
+        } else if n.contains("base") {
+            P::Base
+        } else if n.contains("tiny.en") {
+            P::TinyEn
+        } else if n.contains("tiny") {
+            P::Tiny
+        } else {
+            return None;
+        })
+    }
+
+    pub async fn load_model_with_dtw(&self, model_name: &str, want_dtw: bool) -> Result<()> {
         let models = self.available_models.read().await;
         let model_info = models.get(model_name)
             .ok_or_else(|| anyhow!("Model {} not found", model_name))?;
+
+        // DTW needs an aheads preset for the model
+        let dtw_preset = if want_dtw { Self::dtw_preset_for(model_name) } else { None };
+        let effective_dtw = dtw_preset.is_some();
 
         match model_info.status {
             ModelStatus::Available => {
                 // FIX 5: Check if this model is already loaded
                 if let Some(current_model) = self.current_model.read().await.as_ref() {
-                    if current_model == model_name {
-                        log::info!("Model {} is already loaded, skipping reload", model_name);
+                    if current_model == model_name && *self.current_dtw.read().await == effective_dtw {
+                        log::info!("Model {} is already loaded (dtw={}), skipping reload", model_name, effective_dtw);
                         return Ok(());
                     }
 
                     // FIX 5: Unload current model before loading new one
-                    log::info!("Unloading current model '{}' before loading '{}'", current_model, model_name);
+                    log::info!("Unloading current model '{}' before loading '{}' (dtw={})", current_model, model_name, effective_dtw);
                     self.unload_model().await;
                 }
 
@@ -288,12 +340,22 @@ impl WhisperEngine {
                     hardware_profile.performance_tier,
                 );
 
-                let context_param = WhisperContextParameters {
+                let mut context_param = WhisperContextParameters {
                     use_gpu: acceleration.use_gpu,
                     gpu_device: acceleration.gpu_device,
                     flash_attn: acceleration.flash_attn,
                     ..Default::default()
                 };
+                if let Some(preset) = dtw_preset.clone() {
+                    // whisper.cpp cannot produce DTW timestamps with flash
+                    // attention enabled - accuracy wins for retranscription
+                    context_param.flash_attn = false;
+                    context_param.dtw_parameters = whisper_rs::DtwParameters {
+                        mode: whisper_rs::DtwMode::ModelPreset { model_preset: preset },
+                        ..Default::default()
+                    };
+                    log::info!("DTW token timestamps enabled (flash attention off)");
+                }
 
                 log::info!(
                     "Whisper acceleration decision: compiled_backend={} runtime_detected_gpu={:?} use_gpu={} flash_attn={} gpu_device={}",
@@ -318,6 +380,7 @@ impl WhisperEngine {
                 // Update current context and model
                 *self.current_context.write().await = Some(ctx);
                 *self.current_model.write().await = Some(model_name.to_string());
+                *self.current_dtw.write().await = effective_dtw;
 
                 // Enhanced acceleration status reporting
                 let acceleration_status = acceleration.status_label();
@@ -343,6 +406,7 @@ impl WhisperEngine {
     }
 
     pub async fn unload_model(&self) -> bool  {
+        *self.current_dtw.write().await = false;
         let mut ctx_guard = self.current_context.write().await;
         let unloaded = ctx_guard.take().is_some();
         if unloaded {

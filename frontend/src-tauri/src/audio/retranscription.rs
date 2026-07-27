@@ -675,16 +675,17 @@ async fn get_or_init_whisper<R: Runtime>(
                 None => get_configured_whisper_model(app).await?,
             };
 
-            // Check if the correct model is already loaded
+            // Retranscription wants DTW token timestamps for speaker splitting,
+            // so reload if the model differs OR the context lacks DTW
             let current_model = e.get_current_model().await;
             let needs_load = match &current_model {
-                Some(loaded) => loaded != &target_model,
+                Some(loaded) => loaded != &target_model || !e.is_dtw_enabled().await,
                 None => true,
             };
 
             if needs_load {
                 info!(
-                    "Loading Whisper model '{}' (current: {:?})",
+                    "Loading Whisper model '{}' with DTW timestamps (current: {:?})",
                     target_model, current_model
                 );
 
@@ -694,7 +695,7 @@ async fn get_or_init_whisper<R: Runtime>(
                     warn!("Error during model discovery (continuing anyway): {}", discover_err);
                 }
 
-                match e.load_model(&target_model).await {
+                match e.load_model_with_dtw(&target_model, true).await {
                     Ok(_) => {
                         info!("Whisper model '{}' loaded successfully", target_model);
                         Ok(e)
