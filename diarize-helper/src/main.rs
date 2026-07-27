@@ -128,7 +128,7 @@ struct Args {
     #[arg(long = "num-speakers")]
     num_speakers: Option<i32>,
 
-    #[arg(long, default_value_t = 0.5)]
+    #[arg(long, default_value_t = 0.9)]
     threshold: f32,
 
     #[arg(long = "min-duration-on", default_value_t = 0.3)]
