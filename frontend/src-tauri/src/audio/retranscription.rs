@@ -394,18 +394,15 @@ async fn run_retranscription<R: Runtime>(
         None
     };
 
-    // Glossary biasing is OPT-IN pending validation: prepending the term
-    // list to every VAD segment made whisper hallucinate prompt
-    // continuations at segment starts on real audio ("Geroen Gürtel-"
-    // prefixes, 2026-07-28) — fabricated words are worse than misspelled
-    // names. Terms keep accumulating; enable for experiments with
-    // MEETILY_GLOSSARY_PROMPT=1 until the eval harness proves a safe format.
-    if std::env::var("MEETILY_GLOSSARY_PROMPT").as_deref() == Ok("1") {
-        if let Some(engine) = whisper_engine.as_ref() {
-            if let Some(prompt) = glossary::initial_prompt(&app) {
-                info!("Applying learned glossary as whisper initial_prompt: {}", prompt);
-                engine.set_initial_prompt(Some(prompt)).await;
-            }
+    // Glossary biasing uses APPROVED terms only and is gated on the
+    // Settings toggle (initial_prompt returns None otherwise). Auto-learned
+    // suggestions never reach whisper: unvetted injection hallucinated
+    // prompt continuations at unclear segment starts ("Geroen Gürtel-",
+    // 2026-07-28).
+    if let Some(engine) = whisper_engine.as_ref() {
+        if let Some(prompt) = glossary::initial_prompt(&app) {
+            info!("Applying approved glossary as whisper initial_prompt: {}", prompt);
+            engine.set_initial_prompt(Some(prompt)).await;
         }
     }
 

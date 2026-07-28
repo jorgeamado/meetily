@@ -749,6 +749,8 @@ pub fn run() {
             audio::retranscription::refine_transcript_command,
             audio::diarization::diarization_list_models,
             audio::diarization::diarization_download_model,
+            audio::glossary::glossary_get,
+            audio::glossary::glossary_save,
             audio::retranscription::is_retranscription_in_progress_command,
             // Import audio commands
             audio::import::select_and_validate_audio_command,

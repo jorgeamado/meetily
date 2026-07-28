@@ -21,6 +21,108 @@ interface DiarizationModelStatus {
     downloaded: boolean;
 }
 
+interface GlossaryState {
+    approved: string[];
+    suggested: string[];
+    inject: boolean;
+}
+
+/// Vocabulary glossary editor: auto-learned terms arrive as suggestions;
+/// only human-approved terms may bias whisper, and only when the toggle is
+/// on (unvetted injection hallucinated words on real audio).
+function GlossaryEditor() {
+    const [glossary, setGlossary] = useState<GlossaryState>({ approved: [], suggested: [], inject: false });
+    const [newTerm, setNewTerm] = useState('');
+
+    useEffect(() => {
+        invoke<GlossaryState>('glossary_get')
+            .then(setGlossary)
+            .catch((err) => console.error('Failed to load glossary:', err));
+    }, []);
+
+    const update = (next: GlossaryState) => {
+        setGlossary(next);
+        invoke('glossary_save', { ...next }).catch((err) => console.error('Failed to save glossary:', err));
+    };
+
+    const approve = (term: string) => update({
+        ...glossary,
+        approved: [...glossary.approved, term],
+        suggested: glossary.suggested.filter(t => t !== term),
+    });
+    const dismiss = (term: string) => update({
+        ...glossary,
+        suggested: glossary.suggested.filter(t => t !== term),
+    });
+    const remove = (term: string) => update({
+        ...glossary,
+        approved: glossary.approved.filter(t => t !== term),
+    });
+    const addTerm = () => {
+        const t = newTerm.trim();
+        if (!t || glossary.approved.some(a => a.toLowerCase() === t.toLowerCase())) return;
+        setNewTerm('');
+        update({ ...glossary, approved: [...glossary.approved, t] });
+    };
+
+    return (
+        <div>
+            <Label className="block text-sm font-medium text-gray-700 mb-1">
+                Vocabulary glossary
+            </Label>
+            <div className="mx-1 space-y-2">
+                <div className="flex flex-wrap gap-1.5">
+                    {glossary.approved.map((t) => (
+                        <span key={t} className="inline-flex items-center gap-1 bg-green-50 border border-green-200 text-green-900 text-xs rounded-full px-2 py-0.5">
+                            {t}
+                            <button className="text-green-700 hover:text-red-600" onClick={() => remove(t)} title="Remove">×</button>
+                        </span>
+                    ))}
+                    {glossary.approved.length === 0 && (
+                        <span className="text-xs text-gray-400">No approved terms yet</span>
+                    )}
+                </div>
+                <div className="flex items-center gap-2">
+                    <Input
+                        className="h-8 w-48 text-sm"
+                        placeholder="Add name or term..."
+                        value={newTerm}
+                        onChange={(e) => setNewTerm(e.target.value)}
+                        onKeyDown={(e) => { if (e.key === 'Enter') addTerm(); }}
+                    />
+                    <Button size="sm" variant="outline" onClick={addTerm} disabled={!newTerm.trim()}>
+                        Add
+                    </Button>
+                </div>
+                {glossary.suggested.length > 0 && (
+                    <div>
+                        <p className="text-xs text-gray-500 mb-1">Learned from your meetings — approve the correctly spelled ones:</p>
+                        <div className="flex flex-wrap gap-1.5">
+                            {glossary.suggested.map((t) => (
+                                <span key={t} className="inline-flex items-center gap-1 bg-gray-50 border border-gray-200 text-gray-800 text-xs rounded-full px-2 py-0.5">
+                                    {t}
+                                    <button className="text-green-700 font-bold" onClick={() => approve(t)} title="Approve">✓</button>
+                                    <button className="text-gray-500 hover:text-red-600" onClick={() => dismiss(t)} title="Dismiss">×</button>
+                                </span>
+                            ))}
+                        </div>
+                    </div>
+                )}
+                <div className="flex items-center justify-between gap-2 pt-1">
+                    <div>
+                        <span className="text-xs font-medium text-gray-700">Bias transcription with approved terms</span>
+                        <p className="text-xs text-gray-500">Experimental — can occasionally distort nearby words; approved names get spelled right</p>
+                    </div>
+                    <Switch
+                        checked={glossary.inject}
+                        onCheckedChange={(v) => update({ ...glossary, inject: v })}
+                    />
+                </div>
+            </div>
+        </div>
+    );
+}
+
 /// Download manager for the speaker-detection (diarization) models, matching
 /// the transcription-model download options above it. Progress arrives on the
 /// shared "model-download-progress" event with modelName "diarization:<key>".
@@ -432,6 +534,9 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                 <DiarizationModelDownloads />
                             </div>
                         )}
+                        <div className="mt-4">
+                            <GlossaryEditor />
+                        </div>
                     </div>
                 </div>
             </div>

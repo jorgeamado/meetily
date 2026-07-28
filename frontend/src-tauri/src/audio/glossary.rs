@@ -26,29 +26,87 @@ const MAX_SAMPLE_CHARS: usize = 6000;
 const SYSTEM_PROMPT: &str = "You extract vocabulary from meeting transcripts. \
 Answer with JSON only, no explanation.";
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct Glossary {
-    terms: Vec<String>,
+/// Approved terms are user-curated and the only ones ever fed to whisper;
+/// suggested terms are auto-learned and wait for human review — learning
+/// from whisper's own output can otherwise promote mis-hearings
+/// ("Guggenheim") into vocabulary that reinforces the error.
+#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Glossary {
+    pub approved: Vec<String>,
+    pub suggested: Vec<String>,
+    /// Feed approved terms to whisper as initial_prompt. Off by default:
+    /// prompt injection made whisper hallucinate continuations at unclear
+    /// segment starts ("Geroen Gürtel-", 2026-07-28).
+    pub inject: bool,
 }
 
 fn glossary_path<R: Runtime>(app: &AppHandle<R>) -> Option<PathBuf> {
     app.path().app_data_dir().ok().map(|d| d.join(GLOSSARY_FILE))
 }
 
-/// Terms learned so far (empty when none / unreadable).
-pub fn load_terms<R: Runtime>(app: &AppHandle<R>) -> Vec<String> {
-    let Some(path) = glossary_path(app) else { return Vec::new() };
-    std::fs::read_to_string(path)
-        .ok()
-        .and_then(|s| serde_json::from_str::<Glossary>(&s).ok())
-        .map(|g| g.terms)
-        .unwrap_or_default()
+pub fn load<R: Runtime>(app: &AppHandle<R>) -> Glossary {
+    let Some(path) = glossary_path(app) else { return Glossary::default() };
+    let Ok(raw) = std::fs::read_to_string(path) else { return Glossary::default() };
+    parse_glossary(&raw)
 }
 
-/// Whisper initial_prompt built from the glossary, or None when empty.
+fn parse_glossary(raw: &str) -> Glossary {
+    let mut g: Glossary = serde_json::from_str(raw).unwrap_or_default();
+    if g.approved.is_empty() && g.suggested.is_empty() {
+        // Legacy single-list format: everything auto-learned -> suggestions
+        #[derive(Deserialize)]
+        struct Legacy { terms: Vec<String> }
+        if let Ok(legacy) = serde_json::from_str::<Legacy>(raw) {
+            g.suggested = legacy.terms;
+        }
+    }
+    g
+}
+
+fn save<R: Runtime>(app: &AppHandle<R>, g: &Glossary) -> Result<(), String> {
+    let Some(path) = glossary_path(app) else { return Err("no app data dir".into()) };
+    serde_json::to_string_pretty(g)
+        .map_err(|e| e.to_string())
+        .and_then(|json| std::fs::write(&path, json).map_err(|e| e.to_string()))
+}
+
+/// Whisper initial_prompt from APPROVED terms only, or None when disabled
+/// or empty.
 pub fn initial_prompt<R: Runtime>(app: &AppHandle<R>) -> Option<String> {
-    let terms = load_terms(app);
-    (!terms.is_empty()).then(|| format!("Glossary: {}.", terms.join(", ")))
+    let g = load(app);
+    (g.inject && !g.approved.is_empty())
+        .then(|| format!("Glossary: {}.", g.approved.join(", ")))
+}
+
+#[tauri::command]
+pub async fn glossary_get<R: Runtime>(app: AppHandle<R>) -> Result<Glossary, String> {
+    Ok(load(&app))
+}
+
+#[tauri::command]
+pub async fn glossary_save<R: Runtime>(
+    app: AppHandle<R>,
+    approved: Vec<String>,
+    suggested: Vec<String>,
+    inject: bool,
+) -> Result<(), String> {
+    let clean = |v: Vec<String>| -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for t in v {
+            let t = t.trim().to_string();
+            if !t.is_empty() && t.len() <= 40 && !out.iter().any(|x| x.eq_ignore_ascii_case(&t)) {
+                out.push(t);
+            }
+        }
+        out
+    };
+    let approved = clean(approved);
+    let suggested = clean(suggested)
+        .into_iter()
+        .filter(|s| !approved.iter().any(|a| a.eq_ignore_ascii_case(s)))
+        .collect();
+    save(&app, &Glossary { approved, suggested, inject })
 }
 
 /// Evenly sample rows so long meetings stay under MAX_SAMPLE_CHARS.
@@ -127,21 +185,23 @@ ordinary words.\nReply with only JSON: {{\"terms\": [\"...\"]}}",
     .await
     {
         Ok(reply) => {
-            let new_terms = parse_terms(&reply);
+            let mut g = load(&app);
+            // Suggestions only — never touch the approved list, and don't
+            // re-suggest what the user already approved
+            let new_terms: Vec<String> = parse_terms(&reply)
+                .into_iter()
+                .filter(|t| !g.approved.iter().any(|a| a.eq_ignore_ascii_case(t)))
+                .collect();
             if new_terms.is_empty() {
-                info!("Glossary: no terms extracted");
+                info!("Glossary: no new terms extracted");
                 return;
             }
-            let merged = merge_terms(load_terms(&app), new_terms.clone());
-            let Some(path) = glossary_path(&app) else { return };
-            match serde_json::to_string_pretty(&Glossary { terms: merged.clone() })
-                .map_err(anyhow::Error::from)
-                .and_then(|json| std::fs::write(&path, json).map_err(anyhow::Error::from))
-            {
+            g.suggested = merge_terms(g.suggested, new_terms.clone());
+            match save(&app, &g) {
                 Ok(()) => info!(
-                    "Glossary: learned {:?}, {} terms total",
+                    "Glossary: suggested {:?}, {} suggestions pending review",
                     new_terms,
-                    merged.len()
+                    g.suggested.len()
                 ),
                 Err(e) => warn!("Glossary: failed to save: {}", e),
             }
@@ -175,6 +235,19 @@ mod tests {
         let capped = merge_terms(many, vec!["newest".into()]);
         assert_eq!(capped.len(), MAX_TERMS);
         assert_eq!(capped.last().map(String::as_str), Some("newest"));
+    }
+
+    #[test]
+    fn legacy_single_list_becomes_suggestions() {
+        let g = parse_glossary(r#"{"terms": ["Odyssey", "Ramesh"]}"#);
+        assert!(g.approved.is_empty());
+        assert_eq!(g.suggested, vec!["Odyssey", "Ramesh"]);
+        assert!(!g.inject);
+
+        let g = parse_glossary(r#"{"approved": ["Ramesh"], "suggested": ["Kafka"], "inject": true}"#);
+        assert_eq!(g.approved, vec!["Ramesh"]);
+        assert_eq!(g.suggested, vec!["Kafka"]);
+        assert!(g.inject);
     }
 
     #[test]
