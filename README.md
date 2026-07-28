@@ -60,7 +60,7 @@ A personal fork focused on **fully local speaker diarization and LLM-assisted tr
 - **DTW token timestamps** — whisper.cpp cross-attention alignment for word-accurate boundaries during retranscription.
 - **Perf/accuracy fixes for Apple Silicon** — chip-class hardware tiering (base/Pro/Max), flash attention at every Metal tier, diarization thread tuning (P-cores only; ~3× faster), VAD absolute-timestamp fix, file logging to `~/Library/Application Support/com.meetily.ai/logs/`.
 
-**Branch layout:** `main` tracks [upstream](https://github.com/Zackriya-Solutions/meeting-minutes) (auto-rebased weekly by a scheduled [sync workflow](.github/workflows/sync-upstream.yml)); fork work lives on feature branches — currently `feature/speaker-diarization` stacked with `feature/live-transcription-toggle`.
+**Branch layout:** `main` is the fork's product branch (all features merged); `upstream-main` is a pristine mirror of [upstream](https://github.com/Zackriya-Solutions/meeting-minutes). A weekly [sync workflow](.github/workflows/sync-upstream.yml) fast-forwards the mirror and auto-merges upstream into `main` (clean merges push automatically; conflicts fail loudly for manual resolution).
 
 **Build:** same as upstream (`pnpm tauri:build` in `frontend/`; sidecars build automatically). The diarization helper is a Rust workspace member (`diarize-helper/`); after changing it, copy the binary to `frontend/src-tauri/binaries/diarize-helper-<target-triple>` before bundling.
 
