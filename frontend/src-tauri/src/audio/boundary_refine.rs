@@ -157,8 +157,18 @@ fn ends_sentence(word: &str) -> bool {
 /// are offered, so long-range errors stay reachable without exploding the
 /// option list.
 fn candidate_shifts(l_words: &[String], r_words: &[String]) -> Vec<i32> {
-    let take_left = PUNCT_SHIFT_WORDS.min(l_words.len().saturating_sub(1)) as i32;
-    let take_right = PUNCT_SHIFT_WORDS.min(r_words.len().saturating_sub(1)) as i32;
+    // When the current cut already falls right after sentence punctuation,
+    // acoustics and syntax agree — only small jitter is plausible. Offering
+    // far candidates here makes the model grab the neighbor's whole
+    // sentence ("...these platforms. | What do you call them?" reads fine
+    // as one voice; only the audio knows it is not).
+    let reach = if l_words.last().map(|w| ends_sentence(w)).unwrap_or(false) {
+        MAX_SHIFT_WORDS
+    } else {
+        PUNCT_SHIFT_WORDS
+    };
+    let take_left = reach.min(l_words.len().saturating_sub(1)) as i32;
+    let take_right = reach.min(r_words.len().saturating_sub(1)) as i32;
     // Last word on the A side if this shift were applied
     let a_side_last = |s: i32| -> &str {
         if s > 0 {
@@ -232,6 +242,12 @@ fn build_prompt(left: &SpeakerTurn, right: &SpeakerTurn) -> Option<(String, Vec<
             b_text.trim()
         ));
     }
+    if let Some(current) = shifts.iter().position(|&s| s == 0) {
+        prompt.push_str(&format!(
+            "Option {} is the current split, based on voice analysis. Choose a different option only if it clearly reads more natural.\n",
+            current + 1
+        ));
+    }
     prompt.push_str(&format!(
         "Reply with only JSON like {{\"cut\": 1}} choosing the best option (1-{}).",
         shifts.len()
@@ -255,9 +271,15 @@ fn parse_cut(reply: &str) -> Option<usize> {
     parse_key(reply, "cut")
 }
 
-/// The outermost options signal the true cut may lie beyond the window.
+/// A pick at the edge of the LOCAL window signals the true cut may lie
+/// beyond it — recenter and re-ask. A far punctuation jump is final: the
+/// model chose a sentence boundary on purpose; re-asking there only
+/// produces jitter (observed: a perfect "...were younger?" cut re-asked and
+/// nudged one word back).
 fn is_extreme_shift(shift: i32, shifts: &[i32]) -> bool {
-    shift != 0 && (Some(&shift) == shifts.first() || Some(&shift) == shifts.last())
+    shift != 0
+        && shift.unsigned_abs() as usize == MAX_SHIFT_WORDS
+        && (Some(&shift) == shifts.first() || Some(&shift) == shifts.last())
 }
 
 /// True when mid is a short different-speaker turn wedged inside one
@@ -822,7 +844,7 @@ mod tests {
     }
 
     #[test]
-    fn extreme_shift_is_only_the_outermost_nonzero_options() {
+    fn extreme_shift_is_only_the_local_window_edge() {
         let shifts = vec![-2, -1, 0, 1, 2];
         assert!(is_extreme_shift(-2, &shifts));
         assert!(is_extreme_shift(2, &shifts));
@@ -832,6 +854,33 @@ mod tests {
         // One-sided window: 0 can be an endpoint but is never "extreme"
         assert!(!is_extreme_shift(0, &[0, 1, 2]));
         assert!(is_extreme_shift(2, &[0, 1, 2]));
+        // A punctuation jump is final — never re-asked; and a local pick is
+        // not "extreme" when a farther option was available and declined
+        let with_punct = vec![-2, -1, 0, 1, 2, 7];
+        assert!(!is_extreme_shift(7, &with_punct));
+        assert!(!is_extreme_shift(2, &with_punct));
+        assert!(is_extreme_shift(-2, &with_punct));
+    }
+
+    #[test]
+    fn no_far_candidates_when_cut_already_at_sentence_end() {
+        // "...these platforms. | What do you call them? Are they..." — the
+        // diarizer's cut agrees with the punctuation; grabbing the whole
+        // next question must not even be an option.
+        let l_words: Vec<String> =
+            ["like", "these", "platforms."].map(String::from).to_vec();
+        let r_words: Vec<String> =
+            ["What", "do", "you", "call", "them?", "Are", "they", "moving"].map(String::from).to_vec();
+        let shifts = candidate_shifts(&l_words, &r_words);
+        assert_eq!(shifts, vec![-2, -1, 0, 1, 2]);
+    }
+
+    #[test]
+    fn prompt_marks_the_current_split_option() {
+        let (left, right) = are_boundary();
+        let (prompt, shifts) = build_prompt(&left, &right).expect("prompt");
+        let current = shifts.iter().position(|&s| s == 0).unwrap() + 1;
+        assert!(prompt.contains(&format!("Option {} is the current split", current)));
     }
 
     #[test]
