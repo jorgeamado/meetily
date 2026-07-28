@@ -231,9 +231,9 @@ export function ModelSettingsModal({
     openrouter: openRouterModels.map((m) => m.id),
     'builtin-ai': builtinAiModels.map((m) => m.name),
     'custom-openai': customOpenAIModel ? [customOpenAIModel] : [], // User specifies model manually
-    // Agent CLIs use whatever model the CLI is configured with
-    'claude-cli': ['cli-default'],
-    'codex-cli': ['cli-default'],
+    // "default" = whatever the CLI itself is configured with
+    'claude-cli': ['default', 'sonnet', 'opus', 'haiku'],
+    'codex-cli': ['default', 'gpt-5.6-sol'],
   };
 
   const requiresApiKey =
@@ -889,7 +889,7 @@ export function ModelSettingsModal({
               </SelectContent>
             </Select>
 
-            {modelConfig.provider !== 'builtin-ai' && modelConfig.provider !== 'custom-openai' && modelConfig.provider !== 'claude-cli' && modelConfig.provider !== 'codex-cli' && (
+            {modelConfig.provider !== 'builtin-ai' && modelConfig.provider !== 'custom-openai' && (
               <Popover open={modelComboboxOpen} onOpenChange={setModelComboboxOpen} modal={true}>
                 <PopoverTrigger asChild>
                   <Button
