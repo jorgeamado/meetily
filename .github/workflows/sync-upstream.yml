@@ -1,0 +1,50 @@
+# Fork maintenance: keep `main` current with upstream
+# (Zackriya-Solutions/meeting-minutes).
+#
+# Scheduled workflows only run from the default branch, so this file must
+# live on main — which means main is "upstream + fork-maintenance commits".
+# The sync therefore REBASES main onto upstream/main (replaying this commit
+# on top) and force-pushes with lease. Keep actual fork work on feature
+# branches; anything committed to main gets silently rebased forward.
+name: Sync main with upstream
+
+on:
+  schedule:
+    # Mondays 06:00 UTC
+    - cron: '0 6 * * 1'
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  sync:
+    # Never run on the upstream repo itself, only on the fork
+    if: github.repository == 'jorgeamado/meetily'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout main
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Rebase main onto upstream/main
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git remote add upstream https://github.com/Zackriya-Solutions/meeting-minutes.git
+          git fetch upstream main
+          BEHIND=$(git rev-list --count HEAD..upstream/main)
+          if [ "$BEHIND" -eq 0 ]; then
+            echo "Already up to date with upstream/main"
+            exit 0
+          fi
+          echo "Rebasing onto $BEHIND new upstream commits"
+          git rebase upstream/main
+          git push --force-with-lease origin main
+
+      - name: Report conflict
+        if: failure()
+        run: |
+          echo "::error::Rebase onto upstream/main failed — a commit on main conflicts with upstream. Resolve locally: git fetch upstream && git rebase upstream/main && git push --force-with-lease origin main"

@@ -109,7 +109,7 @@ pub async fn update_from_transcript<R: Runtime>(app: AppHandle<R>, sample: Strin
     let Some(model) = pick_model(&app_data_dir) else { return };
 
     let prompt = format!(
-        "Excerpts from a work meeting transcript (mixed Russian and English):\n\n{}\n\n\
+        "Excerpts from a work meeting transcript (possibly multilingual):\n\n{}\n\n\
 List up to 12 proper nouns — people, companies, products — and technical terms from \
 these excerpts that a speech recognizer should know, exactly as spelled. Skip \
 ordinary words.\nReply with only JSON: {{\"terms\": [\"...\"]}}",
