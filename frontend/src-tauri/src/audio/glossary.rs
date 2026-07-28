@@ -157,6 +157,23 @@ fn merge_terms(existing: Vec<String>, new_terms: Vec<String>) -> Vec<String> {
     merged
 }
 
+/// The summary provider from settings, when it is one of the agent CLIs.
+async fn configured_cli_provider<R: Runtime>(
+    app: &AppHandle<R>,
+) -> Option<crate::summary::llm_client::LLMProvider> {
+    use crate::summary::llm_client::LLMProvider;
+    let state = app.try_state::<crate::state::AppState>()?;
+    let config = crate::database::repositories::setting::SettingsRepository::get_model_config(
+        state.db_manager.pool(),
+    )
+    .await
+    .ok()??;
+    match LLMProvider::from_str(&config.provider).ok()? {
+        p @ (LLMProvider::ClaudeCli | LLMProvider::CodexCli) => Some(p),
+        _ => None,
+    }
+}
+
 /// Extract terms from a transcript sample and fold them into the glossary.
 /// Spawned fire-and-forget after a retranscription completes.
 pub async fn update_from_transcript<R: Runtime>(app: AppHandle<R>, sample: String) {
@@ -164,26 +181,41 @@ pub async fn update_from_transcript<R: Runtime>(app: AppHandle<R>, sample: Strin
         return; // too little text to learn from
     }
     let Ok(app_data_dir) = app.path().app_data_dir() else { return };
-    let Some(model) = pick_model(&app_data_dir) else { return };
 
     let prompt = format!(
         "Excerpts from a work meeting transcript (possibly multilingual):\n\n{}\n\n\
 List up to 12 proper nouns — people, companies, products — and technical terms from \
-these excerpts that a speech recognizer should know, exactly as spelled. Skip \
-ordinary words.\nReply with only JSON: {{\"terms\": [\"...\"]}}",
+these excerpts that a speech recognizer should know, exactly as spelled. Prefer \
+plausible correct spellings; skip ordinary words and anything that looks like a \
+mis-hearing.\nReply with only JSON: {{\"terms\": [\"...\"]}}",
         sample
     );
 
-    match summary_engine::generate_micro(
-        &app_data_dir,
-        &model.name,
-        SYSTEM_PROMPT,
-        &prompt,
-        256,
-        EXTRACT_TIMEOUT,
-    )
-    .await
-    {
+    // Follow the user's summary provider when it is an agent CLI (the user
+    // explicitly opted into cloud there); otherwise stay on the local model
+    let result = match configured_cli_provider(&app).await {
+        Some(cli) => {
+            crate::summary::llm_client::generate_with_cli(&cli, SYSTEM_PROMPT, &prompt, None)
+                .await
+                .map_err(|e| anyhow::anyhow!(e))
+        }
+        None => match pick_model(&app_data_dir) {
+            Some(model) => {
+                summary_engine::generate_micro(
+                    &app_data_dir,
+                    &model.name,
+                    SYSTEM_PROMPT,
+                    &prompt,
+                    256,
+                    EXTRACT_TIMEOUT,
+                )
+                .await
+            }
+            None => return,
+        },
+    };
+
+    match result {
         Ok(reply) => {
             let mut g = load(&app);
             // Suggestions only — never touch the approved list, and don't
