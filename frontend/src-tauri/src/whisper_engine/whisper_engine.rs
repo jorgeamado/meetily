@@ -585,6 +585,15 @@ impl WhisperEngine {
         repeated_words as f32 / total_words
     }
     
+    /// Path of a known model's ggml file (whether downloaded or not).
+    pub async fn model_path(&self, model_name: &str) -> Option<PathBuf> {
+        self.available_models
+            .read()
+            .await
+            .get(model_name)
+            .map(|m| m.path.clone())
+    }
+
     /// Set (or clear) the vocabulary hint passed to whisper as
     /// initial_prompt on every subsequent transcription call. Biases
     /// recognition toward known names/terms; used by retranscription with

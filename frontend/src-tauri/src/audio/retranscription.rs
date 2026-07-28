@@ -428,6 +428,55 @@ async fn run_retranscription<R: Runtime>(
     let processable_count = processable_segments.len();
     info!("Processing {} segments (after splitting)", processable_count);
 
+    // First use of a freshly installed CoreML encoder blocks inside whisper
+    // while macOS compiles it for the Neural Engine (~15 min for large
+    // models, cached per app afterwards). Without feedback that reads as a
+    // hang at "Transcribing 0%" — tick elapsed time until the first
+    // segment comes back, then write the marker so this never shows again.
+    struct AbortOnDrop(Option<tauri::async_runtime::JoinHandle<()>>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            if let Some(h) = self.0.take() {
+                h.abort();
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    let mut ane_marker: Option<PathBuf> = match whisper_engine.as_ref() {
+        Some(engine) => {
+            let name = model.as_deref().unwrap_or(DEFAULT_WHISPER_MODEL);
+            match engine.model_path(name).await {
+                Some(p) => crate::whisper_engine::coreml::first_use_pending(&p),
+                None => None,
+            }
+        }
+        None => None,
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mut ane_marker: Option<PathBuf> = None;
+    let mut ane_ticker = AbortOnDrop(ane_marker.as_ref().map(|_| {
+        let app_for_tick = app.clone();
+        let meeting_for_tick = meeting_id.clone();
+        let started = std::time::Instant::now();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                let secs = started.elapsed().as_secs();
+                emit_progress(
+                    &app_for_tick,
+                    &meeting_for_tick,
+                    "transcribing",
+                    0,
+                    &format!(
+                        "Optimizing model for the Neural Engine — one-time, up to ~15 min ({}m {:02}s)...",
+                        secs / 60,
+                        secs % 60
+                    ),
+                );
+            }
+        })
+    }));
+
     // Process each speech segment with progress updates
     // (text, start_ms, end_ms, token spans in absolute ms for speaker splitting)
     let mut all_transcripts: Vec<(String, f64, f64, Vec<diarization::WordSpan>)> = Vec::new();
@@ -490,6 +539,14 @@ async fn run_retranscription<R: Runtime>(
                 .collect();
             (text, conf, words)
         };
+
+        // First transcription returned: the ANE compile (if any) is done —
+        // stop the ticker and remember so future runs skip the warning
+        if let Some(marker) = ane_marker.take() {
+            ane_ticker = AbortOnDrop(None);
+            let _ = std::fs::write(&marker, "ok");
+            info!("CoreML encoder ready (ANE compile complete), marker at {}", marker.display());
+        }
 
         // Skip empty transcripts
         let trimmed = text.trim();
