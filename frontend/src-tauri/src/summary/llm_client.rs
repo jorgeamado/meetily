@@ -137,11 +137,30 @@ pub async fn generate_with_cli(
     user_prompt: &str,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<String, String> {
+    // The CLIs are AGENTS with tool access, and the transcript is untrusted
+    // input — a prompt-injection line in a meeting must not be able to touch
+    // the filesystem or network. claude: deny every tool; codex: read-only
+    // sandbox for any model-generated commands.
     let (bin_name, mut args): (&str, Vec<String>) = match provider {
-        LLMProvider::ClaudeCli => ("claude", vec!["-p".into()]),
+        LLMProvider::ClaudeCli => (
+            "claude",
+            vec![
+                "-p".into(),
+                "--disallowedTools".into(),
+                "Bash,Edit,Write,Read,Glob,Grep,WebFetch,WebSearch,Task,NotebookEdit".into(),
+            ],
+        ),
         // Run outside any git repo (cwd is temp_dir below), so the trust
         // check must be skipped explicitly
-        LLMProvider::CodexCli => ("codex", vec!["exec".into(), "--skip-git-repo-check".into()]),
+        LLMProvider::CodexCli => (
+            "codex",
+            vec![
+                "exec".into(),
+                "--skip-git-repo-check".into(),
+                "-s".into(),
+                "read-only".into(),
+            ],
+        ),
         _ => return Err("not a CLI provider".to_string()),
     };
     // "default" (and the legacy "cli-default") means: use whatever model
