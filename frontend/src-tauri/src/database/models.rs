@@ -9,6 +9,11 @@ pub struct MeetingModel {
     pub created_at: DateTimeUtc,
     pub updated_at: DateTimeUtc,
     pub folder_path: Option<String>,
+    /// Populated only by queries that select it (get_meetings); other
+    /// SELECT * sites default to 0
+    #[sqlx(default)]
+    #[serde(default)]
+    pub transcript_count: i64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type)]

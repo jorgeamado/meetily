@@ -615,7 +615,17 @@ const Sidebar: React.FC = () => {
                     <Plus className="w-3.5 h-3.5 text-blue-600" />
                   </div>
                 )}
-                <span className="flex-1 break-words">{item.title}</span>
+                <span className="flex-1 break-words">
+                  {item.title}
+                  {isMeetingItem && (item as any).hasTranscripts === false && (
+                    <span
+                      className="ml-1.5 align-middle inline-block text-[10px] leading-4 px-1.5 rounded-full bg-amber-50 border border-amber-200 text-amber-700"
+                      title="Recorded without live transcription — use Enhance to transcribe"
+                    >
+                      no transcript
+                    </span>
+                  )}
+                </span>
                 {isMeetingItem && (
                   <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity duration-150">
                     <button
