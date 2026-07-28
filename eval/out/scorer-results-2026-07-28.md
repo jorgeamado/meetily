@@ -58,3 +58,27 @@ Conclusions:
    stereo channel-identity work (task #24) and the acoustic confidence layer.
 
 Repro: `BOUNDARY_PROMPT_VARIANT={neutral|blind|clause} boundary-eval ...`
+
+## Frontier oracle (2026-07-28, sandboxed `claude -p`, same 24 prompts)
+
+19/24 (79%) — LOSES to the anchored local 2B (83%).
+- Fixed 87b#1 (6-word forward jump) → that case IS decidable from text; 2B capability gap.
+- Missed 87b#2, #18, dbea#8 — same as 2B → information-limited (answer not in text).
+- Broke 87b#4 and dbea#10 which the 2B gets right.
+Verdict: cloud escalation for boundary queries buys nothing (worse accuracy,
+privacy cost, latency). Text ceiling ~83% confirmed by a second, much larger model.
+
+## Acoustic probe of dbea#8 (12s window @ 89.7s, fresh diarization)
+
+- threshold 1.1 auto: BOTH campplus and eres2net see ONE speaker in the whole window.
+- forced --num-speakers 2: both split at the 95.9–96.2s pause → assigns
+  "You go, George." to the NEXT speaker — contradicting George's ground truth.
+- Segment boundaries identical across embedding models (segmentation-3.0 fixes
+  the candidate change-points; embeddings only cluster).
+Verdict: the hardest case fails text models AND embedding clustering — likely
+overlapped/rapid handover. Remaining signals: channel identity (stereo, #24) or
+overlap-aware powerset posteriors (research item 2).
+
+New idea from the probe: word-gap pauses (real whisper timings) are natural
+acoustic cut candidates — a future prompt could mark "this option falls on a
+pause". Needs harness v2 with real word timings (current cases synthesize 300ms).
