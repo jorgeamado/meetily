@@ -54,6 +54,27 @@ pub fn encoder_paths_for(model_file: &Path) -> Option<(PathBuf, String)> {
     Some((dir, zip_name))
 }
 
+/// Marker written after the first successful transcription with the CoreML
+/// encoder. While it is absent, the next transcription may block for minutes
+/// in the one-time ANE compilation — callers use this to show progress
+/// instead of a silent stall.
+pub fn ane_ready_marker(encoder_dir: &Path) -> PathBuf {
+    let mut os = encoder_dir.as_os_str().to_owned();
+    os.push(".ane-ready");
+    PathBuf::from(os)
+}
+
+/// When the model has an installed CoreML encoder whose first (compiling)
+/// use hasn't completed yet, returns the marker path to write afterwards.
+pub fn first_use_pending(model_file: &Path) -> Option<PathBuf> {
+    let (encoder_dir, _) = encoder_paths_for(model_file)?;
+    if !encoder_dir.exists() {
+        return None;
+    }
+    let marker = ane_ready_marker(&encoder_dir);
+    (!marker.exists()).then_some(marker)
+}
+
 // One attempt per model per app run; failures retry on next launch.
 static ATTEMPTED: Lazy<Mutex<HashSet<PathBuf>>> = Lazy::new(|| Mutex::new(HashSet::new()));
 
