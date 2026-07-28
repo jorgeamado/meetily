@@ -80,7 +80,7 @@ pub struct RefineStats {
 
 /// Group a turn's tokens into words: a word starts at token 0 or at a token
 /// with leading whitespace. Returns [start, end) token ranges.
-fn word_ranges(turn: &SpeakerTurn) -> Vec<(usize, usize)> {
+pub(crate) fn word_ranges(turn: &SpeakerTurn) -> Vec<(usize, usize)> {
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     for (i, w) in turn.words.iter().enumerate() {
         if i == 0 || w.text.starts_with(char::is_whitespace) {
@@ -92,7 +92,7 @@ fn word_ranges(turn: &SpeakerTurn) -> Vec<(usize, usize)> {
     ranges
 }
 
-fn words_text(turn: &SpeakerTurn, ranges: &[(usize, usize)]) -> Vec<String> {
+pub(crate) fn words_text(turn: &SpeakerTurn, ranges: &[(usize, usize)]) -> Vec<String> {
     ranges
         .iter()
         .map(|&(a, b)| {
@@ -142,7 +142,7 @@ fn find_boundaries(turns: &[SpeakerTurn]) -> Vec<Boundary> {
 }
 
 /// True when a word plausibly ends a sentence — a natural cut point.
-fn ends_sentence(word: &str) -> bool {
+pub(crate) fn ends_sentence(word: &str) -> bool {
     word.trim_end_matches(['"', '\'', ')', ']', '»'])
         .ends_with(['.', '?', '!', '…'])
 }
@@ -366,7 +366,7 @@ fn apply_shift(left: &mut SpeakerTurn, right: &mut SpeakerTurn, shift: i32) {
 
 /// Pick the best available local model for micro-queries: prefer the smaller
 /// Qwen if downloaded, fall back to any downloaded built-in model.
-fn pick_model(app_data_dir: &PathBuf) -> Option<models::ModelDef> {
+pub(crate) fn pick_model(app_data_dir: &PathBuf) -> Option<models::ModelDef> {
     let preferred = ["qwen3.5:2b", "qwen3.5:4b"];
     let available = models::get_available_models();
     let downloaded = |m: &models::ModelDef| {
@@ -572,7 +572,7 @@ mod tests {
     use crate::audio::diarization::WordSpan;
 
     fn tok(text: &str, start_ms: f64, end_ms: f64) -> WordSpan {
-        WordSpan { text: text.to_string(), start_ms, end_ms }
+        WordSpan { text: text.to_string(), start_ms, end_ms, prob: 1.0 }
     }
 
     fn turn(words: Vec<WordSpan>, speaker: usize) -> SpeakerTurn {

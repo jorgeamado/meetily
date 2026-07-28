@@ -54,6 +54,12 @@ pub mod diarization;
 // LLM tie-breaker for speaker-turn boundaries after diarization
 pub mod boundary_refine;
 
+// Confidence-gated LLM micro-repair of transcription text
+pub mod transcript_repair;
+
+// Self-learning vocabulary fed to whisper as initial_prompt
+pub mod glossary;
+
 // Import module (import external audio files as new meetings)
 pub mod import;
 
