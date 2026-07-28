@@ -1,5 +1,6 @@
 import { useState, useEffect } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { listen, UnlistenFn } from '@tauri-apps/api/event';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from './ui/select';
 import { Input } from './ui/input';
 import { Button } from './ui/button';
@@ -12,6 +13,97 @@ import { configService } from '@/services/configService';
 
 type SensitivityOption = 'merge' | 'balanced' | 'split';
 type EmbeddingModelOption = 'campplus' | 'eres2net';
+
+interface DiarizationModelStatus {
+    key: string;
+    displayName: string;
+    sizeMb: number;
+    downloaded: boolean;
+}
+
+/// Download manager for the speaker-detection (diarization) models, matching
+/// the transcription-model download options above it. Progress arrives on the
+/// shared "model-download-progress" event with modelName "diarization:<key>".
+function DiarizationModelDownloads() {
+    const [models, setModels] = useState<DiarizationModelStatus[]>([]);
+    const [progress, setProgress] = useState<Record<string, number>>({});
+
+    const refresh = () => {
+        invoke<DiarizationModelStatus[]>('diarization_list_models')
+            .then(setModels)
+            .catch((err) => console.error('Failed to list diarization models:', err));
+    };
+
+    useEffect(() => {
+        refresh();
+        const unlisteners: UnlistenFn[] = [];
+        let cleanedUp = false;
+        (async () => {
+            const onProgress = await listen<{ modelName: string; progress: number }>(
+                'model-download-progress',
+                (e) => {
+                    const name = e.payload.modelName;
+                    if (!name.startsWith('diarization:')) return;
+                    setProgress((prev) => ({ ...prev, [name.slice('diarization:'.length)]: e.payload.progress }));
+                }
+            );
+            const onComplete = await listen<{ modelName: string }>(
+                'model-download-complete',
+                (e) => {
+                    if (!e.payload.modelName.startsWith('diarization:')) return;
+                    setProgress((prev) => {
+                        const next = { ...prev };
+                        delete next[e.payload.modelName.slice('diarization:'.length)];
+                        return next;
+                    });
+                    refresh();
+                }
+            );
+            if (cleanedUp) { onProgress(); onComplete(); return; }
+            unlisteners.push(onProgress, onComplete);
+        })();
+        return () => { cleanedUp = true; unlisteners.forEach(u => u()); };
+    }, []);
+
+    const download = (key: string) => {
+        setProgress((prev) => ({ ...prev, [key]: 0 }));
+        invoke('diarization_download_model', { model: key }).catch((err) => {
+            console.error('Diarization model download failed:', err);
+            setProgress((prev) => {
+                const next = { ...prev };
+                delete next[key];
+                return next;
+            });
+        });
+    };
+
+    return (
+        <div>
+            <Label className="block text-sm font-medium text-gray-700 mb-1">
+                Speaker detection models
+            </Label>
+            <div className="mx-1 space-y-1.5">
+                {models.map((m) => (
+                    <div key={m.key} className="flex items-center justify-between gap-2 text-sm">
+                        <span className="text-gray-700">{m.displayName} ({m.sizeMb} MB)</span>
+                        {m.downloaded ? (
+                            <span className="text-xs text-green-700">Downloaded</span>
+                        ) : progress[m.key] !== undefined ? (
+                            <span className="text-xs text-blue-700 w-24 text-right">{progress[m.key]}%</span>
+                        ) : (
+                            <Button size="sm" variant="outline" onClick={() => download(m.key)}>
+                                Download
+                            </Button>
+                        )}
+                    </div>
+                ))}
+            </div>
+            <p className="text-xs text-gray-500 mt-1 mx-1">
+                Downloaded automatically when needed — download ahead of time to avoid the wait on first use.
+            </p>
+        </div>
+    );
+}
 
 
 export interface TranscriptModelProps {
@@ -337,6 +429,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                         Fast is ~35% quicker on real calls with similar or better speaker separation.
                                     </p>
                                 </div>
+                                <DiarizationModelDownloads />
                             </div>
                         )}
                     </div>
