@@ -73,6 +73,12 @@ pub enum LLMProvider {
     OpenRouter,
     BuiltInAI,
     CustomOpenAI,
+    /// Locally installed `claude` CLI (`claude -p`) — inference runs on
+    /// Anthropic's servers billed to the user's subscription
+    ClaudeCli,
+    /// Locally installed `codex` CLI (`codex exec`) — inference runs on
+    /// OpenAI's servers billed to the user's subscription
+    CodexCli,
 }
 
 impl LLMProvider {
@@ -86,9 +92,116 @@ impl LLMProvider {
             "openrouter" => Ok(Self::OpenRouter),
             "builtin-ai" | "local-llama" | "localllama" => Ok(Self::BuiltInAI),
             "custom-openai" => Ok(Self::CustomOpenAI),
+            "claude-cli" => Ok(Self::ClaudeCli),
+            "codex-cli" => Ok(Self::CodexCli),
             _ => Err(format!("Unsupported LLM provider: {}", s)),
         }
     }
+}
+
+/// Locate a CLI binary: GUI apps launched from the Dock get a minimal PATH
+/// without Homebrew, so probe the usual install locations before falling
+/// back to `which`.
+fn resolve_cli_binary(name: &str) -> Option<std::path::PathBuf> {
+    let mut candidates: Vec<std::path::PathBuf> = vec![
+        format!("/opt/homebrew/bin/{}", name).into(),
+        format!("/usr/local/bin/{}", name).into(),
+    ];
+    if let Ok(home) = std::env::var("HOME") {
+        candidates.push(format!("{}/.local/bin/{}", home, name).into());
+        candidates.push(format!("{}/.local/share/mise/shims/{}", home, name).into());
+    }
+    for c in candidates {
+        if c.exists() {
+            return Some(c);
+        }
+    }
+    std::process::Command::new("which")
+        .arg(name)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .and_then(|o| {
+            let p = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            (!p.is_empty()).then(|| p.into())
+        })
+}
+
+/// Generate via a locally installed agent CLI, prompt on stdin. NOTE: the
+/// transcript text leaves the machine — these providers are only reachable
+/// through an explicit user selection in Settings.
+pub async fn generate_with_cli(
+    provider: &LLMProvider,
+    system_prompt: &str,
+    user_prompt: &str,
+    cancellation_token: Option<&CancellationToken>,
+) -> Result<String, String> {
+    let (bin_name, args): (&str, Vec<&str>) = match provider {
+        LLMProvider::ClaudeCli => ("claude", vec!["-p"]),
+        // Run outside any git repo (cwd is temp_dir below), so the trust
+        // check must be skipped explicitly
+        LLMProvider::CodexCli => ("codex", vec!["exec", "--skip-git-repo-check"]),
+        _ => return Err("not a CLI provider".to_string()),
+    };
+    let bin = resolve_cli_binary(bin_name)
+        .ok_or_else(|| format!("'{}' CLI not found — install it or pick another provider", bin_name))?;
+
+    let prompt = format!("{}\n\n{}", system_prompt, user_prompt);
+    log::info!("Generating via {} CLI ({} chars prompt)", bin_name, prompt.len());
+
+    let mut child = tokio::process::Command::new(&bin)
+        .args(&args)
+        // Neutral cwd: the CLIs pick up directory context (git repos,
+        // project files) — a transcript prompt should see none of that
+        .current_dir(std::env::temp_dir())
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to start {}: {}", bin_name, e))?;
+
+    {
+        use tokio::io::AsyncWriteExt;
+        let mut stdin = child.stdin.take().ok_or("Failed to open CLI stdin")?;
+        stdin
+            .write_all(prompt.as_bytes())
+            .await
+            .map_err(|e| format!("Failed to write prompt: {}", e))?;
+        // Closing stdin signals end of prompt
+    }
+
+    let wait = child.wait_with_output();
+    let output = if let Some(token) = cancellation_token {
+        tokio::select! {
+            out = tokio::time::timeout(std::time::Duration::from_secs(600), wait) => {
+                out.map_err(|_| format!("{} CLI timed out after 10 minutes", bin_name))?
+            }
+            _ = token.cancelled() => {
+                return Err("Generation cancelled by user".to_string());
+            }
+        }
+    } else {
+        tokio::time::timeout(std::time::Duration::from_secs(600), wait)
+            .await
+            .map_err(|_| format!("{} CLI timed out after 10 minutes", bin_name))?
+    };
+    let output = output.map_err(|e| format!("{} CLI failed: {}", bin_name, e))?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(format!(
+            "{} CLI exited with {}: {}",
+            bin_name,
+            output.status,
+            stderr.chars().take(400).collect::<String>()
+        ));
+    }
+    let text = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if text.is_empty() {
+        return Err(format!("{} CLI returned empty output", bin_name));
+    }
+    log::info!("{} CLI produced {} chars", bin_name, text.len());
+    Ok(text)
 }
 
 /// Generates a summary using the specified LLM provider
@@ -132,6 +245,11 @@ pub async fn generate_summary(
         }
     }
 
+    // Agent CLIs: subprocess, no HTTP API
+    if matches!(provider, LLMProvider::ClaudeCli | LLMProvider::CodexCli) {
+        return generate_with_cli(provider, system_prompt, user_prompt, cancellation_token).await;
+    }
+
     // Handle BuiltInAI provider separately (uses local sidecar, no HTTP API)
     if provider == &LLMProvider::BuiltInAI {
         let app_data_dir = app_data_dir
@@ -149,6 +267,9 @@ pub async fn generate_summary(
     }
 
     let (api_url, mut headers) = match provider {
+        LLMProvider::BuiltInAI | LLMProvider::ClaudeCli | LLMProvider::CodexCli => {
+            unreachable!("handled above")
+        }
         LLMProvider::OpenAI => (
             "https://api.openai.com/v1/chat/completions".to_string(),
             header::HeaderMap::new(),
@@ -342,5 +463,7 @@ fn provider_name(provider: &LLMProvider) -> &str {
         LLMProvider::BuiltInAI => "Built-in AI",
         LLMProvider::OpenRouter => "OpenRouter",
         LLMProvider::CustomOpenAI => "Custom OpenAI",
+        LLMProvider::ClaudeCli => "Claude Code CLI",
+        LLMProvider::CodexCli => "Codex CLI",
     }
 }
