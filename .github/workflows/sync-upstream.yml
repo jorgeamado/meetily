@@ -1,12 +1,13 @@
-# Fork maintenance: keep `main` current with upstream
-# (Zackriya-Solutions/meeting-minutes).
+# Fork maintenance: track Zackriya-Solutions/meeting-minutes.
 #
-# Scheduled workflows only run from the default branch, so this file must
-# live on main — which means main is "upstream + fork-maintenance commits".
-# The sync therefore REBASES main onto upstream/main (replaying this commit
-# on top) and force-pushes with lease. Keep actual fork work on feature
-# branches; anything committed to main gets silently rebased forward.
-name: Sync main with upstream
+# main is the fork's product branch (features merged in), so upstream is
+# integrated by MERGE, not rebase:
+#   1. upstream-main is kept as a pristine fast-forward mirror of upstream
+#      (never conflicts; useful for diffing fork vs upstream).
+#   2. upstream/main is merged into main. A clean merge is pushed
+#      automatically; a conflict fails the job loudly for manual resolution:
+#      git fetch upstream && git merge upstream/main  (resolve, push)
+name: Sync with upstream
 
 on:
   schedule:
@@ -29,22 +30,26 @@ jobs:
           ref: main
           fetch-depth: 0
 
-      - name: Rebase main onto upstream/main
+      - name: Update upstream-main mirror
+        run: |
+          git remote add upstream https://github.com/Zackriya-Solutions/meeting-minutes.git
+          git fetch upstream main
+          git push origin +refs/remotes/upstream/main:refs/heads/upstream-main
+
+      - name: Merge upstream into main
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git remote add upstream https://github.com/Zackriya-Solutions/meeting-minutes.git
-          git fetch upstream main
           BEHIND=$(git rev-list --count HEAD..upstream/main)
           if [ "$BEHIND" -eq 0 ]; then
-            echo "Already up to date with upstream/main"
+            echo "main already contains upstream/main"
             exit 0
           fi
-          echo "Rebasing onto $BEHIND new upstream commits"
-          git rebase upstream/main
-          git push --force-with-lease origin main
+          echo "Merging $BEHIND new upstream commits into main"
+          git merge --no-edit upstream/main
+          git push origin main
 
       - name: Report conflict
         if: failure()
         run: |
-          echo "::error::Rebase onto upstream/main failed — a commit on main conflicts with upstream. Resolve locally: git fetch upstream && git rebase upstream/main && git push --force-with-lease origin main"
+          echo "::error::Merging upstream/main into main hit a conflict. Resolve locally: git fetch upstream && git merge upstream/main (fix conflicts) && git push origin main. The upstream-main mirror branch is already updated for diffing."
