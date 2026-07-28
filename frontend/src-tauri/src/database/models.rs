@@ -35,6 +35,7 @@ pub struct Transcript {
     pub audio_start_time: Option<f64>,
     pub audio_end_time: Option<f64>,
     pub duration: Option<f64>,
+    pub speaker: Option<String>,
 }
 
 #[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
@@ -127,4 +128,16 @@ pub struct TranscriptSetting {
     #[sqlx(rename = "openaiApiKey")]
     #[serde(rename = "openaiApiKey")]
     pub openai_api_key: Option<String>,
+    #[sqlx(rename = "diarizationEnabled")]
+    #[serde(rename = "diarizationEnabled")]
+    pub diarization_enabled: bool,
+    #[sqlx(rename = "diarizationNumSpeakers")]
+    #[serde(rename = "diarizationNumSpeakers")]
+    pub diarization_num_speakers: Option<i64>,
+    #[sqlx(rename = "diarizationSensitivity")]
+    #[serde(rename = "diarizationSensitivity")]
+    pub diarization_sensitivity: String,
+    #[sqlx(rename = "diarizationEmbeddingModel")]
+    #[serde(rename = "diarizationEmbeddingModel")]
+    pub diarization_embedding_model: String,
 }

@@ -183,8 +183,15 @@ impl ContinuousVadProcessor {
         // Force end any ongoing speech
         if self.in_speech && !self.current_speech.is_empty() {
             // processed_samples and speech_start_sample always count 16kHz samples (post-resampling)
-            let start_ms = (self.speech_start_sample as f64 / 16000.0) * 1000.0;
+            let mut start_ms = (self.speech_start_sample as f64 / 16000.0) * 1000.0;
             let end_ms = (self.processed_samples as f64 / 16000.0) * 1000.0;
+            if start_ms > end_ms {
+                // Should not happen; derive the start from the buffered samples
+                // rather than emitting an inverted segment that downstream
+                // splitting/labeling cannot handle
+                warn!("VAD flush: inverted segment timestamps (start {:.0}ms > end {:.0}ms), reconstructing start from buffer length", start_ms, end_ms);
+                start_ms = (end_ms - (self.current_speech.len() as f64 / 16000.0) * 1000.0).max(0.0);
+            }
 
             debug!("VAD flush: Force-ending speech - start={}ms, end={}ms, duration={}ms, samples={}",
                   start_ms, end_ms, end_ms - start_ms, self.current_speech.len());
@@ -236,8 +243,10 @@ impl ContinuousVadProcessor {
                         self.last_logged_state = true;
                     }
                     self.in_speech = true;
-                    // Use 16000 (VAD processing rate) since processed_samples counts 16kHz samples
-                    self.speech_start_sample = self.processed_samples + (timestamp_ms * 16000 / 1000);
+                    // timestamp_ms is absolute stream time (same clock SpeechEnd
+                    // reports); adding processed_samples double-counted it and
+                    // corrupted flush-terminated segments with start > end
+                    self.speech_start_sample = timestamp_ms * 16000 / 1000;
                     self.current_speech.clear();
                 }
                 VadTransition::SpeechEnd { start_timestamp_ms, end_timestamp_ms, samples } => {

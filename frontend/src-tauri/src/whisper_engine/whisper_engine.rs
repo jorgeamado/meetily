@@ -37,6 +37,12 @@ pub struct WhisperEngine {
     models_dir: PathBuf,
     current_context: Arc<RwLock<Option<WhisperContext>>>,
     current_model: Arc<RwLock<Option<String>>>,
+    // Whether the loaded context has DTW token timestamps enabled (mutually
+    // exclusive with flash attention; used by retranscription only)
+    current_dtw: Arc<RwLock<bool>>,
+    // Vocabulary hint prepended to decoding (whisper initial_prompt); set by
+    // retranscription from the learned glossary, cleared afterwards
+    initial_prompt: Arc<RwLock<Option<String>>>,
     available_models: Arc<RwLock<HashMap<String, ModelInfo>>>,
     // State tracking for smart logging
     last_transcription_was_short: Arc<RwLock<bool>>,
@@ -153,6 +159,8 @@ impl WhisperEngine {
             models_dir,
             current_context: Arc::new(RwLock::new(None)),
             current_model: Arc::new(RwLock::new(None)),
+            current_dtw: Arc::new(RwLock::new(false)),
+            initial_prompt: Arc::new(RwLock::new(None)),
             available_models: Arc::new(RwLock::new(HashMap::new())),
             // Initialize state tracking
             last_transcription_was_short: Arc::new(RwLock::new(false)),
@@ -259,21 +267,69 @@ impl WhisperEngine {
     }
     
     pub async fn load_model(&self, model_name: &str) -> Result<()> {
+        self.load_model_with_dtw(model_name, false).await
+    }
+
+    /// Whether the currently loaded context has DTW token timestamps enabled
+    pub async fn is_dtw_enabled(&self) -> bool {
+        *self.current_dtw.read().await
+    }
+
+    /// DTW alignment-heads preset for a model name; None when the model has no
+    /// preset (DTW stays off and flash attention stays on)
+    fn dtw_preset_for(model_name: &str) -> Option<whisper_rs::DtwModelPreset> {
+        use whisper_rs::DtwModelPreset as P;
+        let n = model_name.to_lowercase();
+        if n.contains("turbo") {
+            return None; // no aheads preset for turbo in whisper-rs 0.13
+        }
+        Some(if n.contains("large-v3") {
+            P::LargeV3
+        } else if n.contains("large-v2") {
+            P::LargeV2
+        } else if n.contains("large-v1") || n.contains("large") {
+            P::LargeV1
+        } else if n.contains("medium.en") {
+            P::MediumEn
+        } else if n.contains("medium") {
+            P::Medium
+        } else if n.contains("small.en") {
+            P::SmallEn
+        } else if n.contains("small") {
+            P::Small
+        } else if n.contains("base.en") {
+            P::BaseEn
+        } else if n.contains("base") {
+            P::Base
+        } else if n.contains("tiny.en") {
+            P::TinyEn
+        } else if n.contains("tiny") {
+            P::Tiny
+        } else {
+            return None;
+        })
+    }
+
+    pub async fn load_model_with_dtw(&self, model_name: &str, want_dtw: bool) -> Result<()> {
         let models = self.available_models.read().await;
         let model_info = models.get(model_name)
             .ok_or_else(|| anyhow!("Model {} not found", model_name))?;
+
+        // DTW needs an aheads preset for the model
+        let dtw_preset = if want_dtw { Self::dtw_preset_for(model_name) } else { None };
+        let effective_dtw = dtw_preset.is_some();
 
         match model_info.status {
             ModelStatus::Available => {
                 // FIX 5: Check if this model is already loaded
                 if let Some(current_model) = self.current_model.read().await.as_ref() {
-                    if current_model == model_name {
-                        log::info!("Model {} is already loaded, skipping reload", model_name);
+                    if current_model == model_name && *self.current_dtw.read().await == effective_dtw {
+                        log::info!("Model {} is already loaded (dtw={}), skipping reload", model_name, effective_dtw);
                         return Ok(());
                     }
 
                     // FIX 5: Unload current model before loading new one
-                    log::info!("Unloading current model '{}' before loading '{}'", current_model, model_name);
+                    log::info!("Unloading current model '{}' before loading '{}' (dtw={})", current_model, model_name, effective_dtw);
                     self.unload_model().await;
                 }
 
@@ -288,12 +344,22 @@ impl WhisperEngine {
                     hardware_profile.performance_tier,
                 );
 
-                let context_param = WhisperContextParameters {
+                let mut context_param = WhisperContextParameters {
                     use_gpu: acceleration.use_gpu,
                     gpu_device: acceleration.gpu_device,
                     flash_attn: acceleration.flash_attn,
                     ..Default::default()
                 };
+                if let Some(preset) = dtw_preset.clone() {
+                    // whisper.cpp cannot produce DTW timestamps with flash
+                    // attention enabled - accuracy wins for retranscription
+                    context_param.flash_attn = false;
+                    context_param.dtw_parameters = whisper_rs::DtwParameters {
+                        mode: whisper_rs::DtwMode::ModelPreset { model_preset: preset },
+                        ..Default::default()
+                    };
+                    log::info!("DTW token timestamps enabled (flash attention off)");
+                }
 
                 log::info!(
                     "Whisper acceleration decision: compiled_backend={} runtime_detected_gpu={:?} use_gpu={} flash_attn={} gpu_device={}",
@@ -318,6 +384,7 @@ impl WhisperEngine {
                 // Update current context and model
                 *self.current_context.write().await = Some(ctx);
                 *self.current_model.write().await = Some(model_name.to_string());
+                *self.current_dtw.write().await = effective_dtw;
 
                 // Enhanced acceleration status reporting
                 let acceleration_status = acceleration.status_label();
@@ -343,6 +410,7 @@ impl WhisperEngine {
     }
 
     pub async fn unload_model(&self) -> bool  {
+        *self.current_dtw.write().await = false;
         let mut ctx_guard = self.current_context.write().await;
         let unloaded = ctx_guard.take().is_some();
         if unloaded {
@@ -512,8 +580,32 @@ impl WhisperEngine {
         repeated_words as f32 / total_words
     }
     
+    /// Set (or clear) the vocabulary hint passed to whisper as
+    /// initial_prompt on every subsequent transcription call. Biases
+    /// recognition toward known names/terms; used by retranscription with
+    /// the learned glossary and cleared when the run ends.
+    pub async fn set_initial_prompt(&self, prompt: Option<String>) {
+        *self.initial_prompt.write().await = prompt;
+    }
+
     /// Transcribe audio with streaming support for partial results and adaptive quality
     pub async fn transcribe_audio_with_confidence(&self, audio_data: Vec<f32>, language: Option<String>) -> Result<(String, f32, bool)> {
+        let (text, conf, is_partial, _) = self.transcribe_internal(audio_data, language).await?;
+        Ok((text, conf, is_partial))
+    }
+
+    /// Like transcribe_audio_with_confidence, but also returns per-token
+    /// timestamps (chunk-relative ms) for speaker-turn splitting.
+    pub async fn transcribe_audio_with_words(
+        &self,
+        audio_data: Vec<f32>,
+        language: Option<String>,
+    ) -> Result<(String, f32, Vec<crate::audio::diarization::WordSpan>)> {
+        let (text, conf, _, words) = self.transcribe_internal(audio_data, language).await?;
+        Ok((text, conf, words))
+    }
+
+    async fn transcribe_internal(&self, audio_data: Vec<f32>, language: Option<String>) -> Result<(String, f32, bool, Vec<crate::audio::diarization::WordSpan>)> {
         let ctx_lock = self.current_context.read().await;
         let ctx = ctx_lock.as_ref()
             .ok_or_else(|| anyhow!("No model loaded. Please load a model first."))?;
@@ -539,6 +631,12 @@ impl WhisperEngine {
         };
         params.set_language(language_code);
         params.set_translate(should_translate);
+
+        // Vocabulary hint (learned glossary) biases decoding toward known
+        // names and terms; whisper-rs leaks the CString so no lifetime issue
+        if let Some(prompt) = self.initial_prompt.read().await.as_deref() {
+            params.set_initial_prompt(prompt);
+        }
 
         // CRITICAL: Disable timestamp tokens to prevent whisper.cpp chunking heuristics
         // The "single timestamp ending - skip entire chunk" optimization incorrectly discards
@@ -591,6 +689,7 @@ impl WhisperEngine {
         let mut result = String::new();
         let mut total_confidence = 0.0;
         let mut segment_count = 0;
+        let mut words: Vec<crate::audio::diarization::WordSpan> = Vec::new();
 
         let num_segments = num_segments?;
         for i in 0..num_segments {
@@ -616,6 +715,51 @@ impl WhisperEngine {
                 }
                 result.push_str(cleaned_text);
             }
+
+            // Collect token timestamps (centiseconds -> ms) for speaker-turn
+            // splitting; skip whisper's special/control tokens
+            if let Ok(n_tokens) = state.full_n_tokens(i) {
+                let mut last_end_ms = words.last().map(|w| w.end_ms).unwrap_or(0.0);
+                for j in 0..n_tokens {
+                    let tok_text = match state.full_get_token_text_lossy(i, j) {
+                        Ok(t) => t,
+                        Err(_) => continue,
+                    };
+                    if tok_text.starts_with("[_") || tok_text.starts_with("<|") {
+                        continue;
+                    }
+                    if let Ok(data) = state.full_get_token_data(i, j) {
+                        // Prefer DTW cross-attention timestamps when the
+                        // context was loaded with them (centisecond point
+                        // estimate per token); fall back to the t0/t1
+                        // heuristics otherwise
+                        let start_ms = if data.t_dtw >= 0 {
+                            data.t_dtw as f64 * 10.0
+                        } else if data.t0 >= 0 {
+                            data.t0 as f64 * 10.0
+                        } else {
+                            last_end_ms
+                        };
+                        let end_ms = (if data.t1 >= 0 { data.t1 as f64 * 10.0 } else { start_ms })
+                            .max(start_ms);
+                        last_end_ms = end_ms;
+                        words.push(crate::audio::diarization::WordSpan {
+                            text: tok_text,
+                            start_ms,
+                            end_ms,
+                            prob: data.p,
+                        });
+                    }
+                }
+            }
+        }
+
+        // DTW gives point estimates; clip a token's end to the next token's
+        // start so spans never overlap their successor
+        for k in 0..words.len().saturating_sub(1) {
+            if words[k + 1].start_ms > words[k].start_ms && words[k].end_ms > words[k + 1].start_ms {
+                words[k].end_ms = words[k + 1].start_ms;
+            }
         }
 
         let final_result = result.trim().to_string();
@@ -627,7 +771,7 @@ impl WhisperEngine {
             0.0
         };
 
-        Ok((cleaned_result, avg_confidence, is_partial))
+        Ok((cleaned_result, avg_confidence, is_partial, words))
     }
 
     pub async fn transcribe_audio(&self, audio_data: Vec<f32>, language: Option<String>) -> Result<String> {

@@ -1,6 +1,10 @@
 // Retranscription module - allows re-processing stored audio with different settings
 
 use crate::audio::decoder::decode_audio_file;
+use crate::audio::boundary_refine;
+use crate::audio::diarization::{self, DiarizeOptions};
+use crate::audio::glossary;
+use crate::audio::transcript_repair;
 use crate::audio::vad::get_speech_chunks_with_progress;
 use super::common::{create_transcript_segments, split_segment_at_silence, write_transcripts_json};
 use super::constants::AUDIO_EXTENSIONS;
@@ -86,6 +90,12 @@ pub fn cancel_retranscription() {
     RETRANSCRIPTION_CANCELLED.store(true, Ordering::SeqCst);
 }
 
+/// Check whether cancellation has been requested (used by the diarization sidecar
+/// to know when to kill the running helper process)
+pub(crate) fn is_cancellation_requested() -> bool {
+    RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst)
+}
+
 /// Start retranscription of a meeting's audio
 pub async fn start_retranscription<R: Runtime>(
     app: AppHandle<R>,
@@ -94,6 +104,8 @@ pub async fn start_retranscription<R: Runtime>(
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    diarize: Option<DiarizeOptions>,
+    repair: Option<bool>,
 ) -> Result<RetranscriptionResult> {
     // Acquire guard - ensures flag is cleared even on panic/early return
     let _guard = RetranscriptionGuard::acquire().map_err(|e| anyhow!(e))?;
@@ -102,7 +114,20 @@ pub async fn start_retranscription<R: Runtime>(
     RETRANSCRIPTION_CANCELLED.store(false, Ordering::SeqCst);
 
     let use_parakeet = provider.as_deref() == Some("parakeet");
-    let result = run_retranscription(app.clone(), meeting_id.clone(), meeting_folder_path, language, model, provider).await;
+    let result = run_retranscription(app.clone(), meeting_id.clone(), meeting_folder_path, language, model, provider, diarize, repair).await;
+
+    // The glossary prompt must never outlive the batch run: live
+    // transcription shares the engine singleton
+    {
+        use crate::whisper_engine::commands::WHISPER_ENGINE;
+        let engine = {
+            let guard = WHISPER_ENGINE.lock().unwrap_or_else(|e| e.into_inner());
+            guard.as_ref().cloned()
+        };
+        if let Some(e) = engine {
+            e.set_initial_prompt(None).await;
+        }
+    }
 
     // Unload the engine after the batch job (success, failure, or cancellation)
     super::common::unload_engine_after_batch(use_parakeet).await;
@@ -176,16 +201,19 @@ async fn run_retranscription<R: Runtime>(
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    diarize: Option<DiarizeOptions>,
+    repair: Option<bool>,
 ) -> Result<RetranscriptionResult> {
     let folder_path = PathBuf::from(&meeting_folder_path);
     let audio_path = find_audio_file(&folder_path)?;
 
     // Determine which provider to use (default to whisper)
     let use_parakeet = provider.as_deref() == Some("parakeet");
+    let diarize_opts = diarize.unwrap_or_default();
 
     info!(
-        "Starting retranscription for meeting {} with language {:?}, model {:?}, provider {:?}",
-        meeting_id, language, model, provider
+        "Starting retranscription for meeting {} with language {:?}, model {:?}, provider {:?}, diarize {:?}",
+        meeting_id, language, model, provider, diarize_opts
     );
 
     // Emit progress: decoding
@@ -224,6 +252,13 @@ async fn run_retranscription<R: Runtime>(
     .await
     .map_err(|e| anyhow!("Resample task panicked: {}", e))?;
     info!("Converted to 16kHz mono format: {} samples", audio_samples.len());
+
+    // Keep a copy of the full audio for diarization, which runs independently of VAD/whisper
+    let audio_samples_for_diarization = if diarize_opts.enabled {
+        Some(audio_samples.clone())
+    } else {
+        None
+    };
 
     emit_progress(&app, &meeting_id, "vad", 20, "Detecting speech segments...");
 
@@ -296,7 +331,56 @@ async fn run_retranscription<R: Runtime>(
         return Err(anyhow!("No speech detected in audio file"));
     }
 
-    emit_progress(&app, &meeting_id, "transcribing", 25, "Loading transcription engine...");
+    // Run speaker diarization (if enabled) concurrently with transcription below. Failures
+    // here must not fail the whole retranscription - we just fall back to no speaker labels.
+    let mut diarize_handle: Option<tauri::async_runtime::JoinHandle<Vec<diarization::DiarizedSegment>>> =
+        if let Some(samples) = audio_samples_for_diarization {
+            if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
+                return Err(anyhow!("Retranscription cancelled"));
+            }
+
+            let app_for_diarize = app.clone();
+            let meeting_id_for_diarize = meeting_id.clone();
+            let diarize_opts_for_task = diarize_opts.clone();
+
+            Some(tauri::async_runtime::spawn(async move {
+                let diarize_result = diarization::diarize(
+                    &samples,
+                    &diarize_opts_for_task,
+                    &app_for_diarize,
+                    |pct, msg| {
+                        emit_progress(&app_for_diarize, &meeting_id_for_diarize, "diarizing", pct, msg);
+                    },
+                )
+                .await;
+
+                match diarize_result {
+                    Ok((segments, num_speakers)) => {
+                        info!(
+                            "Speaker diarization found {} speaker(s) across {} segments",
+                            num_speakers,
+                            segments.len()
+                        );
+                        segments
+                    }
+                    Err(e) => {
+                        warn!("Speaker diarization failed, continuing without speaker labels: {}", e);
+                        emit_progress(
+                            &app_for_diarize,
+                            &meeting_id_for_diarize,
+                            "diarizing",
+                            100,
+                            "Speaker identification failed, continuing without speaker labels",
+                        );
+                        Vec::new()
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+
+    emit_progress(&app, &meeting_id, "transcribing", 0, "Loading transcription engine...");
 
     // Initialize the appropriate engine once (not per-segment)
     let whisper_engine = if !use_parakeet {
@@ -309,6 +393,15 @@ async fn run_retranscription<R: Runtime>(
     } else {
         None
     };
+
+    // Bias whisper toward names/terms learned from previous meetings;
+    // cleared by start_retranscription when the run ends
+    if let Some(engine) = whisper_engine.as_ref() {
+        if let Some(prompt) = glossary::initial_prompt(&app) {
+            info!("Applying learned glossary as whisper initial_prompt: {}", prompt);
+            engine.set_initial_prompt(Some(prompt)).await;
+        }
+    }
 
     // Split very long segments at silence boundaries for better transcription quality.
     // Hard cuts at arbitrary sample positions lose words at boundaries. Instead, scan
@@ -336,17 +429,21 @@ async fn run_retranscription<R: Runtime>(
     info!("Processing {} segments (after splitting)", processable_count);
 
     // Process each speech segment with progress updates
-    let mut all_transcripts: Vec<(String, f64, f64)> = Vec::new(); // (text, start_ms, end_ms)
+    // (text, start_ms, end_ms, token spans in absolute ms for speaker splitting)
+    let mut all_transcripts: Vec<(String, f64, f64, Vec<diarization::WordSpan>)> = Vec::new();
     let mut total_confidence = 0.0f32;
 
     for (i, segment) in processable_segments.iter().enumerate() {
         // Check for cancellation before each segment
         if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
+            if let Some(handle) = diarize_handle.take() {
+                let _ = handle.await;
+            }
             return Err(anyhow!("Retranscription cancelled"));
         }
 
-        // Calculate progress (25% to 80% range for transcription)
-        let progress = 25 + ((i as f32 / processable_count as f32) * 55.0) as u32;
+        // Calculate progress (0-100 range, own to the "transcribing" stage)
+        let progress = ((i as u64 * 100) / processable_count as u64) as u32;
         let segment_duration_sec = (segment.end_timestamp_ms - segment.start_timestamp_ms) / 1000.0;
         emit_progress(
             &app,
@@ -368,20 +465,30 @@ async fn run_retranscription<R: Runtime>(
         }
 
         // Transcribe this segment
-        let (text, conf) = if use_parakeet {
+        let (text, conf, words) = if use_parakeet {
             let engine = parakeet_engine.as_ref().unwrap();
             let text = engine
                 .transcribe_audio(segment.samples.clone())
                 .await
                 .map_err(|e| anyhow!("Parakeet transcription failed on segment {}: {}", i, e))?;
-            (text, 0.9f32)
+            (text, 0.9f32, Vec::new())
         } else {
             let engine = whisper_engine.as_ref().unwrap();
-            let (text, conf, _) = engine
-                .transcribe_audio_with_confidence(segment.samples.clone(), language.clone())
+            let (text, conf, words) = engine
+                .transcribe_audio_with_words(segment.samples.clone(), language.clone())
                 .await
                 .map_err(|e| anyhow!("Whisper transcription failed on segment {}: {}", i, e))?;
-            (text, conf)
+            // Token times are chunk-relative; shift onto the recording timeline
+            let words = words
+                .into_iter()
+                .map(|w| diarization::WordSpan {
+                    text: w.text,
+                    start_ms: w.start_ms + segment.start_timestamp_ms,
+                    end_ms: w.end_ms + segment.start_timestamp_ms,
+                    prob: w.prob,
+                })
+                .collect();
+            (text, conf, words)
         };
 
         // Skip empty transcripts
@@ -392,7 +499,19 @@ async fn run_retranscription<R: Runtime>(
                 i + 1, processable_count, segment_duration_sec, conf,
                 if trimmed.len() > 80 { let mut end = 80; while !trimmed.is_char_boundary(end) { end -= 1; } &trimmed[..end] } else { trimmed }
             );
-            all_transcripts.push((text, segment.start_timestamp_ms, segment.end_timestamp_ms));
+            // Stream the raw block to the UI so the transcript is readable
+            // while later segments are still transcribing; speaker labels
+            // arrive with the final save
+            let _ = app.emit(
+                "retranscription-partial",
+                serde_json::json!({
+                    "meeting_id": meeting_id,
+                    "text": text.trim(),
+                    "audio_start_time": segment.start_timestamp_ms / 1000.0,
+                    "audio_end_time": segment.end_timestamp_ms / 1000.0,
+                }),
+            );
+            all_transcripts.push((text, segment.start_timestamp_ms, segment.end_timestamp_ms, words));
             total_confidence += conf;
         } else {
             debug!("Segment {}/{}: {:.1}s — empty transcription", i + 1, processable_count, segment_duration_sec);
@@ -413,57 +532,138 @@ async fn run_retranscription<R: Runtime>(
 
     // Check for cancellation
     if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
+        if let Some(handle) = diarize_handle.take() {
+            let _ = handle.await;
+        }
         return Err(anyhow!("Retranscription cancelled"));
     }
 
+    // Await diarization (runs concurrently with the transcription above) before
+    // moving past the dual-progress phase; a failed or panicked task just means
+    // no speaker labels. The spawned task keeps emitting "diarizing" progress
+    // while we wait, so the UI stays live until it finishes.
+    let diarized_segments: Vec<diarization::DiarizedSegment> = if let Some(handle) = diarize_handle {
+        match handle.await {
+            Ok(segments) => segments,
+            Err(join_err) => {
+                warn!("Speaker diarization task panicked: {}", join_err);
+                emit_progress(
+                    &app,
+                    &meeting_id,
+                    "diarizing",
+                    100,
+                    "Speaker identification failed, continuing without speaker labels",
+                );
+                Vec::new()
+            }
+        }
+    } else {
+        Vec::new()
+    };
+
     emit_progress(&app, &meeting_id, "saving", 80, "Saving transcripts...");
 
-    // Create transcript segments with proper timestamps from VAD
-    let segments = create_transcript_segments(&all_transcripts);
+    // Split blocks that span speaker changes into per-turn rows using token
+    // timestamps, so one row never mixes two speakers' words. Blocks without
+    // token data (Parakeet) keep whole-block max-overlap labeling.
+    let mut turns: Vec<diarization::SpeakerTurn> = all_transcripts
+        .iter()
+        .flat_map(|(text, start_ms, end_ms, words)| {
+            if diarized_segments.is_empty() {
+                vec![diarization::SpeakerTurn {
+                    text: text.clone(),
+                    start_ms: *start_ms,
+                    end_ms: *end_ms,
+                    speaker: None,
+                    words: words.clone(),
+                }]
+            } else {
+                diarization::split_block_into_turns(
+                    text,
+                    *start_ms,
+                    *end_ms,
+                    words,
+                    &diarized_segments,
+                )
+            }
+        })
+        .collect();
 
-    // Save to database
-    let app_state = app
-        .try_state::<AppState>()
-        .ok_or_else(|| anyhow!("App state not available"))?;
-
-    // Wrap delete+insert+update in a transaction to prevent data loss
-    let pool = app_state.db_manager.pool();
-    let mut conn = pool.acquire().await.map_err(|e| anyhow!("DB error: {}", e))?;
-    let mut tx = sqlx::Connection::begin(&mut *conn)
-        .await
-        .map_err(|e| anyhow!("Failed to start transaction: {}", e))?;
-
-    sqlx::query("DELETE FROM transcripts WHERE meeting_id = ?")
-        .bind(&meeting_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| anyhow!("Failed to delete existing transcripts: {}", e))?;
-
-    for segment in &segments {
-        sqlx::query(
-            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration)
-             VALUES (?, ?, ?, ?, ?, ?, ?)"
+    // Second opinion on tight speaker handovers: the acoustic diarizer often
+    // hands the next speaker's first word to the previous one. A local LLM
+    // picks the natural cut from numbered candidates; text can only be
+    // re-partitioned between rows, never altered.
+    if diarize_opts.llm_refine.unwrap_or(true) && !diarized_segments.is_empty() {
+        emit_progress(&app, &meeting_id, "saving", 80, "Refining speaker boundaries...");
+        let app_for_refine = app.clone();
+        let meeting_id_for_refine = meeting_id.clone();
+        let stats = boundary_refine::refine_turns(
+            &app,
+            &mut turns,
+            || RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst),
+            move |done, total| {
+                emit_progress(
+                    &app_for_refine,
+                    &meeting_id_for_refine,
+                    "saving",
+                    80 + (5 * done / total.max(1)) as u32,
+                    &format!("Refining speaker boundaries ({}/{})...", done, total),
+                );
+            },
         )
-        .bind(&segment.id)
-        .bind(&meeting_id)
-        .bind(&segment.text)
-        .bind(&segment.timestamp)
-        .bind(segment.audio_start_time)
-        .bind(segment.audio_end_time)
-        .bind(segment.duration)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| anyhow!("Failed to insert transcript: {}", e))?;
+        .await;
+        info!(
+            "Boundary refinement: {} sandwiches ({} merged), {} tight boundaries, {} queried, {} moved, {} failures",
+            stats.sandwiches, stats.merged, stats.boundaries, stats.queried, stats.moved, stats.failures
+        );
     }
 
-    tx.commit().await
-        .map_err(|e| anyhow!("Failed to commit transaction: {}", e))?;
+    // Confidence-gated wording repair: sentences whose tokens decoded with
+    // low probability get one constrained LLM patch each (at most 2 words
+    // may change; anything bigger is rejected). Timings are untouched.
+    if repair.unwrap_or(true) && !use_parakeet {
+        emit_progress(&app, &meeting_id, "saving", 86, "Checking low-confidence wording...");
+        let app_for_repair = app.clone();
+        let meeting_id_for_repair = meeting_id.clone();
+        let stats = transcript_repair::repair_turns(
+            &app,
+            &mut turns,
+            || RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst),
+            move |done, total| {
+                emit_progress(
+                    &app_for_repair,
+                    &meeting_id_for_repair,
+                    "saving",
+                    86 + (4 * done / total.max(1)) as u32,
+                    &format!("Checking low-confidence wording ({}/{})...", done, total),
+                );
+            },
+        )
+        .await;
+        info!(
+            "Transcript repair: {} flagged, {} queried, {} repaired, {} failures",
+            stats.flagged, stats.queried, stats.repaired, stats.failures
+        );
+    }
 
-    info!(
-        "Updated {} transcripts for meeting {} in transaction",
-        segments.len(),
-        meeting_id
-    );
+    let labeled_blocks: Vec<(String, f64, f64, Option<usize>)> = diarization::turns_to_rows(&turns);
+
+    // Create transcript segments with proper timestamps from VAD
+    let segments = save_transcript_rows(&app, &meeting_id, &labeled_blocks).await?;
+
+    // Persist the refinement inputs so the AI passes can be re-run later
+    // without redoing transcription (standalone "AI fix-up")
+    if let Err(e) = write_refine_data(&folder_path, &turns, &diarized_segments) {
+        warn!("Failed to write refine-data.json: {}", e);
+    }
+
+    // Learn vocabulary from this meeting in the background (names, terms)
+    // so the NEXT retranscription can bias whisper toward it
+    if !use_parakeet {
+        let row_texts: Vec<String> = labeled_blocks.iter().map(|(t, _, _, _)| t.clone()).collect();
+        let sample = glossary::sample_rows(&row_texts);
+        tauri::async_runtime::spawn(glossary::update_from_transcript(app.clone(), sample));
+    }
 
     // Write updated transcripts.json and metadata.json to the meeting folder
     emit_progress(&app, &meeting_id, "saving", 90, "Writing transcript files...");
@@ -519,6 +719,229 @@ fn emit_progress<R: Runtime>(
 
 /// Get or initialize the Whisper engine, auto-loading the model if needed
 /// If `requested_model` is provided, ensures that specific model is loaded
+/// Replace a meeting's transcript rows in one transaction; returns the
+/// written segments (used for transcripts.json). Shared by retranscription
+/// and the standalone AI fix-up.
+async fn save_transcript_rows<R: Runtime>(
+    app: &AppHandle<R>,
+    meeting_id: &str,
+    labeled_blocks: &[(String, f64, f64, Option<usize>)],
+) -> Result<Vec<crate::api::TranscriptSegment>> {
+    let plain_blocks: Vec<(String, f64, f64)> = labeled_blocks
+        .iter()
+        .map(|(t, s, e, _)| (t.clone(), *s, *e))
+        .collect();
+    let segments = create_transcript_segments(&plain_blocks);
+
+    let app_state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| anyhow!("App state not available"))?;
+
+    // Wrap delete+insert in a transaction to prevent data loss
+    let pool = app_state.db_manager.pool();
+    let mut conn = pool.acquire().await.map_err(|e| anyhow!("DB error: {}", e))?;
+    let mut tx = sqlx::Connection::begin(&mut *conn)
+        .await
+        .map_err(|e| anyhow!("Failed to start transaction: {}", e))?;
+
+    sqlx::query("DELETE FROM transcripts WHERE meeting_id = ?")
+        .bind(meeting_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| anyhow!("Failed to delete existing transcripts: {}", e))?;
+
+    for (segment, (_, _, _, speaker_idx)) in segments.iter().zip(labeled_blocks.iter()) {
+        let speaker = speaker_idx.map(diarization::speaker_label);
+
+        sqlx::query(
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(&segment.id)
+        .bind(meeting_id)
+        .bind(&segment.text)
+        .bind(&segment.timestamp)
+        .bind(segment.audio_start_time)
+        .bind(segment.audio_end_time)
+        .bind(segment.duration)
+        .bind(speaker)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| anyhow!("Failed to insert transcript: {}", e))?;
+    }
+
+    tx.commit().await
+        .map_err(|e| anyhow!("Failed to commit transaction: {}", e))?;
+
+    info!(
+        "Updated {} transcripts for meeting {} in transaction",
+        segments.len(),
+        meeting_id
+    );
+    Ok(segments)
+}
+
+/// Inputs the AI passes need, persisted per meeting so they can be re-run
+/// without redoing transcription.
+#[derive(Serialize, Deserialize)]
+struct RefineData {
+    turns: Vec<diarization::SpeakerTurn>,
+    diarized: Vec<diarization::DiarizedSegment>,
+}
+
+const REFINE_DATA_FILENAME: &str = "refine-data.json";
+
+fn write_refine_data(
+    folder: &Path,
+    turns: &[diarization::SpeakerTurn],
+    diarized: &[diarization::DiarizedSegment],
+) -> Result<()> {
+    let data = RefineData { turns: turns.to_vec(), diarized: diarized.to_vec() };
+    let json = serde_json::to_string(&data)?;
+    std::fs::write(folder.join(REFINE_DATA_FILENAME), json)?;
+    Ok(())
+}
+
+fn load_refine_data(folder: &Path) -> Result<RefineData> {
+    let path = folder.join(REFINE_DATA_FILENAME);
+    let json = std::fs::read_to_string(&path).map_err(|_| {
+        anyhow!("No refinement data for this meeting yet — run Enhance (retranscribe) once first")
+    })?;
+    Ok(serde_json::from_str(&json)?)
+}
+
+/// Standalone AI fix-up: re-run the boundary and wording passes on the
+/// saved transcript without redoing transcription. Reuses the
+/// retranscription progress/complete/error events so the live transcript
+/// banner covers this flow too.
+async fn run_transcript_refinement<R: Runtime>(
+    app: AppHandle<R>,
+    meeting_id: String,
+    meeting_folder_path: String,
+) -> Result<()> {
+    let started = std::time::Instant::now();
+    let folder_path = PathBuf::from(&meeting_folder_path);
+    let mut data = load_refine_data(&folder_path)?;
+    info!(
+        "AI fix-up for meeting {}: {} turns, {} diarized segments",
+        meeting_id,
+        data.turns.len(),
+        data.diarized.len()
+    );
+
+    emit_progress(&app, &meeting_id, "refining", 5, "Refining speaker boundaries...");
+    if !data.diarized.is_empty() {
+        let app_for_refine = app.clone();
+        let meeting_id_for_refine = meeting_id.clone();
+        let stats = boundary_refine::refine_turns(
+            &app,
+            &mut data.turns,
+            || RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst),
+            move |done, total| {
+                emit_progress(
+                    &app_for_refine,
+                    &meeting_id_for_refine,
+                    "refining",
+                    5 + (45 * done / total.max(1)) as u32,
+                    &format!("Refining speaker boundaries ({}/{})...", done, total),
+                );
+            },
+        )
+        .await;
+        info!(
+            "AI fix-up boundaries: {} sandwiches ({} merged), {} boundaries, {} queried, {} moved, {} failures",
+            stats.sandwiches, stats.merged, stats.boundaries, stats.queried, stats.moved, stats.failures
+        );
+    }
+
+    if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
+        return Err(anyhow!("AI fix-up cancelled"));
+    }
+
+    emit_progress(&app, &meeting_id, "refining", 50, "Checking low-confidence wording...");
+    {
+        let app_for_repair = app.clone();
+        let meeting_id_for_repair = meeting_id.clone();
+        let stats = transcript_repair::repair_turns(
+            &app,
+            &mut data.turns,
+            || RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst),
+            move |done, total| {
+                emit_progress(
+                    &app_for_repair,
+                    &meeting_id_for_repair,
+                    "refining",
+                    50 + (40 * done / total.max(1)) as u32,
+                    &format!("Checking low-confidence wording ({}/{})...", done, total),
+                );
+            },
+        )
+        .await;
+        info!(
+            "AI fix-up wording: {} flagged, {} queried, {} repaired, {} failures",
+            stats.flagged, stats.queried, stats.repaired, stats.failures
+        );
+    }
+
+    if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
+        return Err(anyhow!("AI fix-up cancelled"));
+    }
+
+    emit_progress(&app, &meeting_id, "refining", 92, "Saving transcripts...");
+    let labeled_blocks = diarization::turns_to_rows(&data.turns);
+    let segments = save_transcript_rows(&app, &meeting_id, &labeled_blocks).await?;
+    if let Err(e) = write_refine_data(&folder_path, &data.turns, &data.diarized) {
+        warn!("Failed to update refine-data.json: {}", e);
+    }
+    if let Err(e) = write_transcripts_json(&folder_path, &segments) {
+        warn!("Failed to write transcripts.json: {}", e);
+    }
+
+    let _ = app.emit(
+        "retranscription-complete",
+        serde_json::json!({
+            "meeting_id": meeting_id,
+            "segments_count": segments.len(),
+            "duration_seconds": started.elapsed().as_secs(),
+            "language": Option::<String>::None,
+        }),
+    );
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn refine_transcript_command<R: Runtime>(
+    app: AppHandle<R>,
+    meeting_id: String,
+    meeting_folder_path: String,
+) -> Result<(), String> {
+    if RETRANSCRIPTION_IN_PROGRESS.load(Ordering::SeqCst) {
+        return Err("Retranscription already in progress".to_string());
+    }
+
+    tauri::async_runtime::spawn(async move {
+        let _guard = match RetranscriptionGuard::acquire() {
+            Ok(g) => g,
+            Err(e) => {
+                error!("AI fix-up: {}", e);
+                return;
+            }
+        };
+        RETRANSCRIPTION_CANCELLED.store(false, Ordering::SeqCst);
+
+        let result =
+            run_transcript_refinement(app.clone(), meeting_id.clone(), meeting_folder_path).await;
+        if let Err(e) = result {
+            error!("AI fix-up failed: {}", e);
+            let _ = app.emit(
+                "retranscription-error",
+                RetranscriptionError { meeting_id, error: e.to_string() },
+            );
+        }
+    });
+    Ok(())
+}
+
 async fn get_or_init_whisper<R: Runtime>(
     app: &AppHandle<R>,
     requested_model: Option<&str>,
@@ -538,16 +961,17 @@ async fn get_or_init_whisper<R: Runtime>(
                 None => get_configured_whisper_model(app).await?,
             };
 
-            // Check if the correct model is already loaded
+            // Retranscription wants DTW token timestamps for speaker splitting,
+            // so reload if the model differs OR the context lacks DTW
             let current_model = e.get_current_model().await;
             let needs_load = match &current_model {
-                Some(loaded) => loaded != &target_model,
+                Some(loaded) => loaded != &target_model || !e.is_dtw_enabled().await,
                 None => true,
             };
 
             if needs_load {
                 info!(
-                    "Loading Whisper model '{}' (current: {:?})",
+                    "Loading Whisper model '{}' with DTW timestamps (current: {:?})",
                     target_model, current_model
                 );
 
@@ -557,7 +981,7 @@ async fn get_or_init_whisper<R: Runtime>(
                     warn!("Error during model discovery (continuing anyway): {}", discover_err);
                 }
 
-                match e.load_model(&target_model).await {
+                match e.load_model_with_dtw(&target_model, true).await {
                     Ok(_) => {
                         info!("Whisper model '{}' loaded successfully", target_model);
                         Ok(e)
@@ -783,6 +1207,8 @@ pub async fn start_retranscription_command<R: Runtime>(
     language: Option<String>,
     model: Option<String>,
     provider: Option<String>,
+    diarize: Option<DiarizeOptions>,
+    repair: Option<bool>,
 ) -> Result<RetranscriptionStarted, String> {
 
     // Check if retranscription is already in progress (guard will be acquired in start_retranscription)
@@ -802,6 +1228,8 @@ pub async fn start_retranscription_command<R: Runtime>(
             language,
             model,
             provider,
+            diarize,
+            repair,
         )
         .await;
 

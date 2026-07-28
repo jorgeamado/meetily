@@ -44,6 +44,28 @@ A privacy-first AI meeting assistant that captures, transcribes, and summarizes 
 
 ---
 
+# 🍴 About this fork ([jorgeamado/meetily](https://github.com/jorgeamado/meetily))
+
+A personal fork focused on **fully local speaker diarization and LLM-assisted transcript quality**, tuned for multilingual meetings (including code-switching mid-sentence) on Apple Silicon (developed on an M1 base, 16 GB). Everything runs on-device — no audio or text ever leaves the machine.
+
+**What this fork adds on top of upstream:**
+
+- **Speaker diarization (local)** — sherpa-onnx sidecar (pyannote segmentation + campplus embeddings) labels transcript rows per speaker during retranscription; sensitivity presets calibrated on real multi-speaker calls; runs in parallel with transcription.
+- **LLM boundary refinement** — the bundled Qwen model double-checks fast speaker handovers with tiny constrained queries (`{"cut": N}`): moves misattributed first words, merges phantom interjections, offers punctuation-aligned cut candidates. Words can only move between rows, never change.
+- **AI wording check** — sentences whose whisper tokens decoded with low probability get a constrained LLM patch (max 2 words, enforced by an edit-distance guard).
+- **Self-learning glossary** — recurring names/terms are extracted after each run and fed back to whisper as `initial_prompt`, so recognition of your vocabulary improves meeting over meeting.
+- **Standalone “AI fix-up”** — re-run the AI passes on a saved transcript in ~1–2 minutes without re-transcribing (refinement inputs are persisted per meeting).
+- **Live transcript streaming** — retranscription streams raw rows into the transcript panel as they are produced; speaker labels swap in at the end.
+- **Live transcription toggle** — pause/resume live transcription mid-recording to cut CPU load (recording itself continues).
+- **DTW token timestamps** — whisper.cpp cross-attention alignment for word-accurate boundaries during retranscription.
+- **Perf/accuracy fixes for Apple Silicon** — chip-class hardware tiering (base/Pro/Max), flash attention at every Metal tier, diarization thread tuning (P-cores only; ~3× faster), VAD absolute-timestamp fix, file logging to `~/Library/Application Support/com.meetily.ai/logs/`.
+
+**Branch layout:** `main` tracks [upstream](https://github.com/Zackriya-Solutions/meeting-minutes) (auto-rebased weekly by a scheduled [sync workflow](.github/workflows/sync-upstream.yml)); fork work lives on feature branches — currently `feature/speaker-diarization` stacked with `feature/live-transcription-toggle`.
+
+**Build:** same as upstream (`pnpm tauri:build` in `frontend/`; sidecars build automatically). The diarization helper is a Rust workspace member (`diarize-helper/`); after changing it, copy the binary to `frontend/src-tauri/binaries/diarize-helper-<target-triple>` before bundling.
+
+---
+
 > **Meetily PRO Upgrade Offer** - Meetily PRO is available for users who need enhanced accuracy, advanced exports, custom summary workflows, and team-ready features. Use coupon code **LAUNCH20** for **20% off** until the next Meetily Community Edition release. Speaker diarization is also planned for PRO in mid-June. [Explore Meetily PRO →](https://meetily.ai/pro/)
 
 ---

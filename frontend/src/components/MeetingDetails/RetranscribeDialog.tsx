@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { RefreshCw, Globe, Loader2, AlertCircle, CheckCircle2, X, Cpu } from 'lucide-react';
+import { RefreshCw, Globe, Loader2, AlertCircle, CheckCircle2, X, Cpu, Users } from 'lucide-react';
 import {
   Dialog,
   DialogContent,
@@ -9,6 +9,8 @@ import {
   DialogTitle,
 } from '../ui/dialog';
 import { Button } from '../ui/button';
+import { Switch } from '../ui/switch';
+import { Input } from '../ui/input';
 import {
   Select,
   SelectContent,
@@ -22,6 +24,7 @@ import { toast } from 'sonner';
 import { useConfig } from '@/contexts/ConfigContext';
 import { LANGUAGES } from '@/constants/languages';
 import { useTranscriptionModels, ModelOption } from '@/hooks/useTranscriptionModels';
+import { configService } from '@/services/configService';
 import Analytics from '@/lib/analytics';
 
 interface RetranscribeDialogProps {
@@ -51,6 +54,48 @@ interface RetranscriptionError {
   error: string;
 }
 
+function ProgressRow({ label, data }: { label: string; data: RetranscriptionProgress }) {
+  return (
+    <div className="space-y-2">
+      <div className="relative">
+        <div className="w-full bg-gray-200 rounded-full h-3">
+          <div
+            className="bg-blue-600 h-3 rounded-full transition-all duration-300 ease-out"
+            style={{ width: `${Math.min(data.progress_percentage, 100)}%` }}
+          />
+        </div>
+        <div className="flex justify-between text-xs text-gray-600 mt-1">
+          <span>{label}</span>
+          <span>{Math.round(data.progress_percentage)}%</span>
+        </div>
+      </div>
+      <p className="text-sm text-muted-foreground text-center">
+        {data.message}
+      </p>
+    </div>
+  );
+}
+
+interface DiarizeOptions {
+  enabled: boolean;
+  numSpeakers: number | null;
+  threshold: number | null;
+  embeddingModel: string | null;
+  llmRefine: boolean | null;
+}
+
+// Calibrated on a real 4-person call (2026-07-27) with the campplus zh-en
+// advanced model: 0.9 fragmented it into 16 phantom speakers, 1.1 matched the
+// speakers who actually talked, 1.2 over-merged to 2. These values are
+// model-specific; recalibrate if the embedding model changes.
+const SENSITIVITY_THRESHOLDS = {
+  merge: 1.2,
+  balanced: 1.1,
+  split: 1.0,
+} as const;
+
+type SensitivityOption = keyof typeof SENSITIVITY_THRESHOLDS;
+
 export function RetranscribeDialog({
   open,
   onOpenChange,
@@ -60,9 +105,16 @@ export function RetranscribeDialog({
 }: RetranscribeDialogProps) {
   const { selectedLanguage, transcriptModelConfig } = useConfig();
   const [isProcessing, setIsProcessing] = useState(false);
-  const [progress, setProgress] = useState<RetranscriptionProgress | null>(null);
+  const [progressByStage, setProgressByStage] = useState<Record<string, RetranscriptionProgress>>({});
+  const [currentStage, setCurrentStage] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [selectedLang, setSelectedLang] = useState(selectedLanguage || 'auto');
+  const [diarizeEnabled, setDiarizeEnabled] = useState(true);
+  const [numSpeakers, setNumSpeakers] = useState('');
+  const [sensitivity, setSensitivity] = useState<SensitivityOption>('balanced');
+  const [embeddingModel, setEmbeddingModel] = useState<string>('campplus');
+  const [llmRefine, setLlmRefine] = useState(true);
+  const [llmRepair, setLlmRepair] = useState(true);
 
   // Use centralized model fetching hook
   const {
@@ -82,6 +134,22 @@ export function RetranscribeDialog({
 
   // Track previous open state to only reset on closed→open transition
   const prevOpenRef = useRef(false);
+
+  const loadDiarizationDefaults = async () => {
+    try {
+      const settings = await configService.getDiarizationSettings();
+      setDiarizeEnabled(settings.enabled);
+      setNumSpeakers(settings.numSpeakers != null ? String(settings.numSpeakers) : '');
+      setSensitivity(settings.sensitivity);
+      setEmbeddingModel(settings.embeddingModel);
+    } catch (err) {
+      console.error('Failed to load diarization settings:', err);
+      setDiarizeEnabled(true);
+      setNumSpeakers('');
+      setSensitivity('balanced');
+      setEmbeddingModel('campplus');
+    }
+  };
 
   // Helper to get selected model details (memoized)
   const selectedModelDetails = useMemo((): ModelOption | undefined => {
@@ -109,9 +177,11 @@ export function RetranscribeDialog({
     if (open && !wasOpen) {
       resetSelection();
       setIsProcessing(false);
-      setProgress(null);
+      setProgressByStage({});
+      setCurrentStage(null);
       setError(null);
       setSelectedLang(selectedLanguage || 'auto');
+      loadDiarizationDefaults();
 
       // Fetch available models using centralized hook
       fetchModels();
@@ -131,7 +201,8 @@ export function RetranscribeDialog({
         'retranscription-progress',
         (event) => {
           if (event.payload.meeting_id === meetingId) {
-            setProgress(event.payload);
+            setProgressByStage((prev) => ({ ...prev, [event.payload.stage]: event.payload }));
+            setCurrentStage(event.payload.stage);
           }
         }
       );
@@ -204,14 +275,25 @@ export function RetranscribeDialog({
 
     setIsProcessing(true);
     setError(null);
-    setProgress(null);
+    setProgressByStage({});
+    setCurrentStage(null);
 
     try {
       const languageToSend = isParakeetModel ? null : selectedLang === 'auto' ? null : selectedLang;
+      const parsedNumSpeakers = numSpeakers.trim() === '' ? null : parseInt(numSpeakers, 10);
+      const diarize: DiarizeOptions = {
+        enabled: diarizeEnabled,
+        numSpeakers: diarizeEnabled && parsedNumSpeakers && parsedNumSpeakers > 0 ? parsedNumSpeakers : null,
+        threshold: diarizeEnabled ? SENSITIVITY_THRESHOLDS[sensitivity] : null,
+        embeddingModel: diarizeEnabled ? embeddingModel : null,
+        llmRefine: diarizeEnabled ? llmRefine : null,
+      };
+
       await Analytics.track('enhance_transcript_started', {
         language: isParakeetModel ? 'auto' : (selectedLang === 'auto' ? 'auto' : selectedLang),
         model_provider: selectedModelDetails?.provider || '',
-        model_name: selectedModelDetails?.name || ''
+        model_name: selectedModelDetails?.name || '',
+        diarize_enabled: diarizeEnabled.toString(),
       });
 
       await invoke('start_retranscription_command', {
@@ -220,7 +302,15 @@ export function RetranscribeDialog({
         language: languageToSend,
         model: selectedModelDetails?.name || null,
         provider: selectedModelDetails?.provider || null,
+        diarize,
+        repair: isParakeetModel ? null : llmRepair,
       });
+
+      // Progress and the streaming transcript are shown inline by the
+      // transcript panel (useRetranscriptionStream) — close the dialog so
+      // the user can read along
+      toast.info('Retranscription started — the transcript updates live');
+      onOpenChangeRef.current(false);
     } catch (err: any) {
       setIsProcessing(false);
       const errorMsg = typeof err === 'string' ? err : (err?.message || String(err));
@@ -235,7 +325,8 @@ export function RetranscribeDialog({
       try {
         await invoke('cancel_retranscription_command');
         setIsProcessing(false);
-        setProgress(null);
+        setProgressByStage({});
+        setCurrentStage(null);
         toast.info('Retranscription cancelled');
       } catch (err) {
         console.error('Failed to cancel retranscription:', err);
@@ -263,6 +354,14 @@ export function RetranscribeDialog({
       event.preventDefault();
     }
   };
+
+  const transcribingProgress = progressByStage['transcribing'];
+  const diarizingProgress = progressByStage['diarizing'];
+  const showBothStages =
+    (currentStage === 'transcribing' || currentStage === 'diarizing') &&
+    !!transcribingProgress &&
+    !!diarizingProgress;
+  const currentProgress = currentStage ? progressByStage[currentStage] : null;
 
   return (
     <Dialog open={open} onOpenChange={handleOpenChange}>
@@ -292,7 +391,7 @@ export function RetranscribeDialog({
           </DialogTitle>
           <DialogDescription>
             {isProcessing
-              ? progress?.message || 'Processing audio...'
+              ? currentProgress?.message || 'Processing audio...'
               : error
                 ? 'An error occurred during retranscription'
                 : 'Re-process the audio with different language settings'}
@@ -360,24 +459,78 @@ export function RetranscribeDialog({
             </div>
           )}
 
-          {isProcessing && progress && (
-            <div className="space-y-2">
-              <div className="relative">
-                <div className="w-full bg-gray-200 rounded-full h-3">
-                  <div
-                    className="bg-blue-600 h-3 rounded-full transition-all duration-300 ease-out"
-                    style={{ width: `${Math.min(progress.progress_percentage, 100)}%` }}
-                  />
-                </div>
-                <div className="flex justify-between text-xs text-gray-600 mt-1">
-                  <span>{progress.stage}</span>
-                  <span>{Math.round(progress.progress_percentage)}%</span>
-                </div>
+          {!isProcessing && !error && !isParakeetModel && (
+            <div className="flex items-center justify-between gap-2">
+              <div className="space-y-0.5">
+                <span className="text-sm font-medium">AI wording check</span>
+                <p className="text-xs text-muted-foreground">
+                  Local LLM patches low-confidence words (max 2 per sentence)
+                </p>
               </div>
-              <p className="text-sm text-muted-foreground text-center">
-                {progress.message}
-              </p>
+              <Switch checked={llmRepair} onCheckedChange={setLlmRepair} />
             </div>
+          )}
+
+          {!isProcessing && !error && (
+            <div className="space-y-3">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-2">
+                  <Users className="h-4 w-4 text-muted-foreground" />
+                  <span className="text-sm font-medium">Identify speakers (beta)</span>
+                </div>
+                <Switch checked={diarizeEnabled} onCheckedChange={setDiarizeEnabled} />
+              </div>
+              {diarizeEnabled && (
+                <div className="space-y-3 pl-6">
+                  <div className="space-y-1">
+                    <span className="text-xs font-medium">Number of speakers</span>
+                    <Input
+                      type="number"
+                      min={1}
+                      placeholder="Auto"
+                      value={numSpeakers}
+                      onChange={(e) => setNumSpeakers(e.target.value)}
+                    />
+                    <p className="text-xs text-muted-foreground">
+                      Leave empty to auto-detect — auto usually works better
+                    </p>
+                  </div>
+                  <div className="space-y-1">
+                    <span className="text-xs font-medium">Sensitivity</span>
+                    <Select value={sensitivity} onValueChange={(v) => setSensitivity(v as SensitivityOption)}>
+                      <SelectTrigger className="w-full">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="merge">Merge-prone (fewer speakers)</SelectItem>
+                        <SelectItem value="balanced">Balanced</SelectItem>
+                        <SelectItem value="split">Split-prone (more speakers)</SelectItem>
+                      </SelectContent>
+                    </Select>
+                  </div>
+                  <div className="flex items-center justify-between gap-2">
+                    <div className="space-y-0.5">
+                      <span className="text-xs font-medium">AI boundary check</span>
+                      <p className="text-xs text-muted-foreground">
+                        Local LLM double-checks fast speaker handovers (words never change)
+                      </p>
+                    </div>
+                    <Switch checked={llmRefine} onCheckedChange={setLlmRefine} />
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {isProcessing && showBothStages && (
+            <div className="space-y-4">
+              <ProgressRow label="Transcribing" data={transcribingProgress} />
+              <ProgressRow label="Identifying speakers" data={diarizingProgress} />
+            </div>
+          )}
+
+          {isProcessing && !showBothStages && currentProgress && (
+            <ProgressRow label={currentProgress.stage} data={currentProgress} />
           )}
 
           {error && (
@@ -417,7 +570,8 @@ export function RetranscribeDialog({
               <Button
                 onClick={() => {
                   setError(null);
-                  setProgress(null);
+                  setProgressByStage({});
+                  setCurrentStage(null);
                 }}
                 variant="outline"
               >

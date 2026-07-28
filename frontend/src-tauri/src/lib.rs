@@ -605,6 +605,9 @@ pub fn run() {
             audio::recording_commands::pause_recording,
             audio::recording_commands::resume_recording,
             audio::recording_commands::is_recording_paused,
+            // Live transcription toggle (CPU saver - recording continues)
+            audio::recording_commands::set_live_transcription,
+            audio::recording_commands::is_live_transcription_enabled,
             audio::recording_commands::get_recording_state,
             audio::recording_commands::get_meeting_folder_path,
             // Reload sync commands (retrieve transcript history and meeting name)
@@ -642,6 +645,8 @@ pub fn run() {
             // api::api_save_auto_generate_setting,
             api::api_get_transcript_config,
             api::api_save_transcript_config,
+            api::api_get_diarization_settings,
+            api::api_save_diarization_settings,
             api::api_get_transcript_api_key,
             api::api_delete_meeting,
             api::api_get_meeting,
@@ -741,6 +746,7 @@ pub fn run() {
             // Retranscription commands
             audio::retranscription::start_retranscription_command,
             audio::retranscription::cancel_retranscription_command,
+            audio::retranscription::refine_transcript_command,
             audio::retranscription::is_retranscription_in_progress_command,
             // Import audio commands
             audio::import::select_and_validate_audio_command,

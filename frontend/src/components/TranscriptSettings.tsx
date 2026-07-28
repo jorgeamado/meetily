@@ -4,9 +4,14 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '.
 import { Input } from './ui/input';
 import { Button } from './ui/button';
 import { Label } from './ui/label';
+import { Switch } from './ui/switch';
 import { Eye, EyeOff, Lock, Unlock } from 'lucide-react';
 import { ModelManager } from './WhisperModelManager';
 import { ParakeetModelManager } from './ParakeetModelManager';
+import { configService } from '@/services/configService';
+
+type SensitivityOption = 'merge' | 'balanced' | 'split';
+type EmbeddingModelOption = 'campplus' | 'eres2net';
 
 
 export interface TranscriptModelProps {
@@ -27,6 +32,55 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
     const [isApiKeyLocked, setIsApiKeyLocked] = useState<boolean>(true);
     const [isLockButtonVibrating, setIsLockButtonVibrating] = useState<boolean>(false);
     const [uiProvider, setUiProvider] = useState<TranscriptModelProps['provider']>(transcriptModelConfig.provider);
+    const [diarizationEnabled, setDiarizationEnabled] = useState(true);
+    const [numSpeakers, setNumSpeakers] = useState('');
+    const [sensitivity, setSensitivity] = useState<SensitivityOption>('balanced');
+    const [embeddingModel, setEmbeddingModel] = useState<EmbeddingModelOption>('campplus');
+
+    // Load saved speaker identification defaults on mount
+    useEffect(() => {
+        let cancelled = false;
+        configService.getDiarizationSettings()
+            .then((settings) => {
+                if (cancelled) return;
+                setDiarizationEnabled(settings.enabled);
+                setNumSpeakers(settings.numSpeakers != null ? String(settings.numSpeakers) : '');
+                setSensitivity(settings.sensitivity);
+                setEmbeddingModel(settings.embeddingModel);
+            })
+            .catch((err) => console.error('Failed to load diarization settings:', err));
+        return () => { cancelled = true; };
+    }, []);
+
+    const saveDiarizationSettings = (overrides: Partial<{ enabled: boolean; numSpeakers: number | null; sensitivity: SensitivityOption; embeddingModel: EmbeddingModelOption }>) => {
+        const parsedNumSpeakers = numSpeakers.trim() === '' ? null : parseInt(numSpeakers, 10);
+        configService.saveDiarizationSettings({
+            enabled: overrides.enabled ?? diarizationEnabled,
+            numSpeakers: overrides.numSpeakers !== undefined ? overrides.numSpeakers : (parsedNumSpeakers && parsedNumSpeakers > 0 ? parsedNumSpeakers : null),
+            sensitivity: overrides.sensitivity ?? sensitivity,
+            embeddingModel: overrides.embeddingModel ?? embeddingModel,
+        }).catch((err) => console.error('Failed to save diarization settings:', err));
+    };
+
+    const handleDiarizationEnabledChange = (checked: boolean) => {
+        setDiarizationEnabled(checked);
+        saveDiarizationSettings({ enabled: checked });
+    };
+
+    const handleSensitivityChange = (value: SensitivityOption) => {
+        setSensitivity(value);
+        saveDiarizationSettings({ sensitivity: value });
+    };
+
+    const handleEmbeddingModelChange = (value: EmbeddingModelOption) => {
+        setEmbeddingModel(value);
+        saveDiarizationSettings({ embeddingModel: value });
+    };
+
+    const handleNumSpeakersBlur = () => {
+        const parsed = numSpeakers.trim() === '' ? null : parseInt(numSpeakers, 10);
+        saveDiarizationSettings({ numSpeakers: parsed && parsed > 0 ? parsed : null });
+    };
 
     // Sync uiProvider when backend config changes (e.g., after model selection or initial load)
     useEffect(() => {
@@ -219,6 +273,73 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                             </div>
                         </div>
                     )}
+
+                    <div className="pt-4 border-t border-gray-200">
+                        <h3 className="text-lg font-semibold text-gray-900 mb-4">Speaker identification</h3>
+                        <div className="flex items-center justify-between">
+                            <Label className="block text-sm font-medium text-gray-700">
+                                Identify speakers by default (beta)
+                            </Label>
+                            <Switch checked={diarizationEnabled} onCheckedChange={handleDiarizationEnabledChange} />
+                        </div>
+                        <p className="text-xs text-gray-500 mt-1">
+                            Used as the default when retranscribing a meeting. You can still override it per run.
+                        </p>
+
+                        {diarizationEnabled && (
+                            <div className="space-y-4 mt-4">
+                                <div>
+                                    <Label className="block text-sm font-medium text-gray-700 mb-1">
+                                        Number of speakers
+                                    </Label>
+                                    <Input
+                                        type="number"
+                                        min={1}
+                                        placeholder="Auto"
+                                        className="mx-1 w-40"
+                                        value={numSpeakers}
+                                        onChange={(e) => setNumSpeakers(e.target.value)}
+                                        onBlur={handleNumSpeakersBlur}
+                                    />
+                                    <p className="text-xs text-gray-500 mt-1 mx-1">
+                                        Leave empty to auto-detect — auto usually works better
+                                    </p>
+                                </div>
+                                <div>
+                                    <Label className="block text-sm font-medium text-gray-700 mb-1">
+                                        Sensitivity
+                                    </Label>
+                                    <Select value={sensitivity} onValueChange={(v) => handleSensitivityChange(v as SensitivityOption)}>
+                                        <SelectTrigger className="mx-1 w-64 focus:ring-1 focus:ring-blue-500 focus:border-blue-500">
+                                            <SelectValue />
+                                        </SelectTrigger>
+                                        <SelectContent>
+                                            <SelectItem value="merge">Merge-prone (fewer speakers)</SelectItem>
+                                            <SelectItem value="balanced">Balanced</SelectItem>
+                                            <SelectItem value="split">Split-prone (more speakers)</SelectItem>
+                                        </SelectContent>
+                                    </Select>
+                                </div>
+                                <div>
+                                    <Label className="block text-sm font-medium text-gray-700 mb-1">
+                                        Speaker model
+                                    </Label>
+                                    <Select value={embeddingModel} onValueChange={(v) => handleEmbeddingModelChange(v as EmbeddingModelOption)}>
+                                        <SelectTrigger className="mx-1 w-64 focus:ring-1 focus:ring-blue-500 focus:border-blue-500">
+                                            <SelectValue />
+                                        </SelectTrigger>
+                                        <SelectContent>
+                                            <SelectItem value="campplus">Fast (recommended)</SelectItem>
+                                            <SelectItem value="eres2net">Alternative (slower)</SelectItem>
+                                        </SelectContent>
+                                    </Select>
+                                    <p className="text-xs text-gray-500 mt-1 mx-1">
+                                        Fast is ~35% quicker on real calls with similar or better speaker separation.
+                                    </p>
+                                </div>
+                            </div>
+                        )}
+                    </div>
                 </div>
             </div>
         </div >
