@@ -303,6 +303,12 @@ export function RetranscribeDialog({
         provider: selectedModelDetails?.provider || null,
         diarize,
       });
+
+      // Progress and the streaming transcript are shown inline by the
+      // transcript panel (useRetranscriptionStream) — close the dialog so
+      // the user can read along
+      toast.info('Retranscription started — the transcript updates live');
+      onOpenChangeRef.current(false);
     } catch (err: any) {
       setIsProcessing(false);
       const errorMsg = typeof err === 'string' ? err : (err?.message || String(err));

@@ -472,6 +472,18 @@ async fn run_retranscription<R: Runtime>(
                 i + 1, processable_count, segment_duration_sec, conf,
                 if trimmed.len() > 80 { let mut end = 80; while !trimmed.is_char_boundary(end) { end -= 1; } &trimmed[..end] } else { trimmed }
             );
+            // Stream the raw block to the UI so the transcript is readable
+            // while later segments are still transcribing; speaker labels
+            // arrive with the final save
+            let _ = app.emit(
+                "retranscription-partial",
+                serde_json::json!({
+                    "meeting_id": meeting_id,
+                    "text": text.trim(),
+                    "audio_start_time": segment.start_timestamp_ms / 1000.0,
+                    "audio_end_time": segment.end_timestamp_ms / 1000.0,
+                }),
+            );
             all_transcripts.push((text, segment.start_timestamp_ms, segment.end_timestamp_ms, words));
             total_confidence += conf;
         } else {
