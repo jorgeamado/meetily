@@ -20,3 +20,18 @@ Decisions:
   window) and a keep-bias that discourages correct long jumps in Russian.
   Fixing those is cheaper than training. llama-cpp-2 upgraded to 0.1.153 same day: 0.8B now loads and scores 77%
   zero-shot — the LoRA target is closing 9 points to the 2B at 3x its speed.
+
+## After candidate/prompt fixes (same day, later)
+
+Fragment endings ("Sorry?") no longer suppress far candidates
+(TRUSTED_SENTENCE_MIN_WORDS=3), window widened to ±12, keep-bias line now says
+mid-sentence splits are usually wrong.
+
+| Model | Before | After |
+|---|---|---|
+| Qwen3.5-2B | 19/24 (79%, 2 unreachable) | **20/24 (83%, 0 unreachable)** |
+
+Remaining 4 misses share one shape: conservative "keep" on long forward jumps;
+at least one (Sorry?/Sorry.) is text-ambiguous and needs acoustics — the
+boundary where text-only correction tops out (see codex/web research notes:
+powerset overlap posteriors + confidence-gated re-embedding are the next tier).

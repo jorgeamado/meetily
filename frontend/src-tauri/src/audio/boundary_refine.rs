@@ -36,8 +36,14 @@ const MAX_SHIFT_WORDS: usize = 2;
 /// from the current cut. A boundary error like "You think your hangovers
 /// are | worse now than when you were younger?" is 7 words off — no ±2
 /// option ever looks right, but "cut after 'younger?'" is instantly
-/// recognizable.
-const PUNCT_SHIFT_WORDS: usize = 8;
+/// recognizable. (Widened from 8: a measured real case needed +10.)
+const PUNCT_SHIFT_WORDS: usize = 12;
+
+/// A cut is only "trusted" (local jitter only) when the left side ends a
+/// sentence of at least this many words. Fragment endings like "Sorry?"
+/// are exactly where the diarizer glues the next speaker's words on —
+/// measured case: the true cut sat +4 past a trusted "Sorry?".
+const TRUSTED_SENTENCE_MIN_WORDS: usize = 3;
 
 /// Cap on options shown per query.
 const MAX_OPTIONS: usize = 7;
@@ -157,12 +163,21 @@ pub fn ends_sentence(word: &str) -> bool {
 /// are offered, so long-range errors stay reachable without exploding the
 /// option list.
 pub fn candidate_shifts(l_words: &[String], r_words: &[String]) -> Vec<i32> {
-    // When the current cut already falls right after sentence punctuation,
+    // When the current cut already falls after a COMPLETE sentence,
     // acoustics and syntax agree — only small jitter is plausible. Offering
-    // far candidates here makes the model grab the neighbor's whole
+    // far candidates there makes the model grab the neighbor's whole
     // sentence ("...these platforms. | What do you call them?" reads fine
-    // as one voice; only the audio knows it is not).
-    let reach = if l_words.last().map(|w| ends_sentence(w)).unwrap_or(false) {
+    // as one voice; only the audio knows it is not). Fragment endings
+    // ("Sorry?") do NOT earn that trust: they are where glue errors live.
+    let cut_at_sentence_end = l_words.last().map(|w| ends_sentence(w)).unwrap_or(false);
+    let trailing_sentence_words = l_words
+        .iter()
+        .rev()
+        .skip(1)
+        .take_while(|w| !ends_sentence(w))
+        .count()
+        + 1;
+    let reach = if cut_at_sentence_end && trailing_sentence_words >= TRUSTED_SENTENCE_MIN_WORDS {
         MAX_SHIFT_WORDS
     } else {
         PUNCT_SHIFT_WORDS
@@ -244,7 +259,7 @@ pub fn build_prompt(left: &SpeakerTurn, right: &SpeakerTurn) -> Option<(String, 
     }
     if let Some(current) = shifts.iter().position(|&s| s == 0) {
         prompt.push_str(&format!(
-            "Option {} is the current split, based on voice analysis. Choose a different option only if it clearly reads more natural.\n",
+            "Option {} is the current split, based on voice analysis. Prefer it unless it breaks a sentence mid-thought — a speaker change usually happens at a sentence boundary, not inside one.\n",
             current + 1
         ));
     }
@@ -873,6 +888,23 @@ mod tests {
             ["What", "do", "you", "call", "them?", "Are", "they", "moving"].map(String::from).to_vec();
         let shifts = candidate_shifts(&l_words, &r_words);
         assert_eq!(shifts, vec![-2, -1, 0, 1, 2]);
+    }
+
+    #[test]
+    fn fragment_ending_does_not_earn_trust() {
+        // "...to the Odyssey? Sorry? | Sorry. You go, George. Oh, yeah,
+        // okay." — left ends on punctuation, but "Sorry?" is a one-word
+        // fragment: the true cut (+4, after "George.") must stay reachable.
+        let l_words: Vec<String> =
+            ["been", "to", "the", "Odyssey?", "Sorry?"].map(String::from).to_vec();
+        let r_words: Vec<String> = [
+            "Sorry.", "You", "go,", "George.", "Oh,", "yeah,", "okay.", "Actually,", "I'm",
+            "kind", "of", "missing",
+        ]
+        .map(String::from)
+        .to_vec();
+        let shifts = candidate_shifts(&l_words, &r_words);
+        assert!(shifts.contains(&4), "cut after 'George.' must be offered: {:?}", shifts);
     }
 
     #[test]
