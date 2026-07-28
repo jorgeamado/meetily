@@ -35,3 +35,26 @@ Remaining 4 misses share one shape: conservative "keep" on long forward jumps;
 at least one (Sorry?/Sorry.) is text-ambiguous and needs acoustics — the
 boundary where text-only correction tops out (see codex/web research notes:
 powerset overlap posteriors + confidence-gated re-embedding are the next tier).
+
+## Prompt ablation (2026-07-28, Qwen3.5-2B, 24 scored cases)
+
+Theory tested: "remaining misses are anchoring bias — the model defers to the
+marked current split." **Refuted.**
+
+| variant | accuracy | notes |
+|---|---|---|
+| baseline (mark current + keep-bias) | **20/24 (83%)** | the 4 known long-jump misses |
+| neutral (mark current, no keep instruction) | 19/24 (79%) | same misses + #4 regresses |
+| blind (current split not marked) | 14/24 (58%) | 6 correct keeps break; systematic −2 drift |
+| clause (baseline + long-move permission) | 19/24 (79%) | fixes nothing, breaks #9 (−4 grab) |
+
+Conclusions:
+1. The voice-analysis anchor is load-bearing: it suppresses a systematic −2
+   backward drift the 2B exhibits when unanchored (+25pp over blind).
+2. The 4 remaining misses are NOT prompt-fixable: even blind, the model refuses
+   the long forward jumps (#18 keeps 0 with no anchor; #1 moves −6, the wrong
+   direction). The answer isn't in the text — these need acoustics.
+3. Prompt tuning on this axis is exhausted at 83%. Next gains come from the
+   stereo channel-identity work (task #24) and the acoustic confidence layer.
+
+Repro: `BOUNDARY_PROMPT_VARIANT={neutral|blind|clause} boundary-eval ...`
