@@ -84,6 +84,89 @@ fn resolve_embedding_model(key: Option<&str>) -> &'static EmbeddingModelSpec {
     })
 }
 
+/// One row in the app's model-download UI for the diarization models.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiarizationModelStatus {
+    pub key: String,
+    pub display_name: String,
+    pub size_mb: u32,
+    pub downloaded: bool,
+}
+
+#[tauri::command]
+pub async fn diarization_list_models<R: Runtime>(
+    app: AppHandle<R>,
+) -> Result<Vec<DiarizationModelStatus>, String> {
+    let dir = models_dir(&app).map_err(|e| e.to_string())?;
+    let mut out = vec![DiarizationModelStatus {
+        key: "segmentation".to_string(),
+        display_name: "Speech segmentation (pyannote 3.0)".to_string(),
+        size_mb: 6,
+        downloaded: is_valid_file(&dir.join(SEGMENTATION_MODEL_FILENAME), SEGMENTATION_MODEL_MIN_BYTES)
+            .await,
+    }];
+    for m in EMBEDDING_MODELS {
+        out.push(DiarizationModelStatus {
+            key: m.key.to_string(),
+            display_name: match m.key {
+                "campplus" => "Speaker voices — Standard (campplus)".to_string(),
+                "eres2net" => "Speaker voices — Alternative (eres2net)".to_string(),
+                other => other.to_string(),
+            },
+            size_mb: if m.key == "campplus" { 40 } else { 28 },
+            downloaded: is_valid_file(&dir.join(m.filename), EMBEDDING_MODEL_MIN_BYTES).await,
+        });
+    }
+    Ok(out)
+}
+
+/// Download one diarization model with progress on the shared
+/// "model-download-progress" event (modelName = "diarization:<key>").
+#[tauri::command]
+pub async fn diarization_download_model<R: Runtime>(
+    app: AppHandle<R>,
+    model: String,
+) -> Result<(), String> {
+    use tauri::Emitter;
+
+    let dir = models_dir(&app).map_err(|e| e.to_string())?;
+    tokio::fs::create_dir_all(&dir).await.map_err(|e| e.to_string())?;
+    let (url, path, min_bytes) = if model == "segmentation" {
+        (
+            SEGMENTATION_MODEL_URL,
+            dir.join(SEGMENTATION_MODEL_FILENAME),
+            SEGMENTATION_MODEL_MIN_BYTES,
+        )
+    } else {
+        let spec = resolve_embedding_model(Some(&model));
+        (spec.url, dir.join(spec.filename), EMBEDDING_MODEL_MIN_BYTES)
+    };
+    let event_name = format!("diarization:{}", model);
+    if is_valid_file(&path, min_bytes).await {
+        let _ = app.emit(
+            "model-download-complete",
+            serde_json::json!({ "modelName": event_name }),
+        );
+        return Ok(());
+    }
+    let app_for_progress = app.clone();
+    let event_for_progress = event_name.clone();
+    download_file(url, &path, move |pct| {
+        let _ = app_for_progress.emit(
+            "model-download-progress",
+            serde_json::json!({ "modelName": event_for_progress, "progress": pct }),
+        );
+    })
+    .await
+    .map_err(|e| e.to_string())?;
+    let _ = app.emit(
+        "model-download-complete",
+        serde_json::json!({ "modelName": event_name }),
+    );
+    Ok(())
+}
+
 /// Kill the helper only when it stops reporting progress. Long meetings
 /// legitimately run for 30+ minutes, so a fixed wall-clock cap is wrong; the
 /// generous stall window covers silent phases (model load, final clustering)

@@ -78,7 +78,7 @@ pub fn ensure_encoder_in_background(model_file: PathBuf) {
             model_file.display(),
             zip_name
         );
-        match download_and_unpack(&encoder_dir, &zip_name).await {
+        match download_and_unpack(&encoder_dir, &zip_name, &|_| {}).await {
             Ok(()) => log::info!(
                 "CoreML encoder installed at {} — used from the next model load (first use compiles for the Neural Engine, which can take minutes)",
                 encoder_dir.display()
@@ -88,7 +88,29 @@ pub fn ensure_encoder_in_background(model_file: PathBuf) {
     });
 }
 
-async fn download_and_unpack(encoder_dir: &Path, zip_name: &str) -> Result<()> {
+/// Download the encoder for `model_file` with progress (0–100). Returns
+/// Ok(false) when no prebuilt encoder applies or it is already installed.
+pub async fn download_encoder(
+    model_file: &Path,
+    progress: &(dyn Fn(u8) + Send + Sync),
+) -> Result<bool> {
+    let Some((encoder_dir, zip_name)) = encoder_paths_for(model_file) else {
+        return Ok(false);
+    };
+    if encoder_dir.exists() {
+        return Ok(false);
+    }
+    download_and_unpack(&encoder_dir, &zip_name, progress).await?;
+    Ok(true)
+}
+
+async fn download_and_unpack(
+    encoder_dir: &Path,
+    zip_name: &str,
+    progress: &(dyn Fn(u8) + Send + Sync),
+) -> Result<()> {
+    use futures_util::StreamExt;
+
     let url = format!(
         "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/{}",
         zip_name
@@ -103,8 +125,19 @@ async fn download_and_unpack(encoder_dir: &Path, zip_name: &str) -> Result<()> {
     if !response.status().is_success() {
         return Err(anyhow!("HTTP {} for {}", response.status(), url));
     }
-    let bytes = response.bytes().await?;
-    tokio::fs::write(&zip_path, &bytes).await?;
+    let total = response.content_length().unwrap_or(0);
+    let mut file = tokio::fs::File::create(&zip_path).await?;
+    let mut stream = response.bytes_stream();
+    let mut downloaded = 0u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk?;
+        tokio::io::AsyncWriteExt::write_all(&mut file, &chunk).await?;
+        downloaded += chunk.len() as u64;
+        if total > 0 {
+            progress(((downloaded as f64 / total as f64) * 100.0) as u8);
+        }
+    }
+    drop(file);
 
     // ditto ships with macOS and preserves the .mlmodelc bundle structure
     let status = tokio::process::Command::new("ditto")

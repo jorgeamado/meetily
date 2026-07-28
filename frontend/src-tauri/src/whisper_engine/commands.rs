@@ -429,19 +429,39 @@ pub async fn whisper_download_model(
     };
 
     if let Some(engine) = engine {
+        // On macOS the model's CoreML (ANE) encoder ships as a second phase
+        // of the same download: ggml file 0-85%, encoder 85-100%
+        #[cfg(target_os = "macos")]
+        let encoder_target: Option<std::path::PathBuf> = engine
+            .discover_models()
+            .await
+            .ok()
+            .and_then(|models| models.into_iter().find(|m| m.name == model_name))
+            .map(|m| m.path)
+            .filter(|p| {
+                crate::whisper_engine::coreml::encoder_paths_for(p)
+                    .map(|(dir, _)| !dir.exists())
+                    .unwrap_or(false)
+            });
+        #[cfg(not(target_os = "macos"))]
+        let encoder_target: Option<std::path::PathBuf> = None;
+
+        let model_phase_cap: u32 = if encoder_target.is_some() { 85 } else { 100 };
+
         // Create progress callback that emits events
         let app_handle_clone = app_handle.clone();
         let model_name_clone = model_name.clone();
 
         let progress_callback = Box::new(move |progress: u8| {
-            log::info!("Download progress for {}: {}%", model_name_clone, progress);
+            let scaled = (progress as u32 * model_phase_cap / 100) as u8;
+            log::info!("Download progress for {}: {}%", model_name_clone, scaled);
 
             // Emit download progress event
             if let Err(e) = app_handle_clone.emit(
                 "model-download-progress",
                 serde_json::json!({
                     "modelName": model_name_clone,
-                    "progress": progress
+                    "progress": scaled
                 }),
             ) {
                 log::error!("Failed to emit download progress event: {}", e);
@@ -451,6 +471,40 @@ pub async fn whisper_download_model(
         let result = engine
             .download_model(&model_name, Some(progress_callback))
             .await;
+
+        // Phase 2: CoreML encoder. Failure is non-fatal — the model works
+        // on Metal alone; the background provisioner retries on next load.
+        #[cfg(target_os = "macos")]
+        if result.is_ok() {
+            if let Some(model_path) = encoder_target.as_ref() {
+                let app_for_encoder = app_handle.clone();
+                let name_for_encoder = model_name.clone();
+                let emit_encoder_progress = move |p: u8| {
+                    let scaled = 85 + (p as u32 * 15 / 100) as u8;
+                    let _ = app_for_encoder.emit(
+                        "model-download-progress",
+                        serde_json::json!({
+                            "modelName": name_for_encoder,
+                            "progress": scaled
+                        }),
+                    );
+                };
+                match crate::whisper_engine::coreml::download_encoder(
+                    model_path,
+                    &emit_encoder_progress,
+                )
+                .await
+                {
+                    Ok(true) => log::info!("CoreML encoder downloaded for {}", model_name),
+                    Ok(false) => {}
+                    Err(e) => log::warn!(
+                        "CoreML encoder download failed for {} (model still usable on Metal): {}",
+                        model_name,
+                        e
+                    ),
+                }
+            }
+        }
 
         match result {
             Ok(()) => {
