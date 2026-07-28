@@ -3,7 +3,9 @@
 import { useState, useCallback } from 'react';
 import { Button } from '@/components/ui/button';
 import { ButtonGroup } from '@/components/ui/button-group';
-import { Copy, FolderOpen, RefreshCw } from 'lucide-react';
+import { Copy, FolderOpen, RefreshCw, Sparkles } from 'lucide-react';
+import { invoke } from '@tauri-apps/api/core';
+import { toast } from 'sonner';
 import Analytics from '@/lib/analytics';
 import { RetranscribeDialog } from './RetranscribeDialog';
 import { useConfig } from '@/contexts/ConfigContext';
@@ -81,6 +83,28 @@ export function TranscriptButtonGroup({
           >
             <RefreshCw className="xl:mr-2" size={18} />
             <span className="hidden lg:inline">Enhance</span>
+          </Button>
+        )}
+
+        {betaFeatures.importAndRetranscribe && meetingId && meetingFolderPath && (
+          <Button
+            size="sm"
+            variant="outline"
+            className="xl:px-4"
+            disabled={transcriptCount === 0}
+            onClick={async () => {
+              Analytics.trackButtonClick('ai_fixup_transcript', 'meeting_details');
+              try {
+                await invoke('refine_transcript_command', { meetingId, meetingFolderPath });
+                toast.info('AI fix-up started — speaker boundaries and wording');
+              } catch (err: any) {
+                toast.error(typeof err === 'string' ? err : (err?.message || String(err)));
+              }
+            }}
+            title="Re-run the AI speaker-boundary and wording passes without retranscribing"
+          >
+            <Sparkles className="xl:mr-2" size={18} />
+            <span className="hidden lg:inline">AI fix-up</span>
           </Button>
         )}
       </ButtonGroup>

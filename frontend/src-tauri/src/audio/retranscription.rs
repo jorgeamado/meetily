@@ -649,58 +649,13 @@ async fn run_retranscription<R: Runtime>(
     let labeled_blocks: Vec<(String, f64, f64, Option<usize>)> = diarization::turns_to_rows(&turns);
 
     // Create transcript segments with proper timestamps from VAD
-    let plain_blocks: Vec<(String, f64, f64)> = labeled_blocks
-        .iter()
-        .map(|(t, s, e, _)| (t.clone(), *s, *e))
-        .collect();
-    let segments = create_transcript_segments(&plain_blocks);
+    let segments = save_transcript_rows(&app, &meeting_id, &labeled_blocks).await?;
 
-    // Save to database
-    let app_state = app
-        .try_state::<AppState>()
-        .ok_or_else(|| anyhow!("App state not available"))?;
-
-    // Wrap delete+insert+update in a transaction to prevent data loss
-    let pool = app_state.db_manager.pool();
-    let mut conn = pool.acquire().await.map_err(|e| anyhow!("DB error: {}", e))?;
-    let mut tx = sqlx::Connection::begin(&mut *conn)
-        .await
-        .map_err(|e| anyhow!("Failed to start transaction: {}", e))?;
-
-    sqlx::query("DELETE FROM transcripts WHERE meeting_id = ?")
-        .bind(&meeting_id)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| anyhow!("Failed to delete existing transcripts: {}", e))?;
-
-    for (segment, (_, _, _, speaker_idx)) in segments.iter().zip(labeled_blocks.iter()) {
-        let speaker = speaker_idx.map(diarization::speaker_label);
-
-        sqlx::query(
-            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
-        )
-        .bind(&segment.id)
-        .bind(&meeting_id)
-        .bind(&segment.text)
-        .bind(&segment.timestamp)
-        .bind(segment.audio_start_time)
-        .bind(segment.audio_end_time)
-        .bind(segment.duration)
-        .bind(speaker)
-        .execute(&mut *tx)
-        .await
-        .map_err(|e| anyhow!("Failed to insert transcript: {}", e))?;
+    // Persist the refinement inputs so the AI passes can be re-run later
+    // without redoing transcription (standalone "AI fix-up")
+    if let Err(e) = write_refine_data(&folder_path, &turns, &diarized_segments) {
+        warn!("Failed to write refine-data.json: {}", e);
     }
-
-    tx.commit().await
-        .map_err(|e| anyhow!("Failed to commit transaction: {}", e))?;
-
-    info!(
-        "Updated {} transcripts for meeting {} in transaction",
-        segments.len(),
-        meeting_id
-    );
 
     // Learn vocabulary from this meeting in the background (names, terms)
     // so the NEXT retranscription can bias whisper toward it
@@ -764,6 +719,229 @@ fn emit_progress<R: Runtime>(
 
 /// Get or initialize the Whisper engine, auto-loading the model if needed
 /// If `requested_model` is provided, ensures that specific model is loaded
+/// Replace a meeting's transcript rows in one transaction; returns the
+/// written segments (used for transcripts.json). Shared by retranscription
+/// and the standalone AI fix-up.
+async fn save_transcript_rows<R: Runtime>(
+    app: &AppHandle<R>,
+    meeting_id: &str,
+    labeled_blocks: &[(String, f64, f64, Option<usize>)],
+) -> Result<Vec<crate::api::TranscriptSegment>> {
+    let plain_blocks: Vec<(String, f64, f64)> = labeled_blocks
+        .iter()
+        .map(|(t, s, e, _)| (t.clone(), *s, *e))
+        .collect();
+    let segments = create_transcript_segments(&plain_blocks);
+
+    let app_state = app
+        .try_state::<AppState>()
+        .ok_or_else(|| anyhow!("App state not available"))?;
+
+    // Wrap delete+insert in a transaction to prevent data loss
+    let pool = app_state.db_manager.pool();
+    let mut conn = pool.acquire().await.map_err(|e| anyhow!("DB error: {}", e))?;
+    let mut tx = sqlx::Connection::begin(&mut *conn)
+        .await
+        .map_err(|e| anyhow!("Failed to start transaction: {}", e))?;
+
+    sqlx::query("DELETE FROM transcripts WHERE meeting_id = ?")
+        .bind(meeting_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| anyhow!("Failed to delete existing transcripts: {}", e))?;
+
+    for (segment, (_, _, _, speaker_idx)) in segments.iter().zip(labeled_blocks.iter()) {
+        let speaker = speaker_idx.map(diarization::speaker_label);
+
+        sqlx::query(
+            "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(&segment.id)
+        .bind(meeting_id)
+        .bind(&segment.text)
+        .bind(&segment.timestamp)
+        .bind(segment.audio_start_time)
+        .bind(segment.audio_end_time)
+        .bind(segment.duration)
+        .bind(speaker)
+        .execute(&mut *tx)
+        .await
+        .map_err(|e| anyhow!("Failed to insert transcript: {}", e))?;
+    }
+
+    tx.commit().await
+        .map_err(|e| anyhow!("Failed to commit transaction: {}", e))?;
+
+    info!(
+        "Updated {} transcripts for meeting {} in transaction",
+        segments.len(),
+        meeting_id
+    );
+    Ok(segments)
+}
+
+/// Inputs the AI passes need, persisted per meeting so they can be re-run
+/// without redoing transcription.
+#[derive(Serialize, Deserialize)]
+struct RefineData {
+    turns: Vec<diarization::SpeakerTurn>,
+    diarized: Vec<diarization::DiarizedSegment>,
+}
+
+const REFINE_DATA_FILENAME: &str = "refine-data.json";
+
+fn write_refine_data(
+    folder: &Path,
+    turns: &[diarization::SpeakerTurn],
+    diarized: &[diarization::DiarizedSegment],
+) -> Result<()> {
+    let data = RefineData { turns: turns.to_vec(), diarized: diarized.to_vec() };
+    let json = serde_json::to_string(&data)?;
+    std::fs::write(folder.join(REFINE_DATA_FILENAME), json)?;
+    Ok(())
+}
+
+fn load_refine_data(folder: &Path) -> Result<RefineData> {
+    let path = folder.join(REFINE_DATA_FILENAME);
+    let json = std::fs::read_to_string(&path).map_err(|_| {
+        anyhow!("No refinement data for this meeting yet — run Enhance (retranscribe) once first")
+    })?;
+    Ok(serde_json::from_str(&json)?)
+}
+
+/// Standalone AI fix-up: re-run the boundary and wording passes on the
+/// saved transcript without redoing transcription. Reuses the
+/// retranscription progress/complete/error events so the live transcript
+/// banner covers this flow too.
+async fn run_transcript_refinement<R: Runtime>(
+    app: AppHandle<R>,
+    meeting_id: String,
+    meeting_folder_path: String,
+) -> Result<()> {
+    let started = std::time::Instant::now();
+    let folder_path = PathBuf::from(&meeting_folder_path);
+    let mut data = load_refine_data(&folder_path)?;
+    info!(
+        "AI fix-up for meeting {}: {} turns, {} diarized segments",
+        meeting_id,
+        data.turns.len(),
+        data.diarized.len()
+    );
+
+    emit_progress(&app, &meeting_id, "refining", 5, "Refining speaker boundaries...");
+    if !data.diarized.is_empty() {
+        let app_for_refine = app.clone();
+        let meeting_id_for_refine = meeting_id.clone();
+        let stats = boundary_refine::refine_turns(
+            &app,
+            &mut data.turns,
+            || RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst),
+            move |done, total| {
+                emit_progress(
+                    &app_for_refine,
+                    &meeting_id_for_refine,
+                    "refining",
+                    5 + (45 * done / total.max(1)) as u32,
+                    &format!("Refining speaker boundaries ({}/{})...", done, total),
+                );
+            },
+        )
+        .await;
+        info!(
+            "AI fix-up boundaries: {} sandwiches ({} merged), {} boundaries, {} queried, {} moved, {} failures",
+            stats.sandwiches, stats.merged, stats.boundaries, stats.queried, stats.moved, stats.failures
+        );
+    }
+
+    if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
+        return Err(anyhow!("AI fix-up cancelled"));
+    }
+
+    emit_progress(&app, &meeting_id, "refining", 50, "Checking low-confidence wording...");
+    {
+        let app_for_repair = app.clone();
+        let meeting_id_for_repair = meeting_id.clone();
+        let stats = transcript_repair::repair_turns(
+            &app,
+            &mut data.turns,
+            || RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst),
+            move |done, total| {
+                emit_progress(
+                    &app_for_repair,
+                    &meeting_id_for_repair,
+                    "refining",
+                    50 + (40 * done / total.max(1)) as u32,
+                    &format!("Checking low-confidence wording ({}/{})...", done, total),
+                );
+            },
+        )
+        .await;
+        info!(
+            "AI fix-up wording: {} flagged, {} queried, {} repaired, {} failures",
+            stats.flagged, stats.queried, stats.repaired, stats.failures
+        );
+    }
+
+    if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
+        return Err(anyhow!("AI fix-up cancelled"));
+    }
+
+    emit_progress(&app, &meeting_id, "refining", 92, "Saving transcripts...");
+    let labeled_blocks = diarization::turns_to_rows(&data.turns);
+    let segments = save_transcript_rows(&app, &meeting_id, &labeled_blocks).await?;
+    if let Err(e) = write_refine_data(&folder_path, &data.turns, &data.diarized) {
+        warn!("Failed to update refine-data.json: {}", e);
+    }
+    if let Err(e) = write_transcripts_json(&folder_path, &segments) {
+        warn!("Failed to write transcripts.json: {}", e);
+    }
+
+    let _ = app.emit(
+        "retranscription-complete",
+        serde_json::json!({
+            "meeting_id": meeting_id,
+            "segments_count": segments.len(),
+            "duration_seconds": started.elapsed().as_secs(),
+            "language": Option::<String>::None,
+        }),
+    );
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn refine_transcript_command<R: Runtime>(
+    app: AppHandle<R>,
+    meeting_id: String,
+    meeting_folder_path: String,
+) -> Result<(), String> {
+    if RETRANSCRIPTION_IN_PROGRESS.load(Ordering::SeqCst) {
+        return Err("Retranscription already in progress".to_string());
+    }
+
+    tauri::async_runtime::spawn(async move {
+        let _guard = match RetranscriptionGuard::acquire() {
+            Ok(g) => g,
+            Err(e) => {
+                error!("AI fix-up: {}", e);
+                return;
+            }
+        };
+        RETRANSCRIPTION_CANCELLED.store(false, Ordering::SeqCst);
+
+        let result =
+            run_transcript_refinement(app.clone(), meeting_id.clone(), meeting_folder_path).await;
+        if let Err(e) = result {
+            error!("AI fix-up failed: {}", e);
+            let _ = app.emit(
+                "retranscription-error",
+                RetranscriptionError { meeting_id, error: e.to_string() },
+            );
+        }
+    });
+    Ok(())
+}
+
 async fn get_or_init_whisper<R: Runtime>(
     app: &AppHandle<R>,
     requested_model: Option<&str>,
