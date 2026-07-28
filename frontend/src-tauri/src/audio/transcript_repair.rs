@@ -128,7 +128,7 @@ fn word_edit_ops(a: &[&str], b: &[&str]) -> usize {
 
 fn build_prompt(before: &str, sentence: &str, after: &str) -> String {
     let mut prompt = String::from(
-        "A sentence from a meeting transcript (the speech mixes Russian and English). \
+        "A sentence from a meeting transcript (the speech may mix languages mid-sentence). \
 The speech recognizer may have mis-heard a word or two.\n\n",
     );
     if !before.is_empty() {
