@@ -132,17 +132,33 @@ fn resolve_cli_binary(name: &str) -> Option<std::path::PathBuf> {
 /// through an explicit user selection in Settings.
 pub async fn generate_with_cli(
     provider: &LLMProvider,
+    model_name: &str,
     system_prompt: &str,
     user_prompt: &str,
     cancellation_token: Option<&CancellationToken>,
 ) -> Result<String, String> {
-    let (bin_name, args): (&str, Vec<&str>) = match provider {
-        LLMProvider::ClaudeCli => ("claude", vec!["-p"]),
+    let (bin_name, mut args): (&str, Vec<String>) = match provider {
+        LLMProvider::ClaudeCli => ("claude", vec!["-p".into()]),
         // Run outside any git repo (cwd is temp_dir below), so the trust
         // check must be skipped explicitly
-        LLMProvider::CodexCli => ("codex", vec!["exec", "--skip-git-repo-check"]),
+        LLMProvider::CodexCli => ("codex", vec!["exec".into(), "--skip-git-repo-check".into()]),
         _ => return Err("not a CLI provider".to_string()),
     };
+    // "default" (and the legacy "cli-default") means: use whatever model
+    // the CLI itself is configured with
+    if !model_name.is_empty() && model_name != "default" && model_name != "cli-default" {
+        match provider {
+            LLMProvider::ClaudeCli => {
+                args.push("--model".into());
+                args.push(model_name.into());
+            }
+            LLMProvider::CodexCli => {
+                args.push("-m".into());
+                args.push(model_name.into());
+            }
+            _ => {}
+        }
+    }
     let bin = resolve_cli_binary(bin_name)
         .ok_or_else(|| format!("'{}' CLI not found — install it or pick another provider", bin_name))?;
 
@@ -247,7 +263,7 @@ pub async fn generate_summary(
 
     // Agent CLIs: subprocess, no HTTP API
     if matches!(provider, LLMProvider::ClaudeCli | LLMProvider::CodexCli) {
-        return generate_with_cli(provider, system_prompt, user_prompt, cancellation_token).await;
+        return generate_with_cli(provider, model_name, system_prompt, user_prompt, cancellation_token).await;
     }
 
     // Handle BuiltInAI provider separately (uses local sidecar, no HTTP API)

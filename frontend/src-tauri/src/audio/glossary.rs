@@ -160,7 +160,7 @@ fn merge_terms(existing: Vec<String>, new_terms: Vec<String>) -> Vec<String> {
 /// The summary provider from settings, when it is one of the agent CLIs.
 async fn configured_cli_provider<R: Runtime>(
     app: &AppHandle<R>,
-) -> Option<crate::summary::llm_client::LLMProvider> {
+) -> Option<(crate::summary::llm_client::LLMProvider, String)> {
     use crate::summary::llm_client::LLMProvider;
     let state = app.try_state::<crate::state::AppState>()?;
     let config = crate::database::repositories::setting::SettingsRepository::get_model_config(
@@ -169,7 +169,7 @@ async fn configured_cli_provider<R: Runtime>(
     .await
     .ok()??;
     match LLMProvider::from_str(&config.provider).ok()? {
-        p @ (LLMProvider::ClaudeCli | LLMProvider::CodexCli) => Some(p),
+        p @ (LLMProvider::ClaudeCli | LLMProvider::CodexCli) => Some((p, config.model)),
         _ => None,
     }
 }
@@ -194,8 +194,8 @@ mis-hearing.\nReply with only JSON: {{\"terms\": [\"...\"]}}",
     // Follow the user's summary provider when it is an agent CLI (the user
     // explicitly opted into cloud there); otherwise stay on the local model
     let result = match configured_cli_provider(&app).await {
-        Some(cli) => {
-            crate::summary::llm_client::generate_with_cli(&cli, SYSTEM_PROMPT, &prompt, None)
+        Some((cli, model)) => {
+            crate::summary::llm_client::generate_with_cli(&cli, &model, SYSTEM_PROMPT, &prompt, None)
                 .await
                 .map_err(|e| anyhow::anyhow!(e))
         }
