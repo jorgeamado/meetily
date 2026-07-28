@@ -297,8 +297,17 @@ fn overlap_seconds(a_start: f64, a_end: f64, b_start: f64, b_end: f64) -> f64 {
     (a_end.min(b_end) - a_start.max(b_start)).max(0.0)
 }
 
+/// Sentinel speaker index for the local user, identified by the microphone
+/// channel of stereo (mic-left/system-right) recordings rather than by
+/// embedding clustering. Never collides with diarizer-assigned indices.
+pub const LOCAL_SPEAKER: usize = usize::MAX;
+
 /// 1-based display label, e.g. speaker index 0 -> "Speaker 1".
+/// The mic-channel local user gets "You".
 pub fn speaker_label(speaker_index: usize) -> String {
+    if speaker_index == LOCAL_SPEAKER {
+        return "You".to_string();
+    }
     format!("Speaker {}", speaker_index + 1)
 }
 
