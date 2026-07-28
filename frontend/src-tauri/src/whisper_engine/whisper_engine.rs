@@ -335,6 +335,11 @@ impl WhisperEngine {
 
                 log::info!("Loading model: {}", model_name);
 
+                // Provision the CoreML (ANE) encoder in the background when
+                // missing; whisper.cpp picks it up on the next model load
+                #[cfg(target_os = "macos")]
+                crate::whisper_engine::coreml::ensure_encoder_in_background(model_info.path.clone());
+
                 // PERFORMANCE OPTIMIZATION: Use comprehensive hardware profile for optimal GPU configuration
                 let hardware_profile = crate::audio::HardwareProfile::detect();
                 let adaptive_config = hardware_profile.get_whisper_config();

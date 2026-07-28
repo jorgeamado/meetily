@@ -1,5 +1,7 @@
 pub mod whisper_engine;
 pub mod acceleration;
+#[cfg(target_os = "macos")]
+pub mod coreml;
 pub mod commands;
 pub mod system_monitor;
 pub mod parallel_processor;
