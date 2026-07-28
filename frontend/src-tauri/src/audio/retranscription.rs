@@ -4,6 +4,7 @@ use crate::audio::decoder::decode_audio_file;
 use crate::audio::boundary_refine;
 use crate::audio::diarization::{self, DiarizeOptions};
 use crate::audio::glossary;
+use crate::audio::stereo;
 use crate::audio::transcript_repair;
 use crate::audio::vad::get_speech_chunks_with_progress;
 use super::common::{create_transcript_segments, split_segment_at_silence, write_transcripts_json};
@@ -245,17 +246,51 @@ async fn run_retranscription<R: Runtime>(
         return Err(anyhow!("Retranscription cancelled"));
     }
 
+    // Stereo recordings made by this app carry channel identity: left = local
+    // mic, right = system audio. When present (and diarization is on), the
+    // system channel alone is diarized and the mic channel becomes a
+    // ground-truth local-speaker track overlaid on top.
+    let stereo_identity = decoded.channels == 2
+        && stereo::channel_layout(&folder_path).as_deref() == Some(stereo::MIC_SYSTEM_LAYOUT);
+    if stereo_identity {
+        info!("Stereo channel identity detected (mic-left/system-right)");
+    }
+
     // Convert to 16kHz mono format (CPU-intensive, run in blocking task)
-    let audio_samples = tokio::task::spawn_blocking(move || {
-        decoded.to_whisper_format()
+    let split_for_identity = stereo_identity && diarize_opts.enabled;
+    let (audio_samples, stereo_16k) = tokio::task::spawn_blocking(move || {
+        let mono = decoded.to_whisper_format();
+        let split = if split_for_identity {
+            stereo::split_channels_16k(&decoded)
+        } else {
+            None
+        };
+        (mono, split)
     })
     .await
     .map_err(|e| anyhow!("Resample task panicked: {}", e))?;
     info!("Converted to 16kHz mono format: {} samples", audio_samples.len());
 
-    // Keep a copy of the full audio for diarization, which runs independently of VAD/whisper
+    // Mic-channel speech intervals (local user) and the system channel that
+    // the diarizer should see instead of the mixed mono
+    let (mic_intervals, system_16k) = match stereo_16k {
+        Some((mic, sys)) => {
+            let intervals = stereo::mic_activity_intervals(&mic, &sys, 16000);
+            info!(
+                "Mic channel: {} local-speech interval(s), {:.1}s total",
+                intervals.len(),
+                intervals.iter().map(|(s, e)| e - s).sum::<f64>()
+            );
+            (Some(intervals), Some(sys))
+        }
+        None => (None, None),
+    };
+
+    // Keep a copy of the full audio for diarization, which runs independently of VAD/whisper.
+    // With channel identity, the diarizer only sees the system channel: the local
+    // user's voice never enters clustering, so it can't be confused with a remote one.
     let audio_samples_for_diarization = if diarize_opts.enabled {
-        Some(audio_samples.clone())
+        Some(system_16k.unwrap_or_else(|| audio_samples.clone()))
     } else {
         None
     };
@@ -342,6 +377,7 @@ async fn run_retranscription<R: Runtime>(
             let app_for_diarize = app.clone();
             let meeting_id_for_diarize = meeting_id.clone();
             let diarize_opts_for_task = diarize_opts.clone();
+            let mic_intervals_for_task = mic_intervals.clone();
 
             Some(tauri::async_runtime::spawn(async move {
                 let diarize_result = diarization::diarize(
@@ -361,6 +397,18 @@ async fn run_retranscription<R: Runtime>(
                             num_speakers,
                             segments.len()
                         );
+                        // Channel identity: overlay mic-channel speech as the
+                        // local speaker on top of the remote-only diarization
+                        if let Some(intervals) = &mic_intervals_for_task {
+                            let overlaid = stereo::overlay_local_speaker(&segments, intervals);
+                            info!(
+                                "Overlaid {} local-speaker interval(s): {} -> {} segments",
+                                intervals.len(),
+                                segments.len(),
+                                overlaid.len()
+                            );
+                            return overlaid;
+                        }
                         segments
                     }
                     Err(e) => {

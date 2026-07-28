@@ -882,10 +882,21 @@ impl AudioPipeline {
                                 self.skipped_transcription_samples += mixed_with_gain.len() as u64;
                             }
 
-                            // STEP 4: Send mixed audio for recording (WAV file)
+                            // STEP 4: Send audio for recording as interleaved stereo:
+                            // left = microphone (the local user), right = system audio
+                            // (everyone else). Channel identity lets retranscription
+                            // attribute speech to the local user directly instead of
+                            // guessing; whisper and playback downmix to mono/stereo fine.
                             if let Some(ref sender) = self.recording_sender_for_mixed {
+                                let mut stereo = Vec::with_capacity(mic_window.len() * 2);
+                                for i in 0..mic_window.len() {
+                                    let m = mic_window[i];
+                                    let s = sys_window.get(i).copied().unwrap_or(0.0);
+                                    stereo.push(m.clamp(-1.0, 1.0));
+                                    stereo.push(s.clamp(-1.0, 1.0));
+                                }
                                 let recording_chunk = AudioChunk {
-                                    data: mixed_with_gain.clone(),
+                                    data: stereo,
                                     sample_rate: self.sample_rate,
                                     timestamp: chunk.timestamp,
                                     chunk_id: self.chunk_id_counter,

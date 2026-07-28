@@ -51,6 +51,9 @@ pub mod retranscription;
 // Speaker diarization (sherpa-onnx sidecar for the retranscription pipeline)
 pub mod diarization;
 
+// Channel identity for stereo (mic-left/system-right) recordings
+pub mod stereo;
+
 // LLM tie-breaker for speaker-turn boundaries after diarization
 pub mod boundary_refine;
 

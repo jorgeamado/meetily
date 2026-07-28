@@ -38,6 +38,12 @@ pub struct MeetingMetadata {
     pub transcript_file: String,
     pub sample_rate: u32,
     pub status: String,  // "recording", "completed", "error"
+    /// Set to "mic-left-system-right" for stereo recordings where the left
+    /// channel is the local microphone and the right is system audio.
+    /// Retranscription uses this to attribute the left channel to the local
+    /// user. Absent for legacy mono recordings and imports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_layout: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -236,7 +242,8 @@ impl RecordingSaver {
 
         // Only initialize incremental saver if checkpoints are needed (auto_save is true)
         if create_checkpoints {
-            let incremental_saver = IncrementalAudioSaver::new(meeting_folder.clone(), 48000)?;
+            // Recordings are saved as stereo: left = mic, right = system audio
+            let incremental_saver = IncrementalAudioSaver::new(meeting_folder.clone(), 48000, 2)?;
             self.incremental_saver = Some(Arc::new(AsyncMutex::new(incremental_saver)));
             info!("✅ Incremental audio saver initialized for meeting: {}", meeting_name);
         } else {
@@ -259,6 +266,11 @@ impl RecordingSaver {
             transcript_file: "transcripts.json".to_string(),
             sample_rate: 48000,
             status: "recording".to_string(),
+            channel_layout: if create_checkpoints {
+                Some(super::stereo::MIC_SYSTEM_LAYOUT.to_string())
+            } else {
+                None
+            },
         };
 
         // Write initial metadata.json
