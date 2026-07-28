@@ -554,6 +554,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "boundary-eval"
+version = "0.1.0"
+dependencies = [
+ "meetily",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "brotli"
 version = "8.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
