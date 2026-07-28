@@ -89,22 +89,28 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
         return Err("Recording already in progress".to_string());
     }
 
-    // Validate that transcription models are available before starting recording
+    // A missing live-transcription model must NOT block recording: the raw
+    // audio is always saved and can be transcribed later with Enhance. Fall
+    // back to audio-only recording with live transcription disabled.
     info!("🔍 Validating transcription model availability before starting recording...");
-    if let Err(validation_error) = transcription::validate_transcription_model_ready(&app).await {
-        error!("Model validation failed: {}", validation_error);
-
-        // Emit error event for frontend - actionable: false to show toast instead of modal
-        // (download progress is already shown in top-right toast)
-        let _ = app.emit("transcription-error", serde_json::json!({
-            "error": validation_error,
-            "userMessage": "Recording cannot start: Transcription model is still downloading. Please wait for the download to complete.",
-            "actionable": false
-        }));
-
-        return Err(validation_error);
+    match transcription::validate_transcription_model_ready(&app).await {
+        Ok(()) => {
+            info!("✅ Transcription model validation passed");
+            super::pipeline::set_live_transcription_enabled(true);
+        }
+        Err(validation_error) => {
+            error!(
+                "Model validation failed — recording WITHOUT live transcription: {}",
+                validation_error
+            );
+            super::pipeline::set_live_transcription_enabled(false);
+            let _ = app.emit("transcription-error", serde_json::json!({
+                "error": validation_error,
+                "userMessage": "No transcription model available — recording audio only. Use Enhance after the meeting to transcribe.",
+                "actionable": false
+            }));
+        }
     }
-    info!("✅ Transcription model validation passed");
 
     // Async-first approach - no more blocking operations!
     info!("🚀 Starting async recording initialization");
@@ -335,22 +341,28 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
         return Err("Recording already in progress".to_string());
     }
 
-    // Validate that transcription models are available before starting recording
+    // A missing live-transcription model must NOT block recording: the raw
+    // audio is always saved and can be transcribed later with Enhance. Fall
+    // back to audio-only recording with live transcription disabled.
     info!("🔍 Validating transcription model availability before starting recording...");
-    if let Err(validation_error) = transcription::validate_transcription_model_ready(&app).await {
-        error!("Model validation failed: {}", validation_error);
-
-        // Emit error event for frontend - actionable: false to show toast instead of modal
-        // (download progress is already shown in top-right toast)
-        let _ = app.emit("transcription-error", serde_json::json!({
-            "error": validation_error,
-            "userMessage": "Recording cannot start: Transcription model is still downloading. Please wait for the download to complete.",
-            "actionable": false
-        }));
-
-        return Err(validation_error);
+    match transcription::validate_transcription_model_ready(&app).await {
+        Ok(()) => {
+            info!("✅ Transcription model validation passed");
+            super::pipeline::set_live_transcription_enabled(true);
+        }
+        Err(validation_error) => {
+            error!(
+                "Model validation failed — recording WITHOUT live transcription: {}",
+                validation_error
+            );
+            super::pipeline::set_live_transcription_enabled(false);
+            let _ = app.emit("transcription-error", serde_json::json!({
+                "error": validation_error,
+                "userMessage": "No transcription model available — recording audio only. Use Enhance after the meeting to transcribe.",
+                "actionable": false
+            }));
+        }
     }
-    info!("✅ Transcription model validation passed");
 
     // Parse devices
     let mic_device = if let Some(ref name) = mic_device_name {

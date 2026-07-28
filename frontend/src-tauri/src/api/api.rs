@@ -30,6 +30,14 @@ pub struct ApiResponse<T> {
 pub struct Meeting {
     pub id: String,
     pub title: String,
+    /// False when the meeting has no transcript rows (e.g. recorded without
+    /// a live-transcription model) — the list shows a "no transcript" hint
+    #[serde(default = "default_true")]
+    pub has_transcripts: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -353,6 +361,7 @@ pub async fn api_get_meetings<R: Runtime>(
                 .map(|m| Meeting {
                     id: m.id,
                     title: m.title,
+                    has_transcripts: m.transcript_count > 0,
                 })
                 .collect();
             Ok(result)
