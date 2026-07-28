@@ -13,6 +13,7 @@ const STAGE_LABELS: Record<string, string> = {
   transcribing: 'Transcribing',
   diarizing: 'Identifying speakers',
   saving: 'Finalizing',
+  refining: 'AI fix-up',
 };
 
 interface TranscriptPanelProps {
@@ -95,7 +96,11 @@ export function TranscriptPanel({
       })),
     [partialRows]
   );
-  const displaySegments = retranscribing ? previewSegments : convertedSegments;
+  // Keep showing the existing rows until streamed blocks actually arrive —
+  // covers the decode/VAD warm-up and the standalone AI fix-up (which never
+  // streams raw blocks, only updates rows at the end)
+  const displaySegments =
+    retranscribing && previewSegments.length > 0 ? previewSegments : convertedSegments;
 
   return (
     <div className="flex h-full min-w-0 w-full bg-white flex-col relative @container">
@@ -116,7 +121,9 @@ export function TranscriptPanel({
         <div className="px-4 py-2 border-b border-blue-100 bg-blue-50 space-y-1.5">
           <div className="flex items-center justify-between gap-2">
             <span className="text-xs font-medium text-blue-900">
-              Retranscribing — transcript updates live, speakers appear at the end
+              {progressByStage['transcribing']
+                ? 'Retranscribing — transcript updates live, speakers appear at the end'
+                : 'AI fix-up — improving speaker boundaries and wording'}
             </span>
             <Button
               variant="ghost"

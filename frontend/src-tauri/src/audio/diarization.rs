@@ -221,7 +221,7 @@ pub fn speaker_label(speaker_index: usize) -> String {
 
 /// A whisper token with absolute timestamps on the recording timeline and
 /// the decoder's probability for the token (1.0 when unknown).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WordSpan {
     pub text: String,
     pub start_ms: f64,
@@ -237,7 +237,7 @@ const MIN_TURN_MS: f64 = 350.0;
 /// One speaker's run of consecutive tokens inside a transcribed block, with
 /// the tokens kept so downstream passes (LLM boundary refinement) can move
 /// words across turn boundaries without re-deriving timestamps.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpeakerTurn {
     pub text: String,
     pub start_ms: f64,
