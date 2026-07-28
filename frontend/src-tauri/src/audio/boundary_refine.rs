@@ -257,11 +257,28 @@ pub fn build_prompt(left: &SpeakerTurn, right: &SpeakerTurn) -> Option<(String, 
             b_text.trim()
         ));
     }
-    if let Some(current) = shifts.iter().position(|&s| s == 0) {
-        prompt.push_str(&format!(
-            "Option {} is the current split, based on voice analysis. Prefer it unless it breaks a sentence mid-thought — a speaker change usually happens at a sentence boundary, not inside one.\n",
-            current + 1
-        ));
+    // BOUNDARY_PROMPT_VARIANT (eval-only knob): "blind" hides which option is
+    // the current split, "neutral" marks it without the keep instruction.
+    let variant = std::env::var("BOUNDARY_PROMPT_VARIANT").unwrap_or_default();
+    if variant != "blind" {
+        if let Some(current) = shifts.iter().position(|&s| s == 0) {
+            if variant == "neutral" {
+                prompt.push_str(&format!(
+                    "Option {} is the current split, based on voice analysis.\n",
+                    current + 1
+                ));
+            } else {
+                prompt.push_str(&format!(
+                    "Option {} is the current split, based on voice analysis. Prefer it unless it breaks a sentence mid-thought — a speaker change usually happens at a sentence boundary, not inside one.\n",
+                    current + 1
+                ));
+                if variant == "clause" {
+                    prompt.push_str(
+                        "But if the words right after the split clearly finish A's sentence, they belong to A — even if that moves the split several words.\n",
+                    );
+                }
+            }
+        }
     }
     prompt.push_str(&format!(
         "Reply with only JSON like {{\"cut\": 1}} choosing the best option (1-{}).",
