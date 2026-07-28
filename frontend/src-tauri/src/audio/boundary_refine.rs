@@ -80,7 +80,7 @@ pub struct RefineStats {
 
 /// Group a turn's tokens into words: a word starts at token 0 or at a token
 /// with leading whitespace. Returns [start, end) token ranges.
-pub(crate) fn word_ranges(turn: &SpeakerTurn) -> Vec<(usize, usize)> {
+pub fn word_ranges(turn: &SpeakerTurn) -> Vec<(usize, usize)> {
     let mut ranges: Vec<(usize, usize)> = Vec::new();
     for (i, w) in turn.words.iter().enumerate() {
         if i == 0 || w.text.starts_with(char::is_whitespace) {
@@ -92,7 +92,7 @@ pub(crate) fn word_ranges(turn: &SpeakerTurn) -> Vec<(usize, usize)> {
     ranges
 }
 
-pub(crate) fn words_text(turn: &SpeakerTurn, ranges: &[(usize, usize)]) -> Vec<String> {
+pub fn words_text(turn: &SpeakerTurn, ranges: &[(usize, usize)]) -> Vec<String> {
     ranges
         .iter()
         .map(|&(a, b)| {
@@ -142,7 +142,7 @@ fn find_boundaries(turns: &[SpeakerTurn]) -> Vec<Boundary> {
 }
 
 /// True when a word plausibly ends a sentence — a natural cut point.
-pub(crate) fn ends_sentence(word: &str) -> bool {
+pub fn ends_sentence(word: &str) -> bool {
     word.trim_end_matches(['"', '\'', ')', ']', '»'])
         .ends_with(['.', '?', '!', '…'])
 }
@@ -156,7 +156,7 @@ pub(crate) fn ends_sentence(word: &str) -> bool {
 /// ±PUNCT_SHIFT_WORDS) only cuts falling right after sentence punctuation
 /// are offered, so long-range errors stay reachable without exploding the
 /// option list.
-fn candidate_shifts(l_words: &[String], r_words: &[String]) -> Vec<i32> {
+pub fn candidate_shifts(l_words: &[String], r_words: &[String]) -> Vec<i32> {
     // When the current cut already falls right after sentence punctuation,
     // acoustics and syntax agree — only small jitter is plausible. Offering
     // far candidates here makes the model grab the neighbor's whole
@@ -194,7 +194,7 @@ fn candidate_shifts(l_words: &[String], r_words: &[String]) -> Vec<i32> {
 
 /// Render the numbered options. Returns (prompt, shifts) — shifts[n-1] is the
 /// shift encoded by option n.
-fn build_prompt(left: &SpeakerTurn, right: &SpeakerTurn) -> Option<(String, Vec<i32>)> {
+pub fn build_prompt(left: &SpeakerTurn, right: &SpeakerTurn) -> Option<(String, Vec<i32>)> {
     let l_ranges = word_ranges(left);
     let r_ranges = word_ranges(right);
     let l_words = words_text(left, &l_ranges);
@@ -257,7 +257,7 @@ fn build_prompt(left: &SpeakerTurn, right: &SpeakerTurn) -> Option<(String, Vec<
 
 /// Extract the integer following `key` in the model's reply. Accepts any
 /// text that contains the key followed by an integer, JSON or not.
-fn parse_key(reply: &str, key: &str) -> Option<usize> {
+pub fn parse_key(reply: &str, key: &str) -> Option<usize> {
     let idx = reply.find(key)?;
     let digits: String = reply[idx + key.len()..]
         .chars()
@@ -267,7 +267,7 @@ fn parse_key(reply: &str, key: &str) -> Option<usize> {
     digits.parse().ok()
 }
 
-fn parse_cut(reply: &str) -> Option<usize> {
+pub fn parse_cut(reply: &str) -> Option<usize> {
     parse_key(reply, "cut")
 }
 
@@ -284,7 +284,7 @@ fn is_extreme_shift(shift: i32, shifts: &[i32]) -> bool {
 
 /// True when mid is a short different-speaker turn wedged inside one
 /// speaker's speech with tight gaps on both sides.
-fn is_sandwich(prev: &SpeakerTurn, mid: &SpeakerTurn, next: &SpeakerTurn) -> bool {
+pub fn is_sandwich(prev: &SpeakerTurn, mid: &SpeakerTurn, next: &SpeakerTurn) -> bool {
     let (Some(p), Some(m), Some(n)) = (prev.speaker, mid.speaker, next.speaker) else {
         return false;
     };
@@ -301,7 +301,7 @@ fn is_sandwich(prev: &SpeakerTurn, mid: &SpeakerTurn, next: &SpeakerTurn) -> boo
     tight(prev, mid) && tight(mid, next)
 }
 
-fn build_sandwich_prompt(prev: &SpeakerTurn, mid: &SpeakerTurn, next: &SpeakerTurn) -> String {
+pub fn build_sandwich_prompt(prev: &SpeakerTurn, mid: &SpeakerTurn, next: &SpeakerTurn) -> String {
     let tail = |t: &SpeakerTurn| {
         let r = word_ranges(t);
         let w = words_text(t, &r);
@@ -366,7 +366,7 @@ fn apply_shift(left: &mut SpeakerTurn, right: &mut SpeakerTurn, shift: i32) {
 
 /// Pick the best available local model for micro-queries: prefer the smaller
 /// Qwen if downloaded, fall back to any downloaded built-in model.
-pub(crate) fn pick_model(app_data_dir: &PathBuf) -> Option<models::ModelDef> {
+pub fn pick_model(app_data_dir: &PathBuf) -> Option<models::ModelDef> {
     let preferred = ["qwen3.5:2b", "qwen3.5:4b"];
     let available = models::get_available_models();
     let downloaded = |m: &models::ModelDef| {
