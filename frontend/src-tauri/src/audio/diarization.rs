@@ -219,12 +219,14 @@ pub fn speaker_label(speaker_index: usize) -> String {
     format!("Speaker {}", speaker_index + 1)
 }
 
-/// A whisper token with absolute timestamps on the recording timeline.
+/// A whisper token with absolute timestamps on the recording timeline and
+/// the decoder's probability for the token (1.0 when unknown).
 #[derive(Debug, Clone)]
 pub struct WordSpan {
     pub text: String,
     pub start_ms: f64,
     pub end_ms: f64,
+    pub prob: f32,
 }
 
 /// Minimum duration for a speaker turn produced by splitting; shorter runs of
@@ -877,7 +879,7 @@ mod tests {
     }
 
     fn w(text: &str, start_ms: f64, end_ms: f64) -> WordSpan {
-        WordSpan { text: text.to_string(), start_ms, end_ms }
+        WordSpan { text: text.to_string(), start_ms, end_ms, prob: 1.0 }
     }
 
     fn d(start: f32, end: f32, speaker: usize) -> DiarizedSegment {

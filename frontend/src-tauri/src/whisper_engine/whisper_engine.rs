@@ -40,6 +40,9 @@ pub struct WhisperEngine {
     // Whether the loaded context has DTW token timestamps enabled (mutually
     // exclusive with flash attention; used by retranscription only)
     current_dtw: Arc<RwLock<bool>>,
+    // Vocabulary hint prepended to decoding (whisper initial_prompt); set by
+    // retranscription from the learned glossary, cleared afterwards
+    initial_prompt: Arc<RwLock<Option<String>>>,
     available_models: Arc<RwLock<HashMap<String, ModelInfo>>>,
     // State tracking for smart logging
     last_transcription_was_short: Arc<RwLock<bool>>,
@@ -157,6 +160,7 @@ impl WhisperEngine {
             current_context: Arc::new(RwLock::new(None)),
             current_model: Arc::new(RwLock::new(None)),
             current_dtw: Arc::new(RwLock::new(false)),
+            initial_prompt: Arc::new(RwLock::new(None)),
             available_models: Arc::new(RwLock::new(HashMap::new())),
             // Initialize state tracking
             last_transcription_was_short: Arc::new(RwLock::new(false)),
@@ -576,6 +580,14 @@ impl WhisperEngine {
         repeated_words as f32 / total_words
     }
     
+    /// Set (or clear) the vocabulary hint passed to whisper as
+    /// initial_prompt on every subsequent transcription call. Biases
+    /// recognition toward known names/terms; used by retranscription with
+    /// the learned glossary and cleared when the run ends.
+    pub async fn set_initial_prompt(&self, prompt: Option<String>) {
+        *self.initial_prompt.write().await = prompt;
+    }
+
     /// Transcribe audio with streaming support for partial results and adaptive quality
     pub async fn transcribe_audio_with_confidence(&self, audio_data: Vec<f32>, language: Option<String>) -> Result<(String, f32, bool)> {
         let (text, conf, is_partial, _) = self.transcribe_internal(audio_data, language).await?;
@@ -619,6 +631,12 @@ impl WhisperEngine {
         };
         params.set_language(language_code);
         params.set_translate(should_translate);
+
+        // Vocabulary hint (learned glossary) biases decoding toward known
+        // names and terms; whisper-rs leaks the CString so no lifetime issue
+        if let Some(prompt) = self.initial_prompt.read().await.as_deref() {
+            params.set_initial_prompt(prompt);
+        }
 
         // CRITICAL: Disable timestamp tokens to prevent whisper.cpp chunking heuristics
         // The "single timestamp ending - skip entire chunk" optimization incorrectly discards
@@ -711,16 +729,36 @@ impl WhisperEngine {
                         continue;
                     }
                     if let Ok(data) = state.full_get_token_data(i, j) {
-                        let start_ms = if data.t0 >= 0 { data.t0 as f64 * 10.0 } else { last_end_ms };
-                        let end_ms = if data.t1 >= 0 { data.t1 as f64 * 10.0 } else { start_ms };
+                        // Prefer DTW cross-attention timestamps when the
+                        // context was loaded with them (centisecond point
+                        // estimate per token); fall back to the t0/t1
+                        // heuristics otherwise
+                        let start_ms = if data.t_dtw >= 0 {
+                            data.t_dtw as f64 * 10.0
+                        } else if data.t0 >= 0 {
+                            data.t0 as f64 * 10.0
+                        } else {
+                            last_end_ms
+                        };
+                        let end_ms = (if data.t1 >= 0 { data.t1 as f64 * 10.0 } else { start_ms })
+                            .max(start_ms);
                         last_end_ms = end_ms;
                         words.push(crate::audio::diarization::WordSpan {
                             text: tok_text,
                             start_ms,
                             end_ms,
+                            prob: data.p,
                         });
                     }
                 }
+            }
+        }
+
+        // DTW gives point estimates; clip a token's end to the next token's
+        // start so spans never overlap their successor
+        for k in 0..words.len().saturating_sub(1) {
+            if words[k + 1].start_ms > words[k].start_ms && words[k].end_ms > words[k + 1].start_ms {
+                words[k].end_ms = words[k + 1].start_ms;
             }
         }
 

@@ -3,6 +3,8 @@
 use crate::audio::decoder::decode_audio_file;
 use crate::audio::boundary_refine;
 use crate::audio::diarization::{self, DiarizeOptions};
+use crate::audio::glossary;
+use crate::audio::transcript_repair;
 use crate::audio::vad::get_speech_chunks_with_progress;
 use super::common::{create_transcript_segments, split_segment_at_silence, write_transcripts_json};
 use super::constants::AUDIO_EXTENSIONS;
@@ -103,6 +105,7 @@ pub async fn start_retranscription<R: Runtime>(
     model: Option<String>,
     provider: Option<String>,
     diarize: Option<DiarizeOptions>,
+    repair: Option<bool>,
 ) -> Result<RetranscriptionResult> {
     // Acquire guard - ensures flag is cleared even on panic/early return
     let _guard = RetranscriptionGuard::acquire().map_err(|e| anyhow!(e))?;
@@ -111,7 +114,20 @@ pub async fn start_retranscription<R: Runtime>(
     RETRANSCRIPTION_CANCELLED.store(false, Ordering::SeqCst);
 
     let use_parakeet = provider.as_deref() == Some("parakeet");
-    let result = run_retranscription(app.clone(), meeting_id.clone(), meeting_folder_path, language, model, provider, diarize).await;
+    let result = run_retranscription(app.clone(), meeting_id.clone(), meeting_folder_path, language, model, provider, diarize, repair).await;
+
+    // The glossary prompt must never outlive the batch run: live
+    // transcription shares the engine singleton
+    {
+        use crate::whisper_engine::commands::WHISPER_ENGINE;
+        let engine = {
+            let guard = WHISPER_ENGINE.lock().unwrap_or_else(|e| e.into_inner());
+            guard.as_ref().cloned()
+        };
+        if let Some(e) = engine {
+            e.set_initial_prompt(None).await;
+        }
+    }
 
     // Unload the engine after the batch job (success, failure, or cancellation)
     super::common::unload_engine_after_batch(use_parakeet).await;
@@ -186,6 +202,7 @@ async fn run_retranscription<R: Runtime>(
     model: Option<String>,
     provider: Option<String>,
     diarize: Option<DiarizeOptions>,
+    repair: Option<bool>,
 ) -> Result<RetranscriptionResult> {
     let folder_path = PathBuf::from(&meeting_folder_path);
     let audio_path = find_audio_file(&folder_path)?;
@@ -377,6 +394,15 @@ async fn run_retranscription<R: Runtime>(
         None
     };
 
+    // Bias whisper toward names/terms learned from previous meetings;
+    // cleared by start_retranscription when the run ends
+    if let Some(engine) = whisper_engine.as_ref() {
+        if let Some(prompt) = glossary::initial_prompt(&app) {
+            info!("Applying learned glossary as whisper initial_prompt: {}", prompt);
+            engine.set_initial_prompt(Some(prompt)).await;
+        }
+    }
+
     // Split very long segments at silence boundaries for better transcription quality.
     // Hard cuts at arbitrary sample positions lose words at boundaries. Instead, scan
     // for the lowest-energy window near the target split point and cut there.
@@ -459,6 +485,7 @@ async fn run_retranscription<R: Runtime>(
                     text: w.text,
                     start_ms: w.start_ms + segment.start_timestamp_ms,
                     end_ms: w.end_ms + segment.start_timestamp_ms,
+                    prob: w.prob,
                 })
                 .collect();
             (text, conf, words)
@@ -591,6 +618,34 @@ async fn run_retranscription<R: Runtime>(
         );
     }
 
+    // Confidence-gated wording repair: sentences whose tokens decoded with
+    // low probability get one constrained LLM patch each (at most 2 words
+    // may change; anything bigger is rejected). Timings are untouched.
+    if repair.unwrap_or(true) && !use_parakeet {
+        emit_progress(&app, &meeting_id, "saving", 86, "Checking low-confidence wording...");
+        let app_for_repair = app.clone();
+        let meeting_id_for_repair = meeting_id.clone();
+        let stats = transcript_repair::repair_turns(
+            &app,
+            &mut turns,
+            || RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst),
+            move |done, total| {
+                emit_progress(
+                    &app_for_repair,
+                    &meeting_id_for_repair,
+                    "saving",
+                    86 + (4 * done / total.max(1)) as u32,
+                    &format!("Checking low-confidence wording ({}/{})...", done, total),
+                );
+            },
+        )
+        .await;
+        info!(
+            "Transcript repair: {} flagged, {} queried, {} repaired, {} failures",
+            stats.flagged, stats.queried, stats.repaired, stats.failures
+        );
+    }
+
     let labeled_blocks: Vec<(String, f64, f64, Option<usize>)> = diarization::turns_to_rows(&turns);
 
     // Create transcript segments with proper timestamps from VAD
@@ -646,6 +701,14 @@ async fn run_retranscription<R: Runtime>(
         segments.len(),
         meeting_id
     );
+
+    // Learn vocabulary from this meeting in the background (names, terms)
+    // so the NEXT retranscription can bias whisper toward it
+    if !use_parakeet {
+        let row_texts: Vec<String> = labeled_blocks.iter().map(|(t, _, _, _)| t.clone()).collect();
+        let sample = glossary::sample_rows(&row_texts);
+        tauri::async_runtime::spawn(glossary::update_from_transcript(app.clone(), sample));
+    }
 
     // Write updated transcripts.json and metadata.json to the meeting folder
     emit_progress(&app, &meeting_id, "saving", 90, "Writing transcript files...");
@@ -967,6 +1030,7 @@ pub async fn start_retranscription_command<R: Runtime>(
     model: Option<String>,
     provider: Option<String>,
     diarize: Option<DiarizeOptions>,
+    repair: Option<bool>,
 ) -> Result<RetranscriptionStarted, String> {
 
     // Check if retranscription is already in progress (guard will be acquired in start_retranscription)
@@ -987,6 +1051,7 @@ pub async fn start_retranscription_command<R: Runtime>(
             model,
             provider,
             diarize,
+            repair,
         )
         .await;
 

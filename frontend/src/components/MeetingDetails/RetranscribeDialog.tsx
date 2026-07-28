@@ -114,6 +114,7 @@ export function RetranscribeDialog({
   const [sensitivity, setSensitivity] = useState<SensitivityOption>('balanced');
   const [embeddingModel, setEmbeddingModel] = useState<string>('campplus');
   const [llmRefine, setLlmRefine] = useState(true);
+  const [llmRepair, setLlmRepair] = useState(true);
 
   // Use centralized model fetching hook
   const {
@@ -302,6 +303,7 @@ export function RetranscribeDialog({
         model: selectedModelDetails?.name || null,
         provider: selectedModelDetails?.provider || null,
         diarize,
+        repair: isParakeetModel ? null : llmRepair,
       });
 
       // Progress and the streaming transcript are shown inline by the
@@ -454,6 +456,18 @@ export function RetranscribeDialog({
               <p className="text-xs text-muted-foreground">
                 Choose a transcription model
               </p>
+            </div>
+          )}
+
+          {!isProcessing && !error && !isParakeetModel && (
+            <div className="flex items-center justify-between gap-2">
+              <div className="space-y-0.5">
+                <span className="text-sm font-medium">AI wording check</span>
+                <p className="text-xs text-muted-foreground">
+                  Local LLM patches low-confidence words (max 2 per sentence)
+                </p>
+              </div>
+              <Switch checked={llmRepair} onCheckedChange={setLlmRepair} />
             </div>
           )}
 
