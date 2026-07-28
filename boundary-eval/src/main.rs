@@ -107,18 +107,26 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut model = String::new();
     let mut helper = String::new();
+    let mut dump: Option<PathBuf> = None;
     let mut files: Vec<PathBuf> = Vec::new();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--model" => { model = args[i + 1].clone(); i += 2; }
             "--helper" => { helper = args[i + 1].clone(); i += 2; }
+            "--dump" => { dump = Some(args[i + 1].clone().into()); i += 2; }
             f => { files.push(f.into()); i += 1; }
         }
     }
-    assert!(!model.is_empty() && !helper.is_empty() && !files.is_empty(), "usage: --model m.gguf --helper llama-helper cases.jsonl...");
+    assert!(
+        !files.is_empty() && (dump.is_some() || (!model.is_empty() && !helper.is_empty())),
+        "usage: [--model m.gguf --helper llama-helper] [--dump DIR] cases.jsonl..."
+    );
 
-    let mut h = Helper::spawn(&helper, &model);
+    let mut h = if dump.is_none() { Some(Helper::spawn(&helper, &model)) } else { None };
+    if let Some(dir) = &dump {
+        std::fs::create_dir_all(dir).expect("create dump dir");
+    }
 
     let (mut correct, mut wrong, mut unreachable, mut merge_skipped, mut skipped) = (0, 0, 0, 0, 0);
     let mut failures: Vec<String> = Vec::new();
@@ -163,6 +171,21 @@ fn main() {
                 continue;
             }
 
+            if let Some(dir) = &dump {
+                let meta = serde_json::json!({
+                    "case": c.case,
+                    "meeting": &c.meeting_id[9..17],
+                    "shifts": shifts,
+                    "expected_shift": expected,
+                    "expected_option": shifts.iter().position(|&s| s == expected).map(|p| p + 1),
+                    "system": SYSTEM_PROMPT,
+                    "prompt": prompt,
+                });
+                let path = dir.join(format!("case-{}-{:02}.json", &c.meeting_id[9..17], c.case));
+                std::fs::write(&path, serde_json::to_string_pretty(&meta).unwrap()).expect("write dump");
+                continue;
+            }
+            let h = h.as_mut().unwrap();
             let reply = h.generate(&prompt).unwrap_or_default();
             let chosen = parse_cut(&reply)
                 .filter(|n| (1..=shifts.len()).contains(n))
@@ -191,5 +214,7 @@ fn main() {
     for f in &failures {
         println!("{}", f);
     }
-    let _ = h.child.kill();
+    if let Some(mut h) = h {
+        let _ = h.child.kill();
+    }
 }
