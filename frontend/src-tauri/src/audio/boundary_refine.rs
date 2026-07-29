@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use log::{info, warn};
 use tauri::{AppHandle, Manager, Runtime};
 
-use super::diarization::SpeakerTurn;
+use super::diarization::{DiarizedSegment, SpeakerTurn, LOCAL_SPEAKER};
 use super::segmentation::{self, SegmentationModel};
 use crate::summary::summary_engine::{self, models};
 
@@ -79,6 +79,8 @@ Answer with JSON only, no explanation.";
 pub struct RefineStats {
     pub boundaries: usize,
     pub sandwiches: usize,
+    /// Sandwiches kept because the interjection's voice proves its speaker.
+    pub kept_voice: usize,
     pub queried: usize,
     pub moved: usize,
     pub merged: usize,
@@ -338,6 +340,36 @@ pub fn is_sandwich(prev: &SpeakerTurn, mid: &SpeakerTurn, next: &SpeakerTurn) ->
     tight(prev, mid) && tight(mid, next)
 }
 
+/// Minimum interjection span for the voice guard — sub-second spans are
+/// below the sidecar's confirmation floor and whisper's timing slop.
+const VOICE_KEEP_MIN_MS: f64 = 1000.0;
+/// Fraction of the interjection that voice-confirmed diarized spans of its
+/// own speaker must cover for the guard to fire.
+const VOICE_KEEP_MIN_COVER: f64 = 0.5;
+
+/// True when a sandwich's middle turn is acoustically proven to belong to
+/// its labeled (different) speaker: the stereo mic channel, or diarized
+/// spans whose label was voice-confirmed by the sidecar's embedding check.
+/// Such interjections are real backchannels — the text-only LLM merges
+/// sandwiches near-unconditionally (measured 43/43), so these must never
+/// reach it.
+pub fn voice_confirmed_interjection(mid: &SpeakerTurn, diarized: &[DiarizedSegment]) -> bool {
+    let Some(spk) = mid.speaker else { return false };
+    if mid.end_ms - mid.start_ms < VOICE_KEEP_MIN_MS {
+        return false;
+    }
+    if spk == LOCAL_SPEAKER {
+        return true;
+    }
+    let (s, e) = (mid.start_ms / 1000.0, mid.end_ms / 1000.0);
+    let covered: f64 = diarized
+        .iter()
+        .filter(|d| d.voice && d.speaker == spk)
+        .map(|d| (e.min(d.end as f64) - s.max(d.start as f64)).max(0.0))
+        .sum();
+    covered >= (e - s) * VOICE_KEEP_MIN_COVER
+}
+
 pub fn build_sandwich_prompt(prev: &SpeakerTurn, mid: &SpeakerTurn, next: &SpeakerTurn) -> String {
     let tail = |t: &SpeakerTurn| {
         let r = word_ranges(t);
@@ -534,6 +566,7 @@ impl QueryCtx {
 pub async fn refine_turns<R: Runtime>(
     app: &AppHandle<R>,
     turns: &mut Vec<SpeakerTurn>,
+    diarized: &[DiarizedSegment],
     audio_16k: Option<&[f32]>,
     cancelled: impl Fn() -> bool,
     mut on_progress: impl FnMut(usize, usize),
@@ -585,6 +618,18 @@ pub async fn refine_turns<R: Runtime>(
         }
         if is_sandwich(&turns[i - 1], &turns[i], &turns[i + 1]) {
             stats.sandwiches += 1;
+            // Acoustically proven interjections are kept without asking the
+            // merge-happy LLM at all.
+            if voice_confirmed_interjection(&turns[i], diarized) {
+                stats.kept_voice += 1;
+                info!(
+                    "Boundary refine: keeping interjection {:?} at {:.1}s (voice-confirmed)",
+                    turns[i].text.trim(),
+                    turns[i].start_ms / 1000.0
+                );
+                i += 1;
+                continue;
+            }
             // Once the pass-1 query share is spent, keep scanning without
             // querying so `sandwiches` reports how many actually exist.
             if !ctx.exhausted(&stats) && stats.queried < MAX_QUERIES / 2 {
@@ -629,8 +674,8 @@ pub async fn refine_turns<R: Runtime>(
     let boundaries = find_boundaries(turns);
     stats.boundaries = boundaries.len();
     info!(
-        "Boundary refine: {} sandwiches ({} queried, {} merged), {} tight boundaries, model {}",
-        stats.sandwiches, pass1_queried, stats.merged, stats.boundaries, ctx.model_name
+        "Boundary refine: {} sandwiches ({} queried, {} merged, {} kept by voice), {} tight boundaries, model {}",
+        stats.sandwiches, pass1_queried, stats.merged, stats.kept_voice, stats.boundaries, ctx.model_name
     );
     let total = boundaries.len();
 
@@ -769,6 +814,38 @@ mod tests {
         };
         t.rebuild_from_words();
         t
+    }
+
+    fn dseg(start: f32, end: f32, speaker: usize, voice: bool) -> DiarizedSegment {
+        DiarizedSegment { start, end, speaker, voice }
+    }
+
+    #[test]
+    fn voice_guard_keeps_confirmed_interjection_only() {
+        // "Да, я понимаю." — 1.4s backchannel by speaker 2 at 10.0s
+        let mid = turn(
+            vec![tok("Да,", 10000.0, 10400.0), tok(" я", 10400.0, 10700.0), tok(" понимаю.", 10700.0, 11400.0)],
+            2,
+        );
+        // Voice-confirmed segment of the same speaker covering the span
+        assert!(voice_confirmed_interjection(&mid, &[dseg(9.9, 11.5, 2, true)]));
+        // Same coverage but unconfirmed label → LLM path
+        assert!(!voice_confirmed_interjection(&mid, &[dseg(9.9, 11.5, 2, false)]));
+        // Confirmed but a different speaker's segment → no cover
+        assert!(!voice_confirmed_interjection(&mid, &[dseg(9.9, 11.5, 1, true)]));
+        // Confirmed but covering under half the span
+        assert!(!voice_confirmed_interjection(&mid, &[dseg(10.0, 10.5, 2, true)]));
+
+        // Sub-second blip never voice-kept, even confirmed
+        let blip = turn(vec![tok("это", 10000.0, 10600.0)], 2);
+        assert!(!voice_confirmed_interjection(&blip, &[dseg(9.9, 10.7, 2, true)]));
+
+        // Local (mic-channel) speaker is channel-confirmed without diarized cover
+        let local = turn(
+            vec![tok("Да,", 10000.0, 10400.0), tok(" понимаю.", 10400.0, 11100.0)],
+            LOCAL_SPEAKER,
+        );
+        assert!(voice_confirmed_interjection(&local, &[]));
     }
 
     // The real case from the user's 3-person meeting: "What do you call

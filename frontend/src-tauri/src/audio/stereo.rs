@@ -136,13 +136,19 @@ pub fn overlay_local_speaker(
         }
         for (ps, pe) in pieces {
             if pe - ps >= MIN_PIECE_SECS {
-                out.push(DiarizedSegment { start: ps, end: pe, speaker: seg.speaker });
+                out.push(DiarizedSegment { start: ps, end: pe, speaker: seg.speaker, voice: seg.voice });
             }
         }
     }
 
+    // Mic-channel evidence is per-channel RMS, as strong as a voice match
     for &(ms, me) in mic_intervals {
-        out.push(DiarizedSegment { start: ms as f32, end: me as f32, speaker: LOCAL_SPEAKER });
+        out.push(DiarizedSegment {
+            start: ms as f32,
+            end: me as f32,
+            speaker: LOCAL_SPEAKER,
+            voice: true,
+        });
     }
 
     out.sort_by(|a, b| a.start.partial_cmp(&b.start).unwrap_or(std::cmp::Ordering::Equal));
@@ -234,8 +240,8 @@ mod tests {
     #[test]
     fn overlay_clips_remote_and_inserts_local() {
         let remote = vec![
-            DiarizedSegment { start: 0.0, end: 10.0, speaker: 0 },
-            DiarizedSegment { start: 12.0, end: 14.0, speaker: 1 },
+            DiarizedSegment { start: 0.0, end: 10.0, speaker: 0, voice: false },
+            DiarizedSegment { start: 12.0, end: 14.0, speaker: 1, voice: false },
         ];
         let mic = vec![(4.0, 6.0)];
         let out = overlay_local_speaker(&remote, &mic);
@@ -249,7 +255,7 @@ mod tests {
 
     #[test]
     fn overlay_drops_slivers() {
-        let remote = vec![DiarizedSegment { start: 0.0, end: 5.0, speaker: 0 }];
+        let remote = vec![DiarizedSegment { start: 0.0, end: 5.0, speaker: 0, voice: false }];
         // Mic covers all but 20ms at the edges
         let mic = vec![(0.02, 4.99)];
         let out = overlay_local_speaker(&remote, &mic);
