@@ -75,5 +75,6 @@ node_modules/
 experiments/
 .cursor/
 target/
+target.noindex/
 
 frontend/src-tauri/binaries/

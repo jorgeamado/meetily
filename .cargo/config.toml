@@ -1,0 +1,5 @@
+[build]
+# The ".noindex" suffix keeps Spotlight from indexing build artifacts —
+# otherwise launching "meetily" from Spotlight can open the stale
+# target/release bundle instead of the installed /Applications copy.
+target-dir = "target.noindex"
