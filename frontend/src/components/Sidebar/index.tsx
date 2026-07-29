@@ -144,11 +144,11 @@ const Sidebar: React.FC = () => {
   const handleMoveTo = async (folderId: string | null) => {
     if (!moveModalState.meetingId) return;
     const ok = await moveMeetingToFolder(moveModalState.meetingId, folderId);
-    if (ok) {
+    if (ok === true) {
       if (folderId) setExpandedFolders(prev => new Set(prev).add(folderId));
       toast.success(folderId ? 'Meeting moved' : 'Meeting moved to top level');
     } else {
-      toast.error('Failed to move meeting');
+      toast.error('Failed to move meeting', { description: ok });
     }
     setMoveModalState({ isOpen: false, meetingId: null });
     setMoveNewFolderName('');
