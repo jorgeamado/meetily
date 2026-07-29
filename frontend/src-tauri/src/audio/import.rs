@@ -307,6 +307,98 @@ pub async fn start_import<R: Runtime>(
     result
 }
 
+/// Video containers whose imports keep only the audio track — the video
+/// stream is never used and can be many times the size of the audio.
+const VIDEO_CONTAINER_EXTENSIONS: &[&str] = &["mp4", "mkv", "webm"];
+
+/// Build an ffmpeg Command with no stray stdio (and no console window on
+/// Windows), mirroring the invocation style in decoder.rs.
+fn ffmpeg_command(ffmpeg: &Path) -> std::process::Command {
+    let mut command = std::process::Command::new(ffmpeg);
+    command
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x08000000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+    command
+}
+
+/// Pull the first audio stream's codec name out of ffmpeg's stream listing,
+/// e.g. "Audio: aac (LC) (mp4a / 0x6134706D), 48000 Hz, ..." -> "aac".
+fn parse_audio_codec(listing: &str) -> Option<String> {
+    let after = listing.split("Audio: ").nth(1)?;
+    let codec = after
+        .split(|c: char| c == ',' || c.is_whitespace())
+        .next()?
+        .trim();
+    (!codec.is_empty()).then(|| codec.to_string())
+}
+
+/// Best-effort audio codec probe via `ffmpeg -i` (no ffprobe in the bundle;
+/// the bare -i invocation exits non-zero but still prints the stream listing).
+fn probe_audio_codec(ffmpeg: &Path, source: &Path) -> Option<String> {
+    let output = ffmpeg_command(ffmpeg)
+        .arg("-hide_banner")
+        .arg("-i")
+        .arg(source)
+        .stderr(std::process::Stdio::piped())
+        .output()
+        .ok()?;
+    parse_audio_codec(&String::from_utf8_lossy(&output.stderr))
+}
+
+fn run_ffmpeg_extract(ffmpeg: &Path, source: &Path, dest: &Path, stream_copy: bool) -> bool {
+    let mut command = ffmpeg_command(ffmpeg);
+    command.arg("-y").arg("-i").arg(source).arg("-map").arg("0:a:0");
+    if stream_copy {
+        command.arg("-c:a").arg("copy");
+    } else {
+        command.arg("-c:a").arg("aac").arg("-b:a").arg("192k");
+    }
+    command
+        .arg("-movflags")
+        .arg("+faststart")
+        .arg(dest)
+        .stderr(std::process::Stdio::null());
+    match command.status() {
+        Ok(status) if status.success() && dest.metadata().map(|m| m.len() > 0).unwrap_or(false) => {
+            true
+        }
+        result => {
+            warn!(
+                "Audio extraction ({}) failed for {}: {:?}",
+                if stream_copy { "stream copy" } else { "re-encode" },
+                source.display(),
+                result
+            );
+            let _ = std::fs::remove_file(dest);
+            false
+        }
+    }
+}
+
+/// Extract the audio track of a video container into `dest` (an .m4a).
+/// AAC sources are stream-copied (lossless, near-instant); other codecs are
+/// re-encoded to AAC so the result always decodes with Symphonia (opus/ac3
+/// copied into an .m4a would not). Returns false when ffmpeg is unavailable
+/// or every attempt fails — the caller then copies the file verbatim.
+fn extract_audio_track(source: &Path, dest: &Path) -> bool {
+    let Some(ffmpeg) = crate::audio::ffmpeg::find_ffmpeg_path() else {
+        warn!("Audio extraction skipped: ffmpeg not found; keeping full video file");
+        return false;
+    };
+    let codec = probe_audio_codec(&ffmpeg, source);
+    info!("Extracting audio track from {} (codec {:?})", source.display(), codec);
+    if matches!(codec.as_deref(), Some("aac")) && run_ffmpeg_extract(&ffmpeg, source, dest, true) {
+        return true;
+    }
+    run_ffmpeg_extract(&ffmpeg, source, dest, false)
+}
+
 /// Internal function to run import
 async fn run_import<R: Runtime>(
     app: AppHandle<R>,
@@ -342,26 +434,52 @@ async fn run_import<R: Runtime>(
     let base_folder = get_default_recordings_folder();
     let meeting_folder = create_meeting_folder(&base_folder, &title, false)?;
 
-    // Copy audio file to meeting folder
-    emit_progress(&app, "copying", 10, "Copying audio file...");
+    // Bring the audio into the meeting folder. Video containers keep only
+    // their audio track; other formats are copied verbatim.
+    let source_ext = source
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_lowercase)
+        .unwrap_or_else(|| "mp4".to_string());
 
-    let dest_filename = format!(
-        "audio.{}",
-        source
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("mp4")
-    );
-    let dest_path = meeting_folder.join(&dest_filename);
+    let mut dest_filename = format!("audio.{}", source_ext);
+    let mut dest_path = meeting_folder.join(&dest_filename);
 
-    let src = source.clone();
-    let dst = dest_path.clone();
-    tokio::task::spawn_blocking(move || std::fs::copy(&src, &dst))
-        .await
-        .map_err(|e| anyhow!("Copy task join error: {}", e))?
-        .map_err(|e| anyhow!("Failed to copy audio file: {}", e))?;
+    let mut extracted = false;
+    if VIDEO_CONTAINER_EXTENSIONS.contains(&source_ext.as_str()) {
+        emit_progress(&app, "copying", 10, "Extracting audio track...");
+        let m4a_path = meeting_folder.join("audio.m4a");
+        let src = source.clone();
+        let dst = m4a_path.clone();
+        extracted = tokio::task::spawn_blocking(move || extract_audio_track(&src, &dst))
+            .await
+            .map_err(|e| anyhow!("Extract task join error: {}", e))?;
+        if extracted {
+            let source_mb =
+                std::fs::metadata(&source).map(|m| m.len() as f64 / 1e6).unwrap_or(0.0);
+            let audio_mb =
+                std::fs::metadata(&m4a_path).map(|m| m.len() as f64 / 1e6).unwrap_or(0.0);
+            info!(
+                "Extracted audio track to {} ({:.1} MB of {:.1} MB source)",
+                m4a_path.display(),
+                audio_mb,
+                source_mb
+            );
+            dest_filename = "audio.m4a".to_string();
+            dest_path = m4a_path;
+        }
+    }
 
-    info!("Copied audio to: {}", dest_path.display());
+    if !extracted {
+        emit_progress(&app, "copying", 10, "Copying audio file...");
+        let src = source.clone();
+        let dst = dest_path.clone();
+        tokio::task::spawn_blocking(move || std::fs::copy(&src, &dst))
+            .await
+            .map_err(|e| anyhow!("Copy task join error: {}", e))?
+            .map_err(|e| anyhow!("Failed to copy audio file: {}", e))?;
+        info!("Copied audio to: {}", dest_path.display());
+    }
 
     // Check for cancellation
     if IMPORT_CANCELLED.load(Ordering::SeqCst) {
@@ -1015,6 +1133,19 @@ mod tests {
         assert!(AUDIO_EXTENSIONS.contains(&"wav"));
         assert!(AUDIO_EXTENSIONS.contains(&"mp3"));
         assert!(!AUDIO_EXTENSIONS.contains(&"txt"));
+    }
+
+    #[test]
+    fn test_parse_audio_codec_from_stream_listing() {
+        let listing = "Input #0, mov,mp4,m4a,3gp,3g2,mj2, from 'call.mp4':\n\
+            Stream #0:0[0x1](und): Video: h264 (High) (avc1 / 0x31637661), yuv420p, 1280x720\n\
+            Stream #0:1[0x2](und): Audio: aac (LC) (mp4a / 0x6134706D), 48000 Hz, stereo, fltp, 128 kb/s (default)\n";
+        assert_eq!(parse_audio_codec(listing).as_deref(), Some("aac"));
+
+        let opus = "Stream #0:1(eng): Audio: opus, 48000 Hz, stereo, fltp (default)\n";
+        assert_eq!(parse_audio_codec(opus).as_deref(), Some("opus"));
+
+        assert_eq!(parse_audio_codec("Stream #0:0: Video: h264\n"), None);
     }
 
     #[test]
