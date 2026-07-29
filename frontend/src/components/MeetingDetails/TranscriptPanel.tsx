@@ -5,9 +5,16 @@ import { TranscriptView } from '@/components/TranscriptView';
 import { VirtualizedTranscriptView } from '@/components/VirtualizedTranscriptView';
 import { TranscriptButtonGroup } from './TranscriptButtonGroup';
 import { useRetranscriptionStream } from './useRetranscriptionStream';
+import { SpeakerNameControl, SpeakerClusterInfo } from './SpeakerNameControl';
 import { Button } from '@/components/ui/button';
 import { X } from 'lucide-react';
-import { useMemo } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
+import { invoke } from '@tauri-apps/api/core';
+
+interface SpeakersOverviewData {
+  clusters: SpeakerClusterInfo[];
+  knownVoices: string[];
+}
 
 const STAGE_LABELS: Record<string, string> = {
   transcribing: 'Transcribing',
@@ -102,6 +109,60 @@ export function TranscriptPanel({
   const displaySegments =
     retranscribing && previewSegments.length > 0 ? previewSegments : convertedSegments;
 
+  // Speaker naming: per-cluster identity for this meeting (names, recognized
+  // voices, suggestions). Absent for meetings never enhanced on a build with
+  // voiceprints — labels then render as plain text.
+  const [speakers, setSpeakers] = useState<SpeakersOverviewData | null>(null);
+  const refetchSpeakers = useCallback(async () => {
+    if (!meetingId) return;
+    try {
+      const data = await invoke<SpeakersOverviewData>('speakers_overview', { meetingId });
+      setSpeakers(data);
+    } catch {
+      setSpeakers(null);
+    }
+  }, [meetingId]);
+  useEffect(() => {
+    if (!retranscribing) {
+      refetchSpeakers();
+    }
+  }, [refetchSpeakers, retranscribing]);
+
+  const speakersByDisplay = useMemo(() => {
+    const map = new Map<string, SpeakerClusterInfo>();
+    speakers?.clusters.forEach((c) => map.set(c.display, c));
+    return map;
+  }, [speakers]);
+
+  const turnCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    convertedSegments.forEach((s: { speaker?: string }) => {
+      if (s.speaker) counts.set(s.speaker, (counts.get(s.speaker) ?? 0) + 1);
+    });
+    return counts;
+  }, [convertedSegments]);
+
+  const handleSpeakerChanged = useCallback(async () => {
+    await onRefetchTranscripts?.();
+    await refetchSpeakers();
+  }, [onRefetchTranscripts, refetchSpeakers]);
+
+  const renderSpeaker = useCallback(
+    (speaker: string) => (
+      <SpeakerNameControl
+        speaker={speaker}
+        cluster={speakersByDisplay.get(speaker)}
+        meetingId={meetingId!}
+        turnCount={turnCounts.get(speaker) ?? 0}
+        knownVoices={speakers?.knownVoices ?? []}
+        onChanged={handleSpeakerChanged}
+      />
+    ),
+    [speakersByDisplay, meetingId, turnCounts, speakers, handleSpeakerChanged]
+  );
+  const speakerRenderer =
+    meetingId && !isRecording && !retranscribing && speakers ? renderSpeaker : undefined;
+
   return (
     <div className="flex w-1/3 min-w-[250px] max-w-[460px] border-r border-gray-200 bg-white flex-col relative shrink-0">
       {/* Title area */}
@@ -173,6 +234,7 @@ export function TranscriptPanel({
           totalCount={retranscribing ? previewSegments.length : totalCount}
           loadedCount={retranscribing ? previewSegments.length : loadedCount}
           onLoadMore={onLoadMore}
+          renderSpeaker={speakerRenderer}
         />
       </div>
 
