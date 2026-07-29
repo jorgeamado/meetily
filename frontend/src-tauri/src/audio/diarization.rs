@@ -492,6 +492,12 @@ fn models_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf> {
     Ok(base.join("models").join("diarization"))
 }
 
+/// Path of the downloaded pyannote segmentation model — present whenever
+/// diarization has run at least once (it downloads the model on first use).
+pub fn segmentation_model_path<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf> {
+    Ok(models_dir(app)?.join(SEGMENTATION_MODEL_FILENAME))
+}
+
 async fn ensure_models<R: Runtime>(
     app: &AppHandle<R>,
     embedding_model_key: Option<&str>,

@@ -54,6 +54,9 @@ pub mod diarization;
 // Channel identity for stereo (mic-left/system-right) recordings
 pub mod stereo;
 
+// Frame-level voice-change evidence (pyannote segmentation via ort)
+pub mod segmentation;
+
 // LLM tie-breaker for speaker-turn boundaries after diarization
 pub mod boundary_refine;
 

@@ -270,6 +270,8 @@ async fn run_retranscription<R: Runtime>(
     .await
     .map_err(|e| anyhow!("Resample task panicked: {}", e))?;
     info!("Converted to 16kHz mono format: {} samples", audio_samples.len());
+    // Shared with the VAD task and, later, boundary refinement's acoustic gate
+    let audio_samples = std::sync::Arc::new(audio_samples);
 
     // Mic-channel speech intervals (local user) and the system channel that
     // the diarizer should see instead of the mixed mono
@@ -290,7 +292,7 @@ async fn run_retranscription<R: Runtime>(
     // With channel identity, the diarizer only sees the system channel: the local
     // user's voice never enters clustering, so it can't be confused with a remote one.
     let audio_samples_for_diarization = if diarize_opts.enabled {
-        Some(system_16k.unwrap_or_else(|| audio_samples.clone()))
+        Some(system_16k.unwrap_or_else(|| (*audio_samples).clone()))
     } else {
         None
     };
@@ -307,10 +309,11 @@ async fn run_retranscription<R: Runtime>(
     // For large files (35+ minutes), VAD processing can take several minutes
     let app_for_vad = app.clone();
     let meeting_id_for_vad = meeting_id.clone();
+    let audio_for_vad = audio_samples.clone();
 
     let speech_segments = tokio::task::spawn_blocking(move || {
         get_speech_chunks_with_progress(
-            &audio_samples,
+            &audio_for_vad,
             VAD_REDEMPTION_TIME_MS,
             |vad_progress, segments_found| {
                 // Map VAD progress (0-100) to overall progress (20-25)
@@ -708,6 +711,7 @@ async fn run_retranscription<R: Runtime>(
         let stats = boundary_refine::refine_turns(
             &app,
             &mut turns,
+            Some(&audio_samples[..]),
             || RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst),
             move |done, total| {
                 emit_progress(
@@ -721,8 +725,9 @@ async fn run_retranscription<R: Runtime>(
         )
         .await;
         info!(
-            "Boundary refinement: {} sandwiches ({} merged), {} tight boundaries, {} queried, {} moved, {} failures",
-            stats.sandwiches, stats.merged, stats.boundaries, stats.queried, stats.moved, stats.failures
+            "Boundary refinement: {} sandwiches ({} merged), {} tight boundaries, {} queried, {} moved ({} acoustic, {} confirmed), {} failures",
+            stats.sandwiches, stats.merged, stats.boundaries, stats.queried, stats.moved,
+            stats.acoustic_moved, stats.acoustic_confirmed, stats.failures
         );
     }
 
@@ -939,11 +944,28 @@ async fn run_transcript_refinement<R: Runtime>(
 
     emit_progress(&app, &meeting_id, "refining", 5, "Refining speaker boundaries...");
     if !data.diarized.is_empty() {
+        // Decode the recording so the acoustic gate can weigh in; a fix-up
+        // without audio (file gone) still works, LLM-only.
+        let audio_16k = tokio::task::spawn_blocking({
+            let folder = folder_path.clone();
+            move || -> Option<Vec<f32>> {
+                let audio_path = find_audio_file(&folder).ok()?;
+                let decoded = decode_audio_file(&audio_path).ok()?;
+                Some(decoded.to_whisper_format())
+            }
+        })
+        .await
+        .ok()
+        .flatten();
+        if audio_16k.is_none() {
+            info!("AI fix-up: no decodable audio, boundary refine runs without acoustic gate");
+        }
         let app_for_refine = app.clone();
         let meeting_id_for_refine = meeting_id.clone();
         let stats = boundary_refine::refine_turns(
             &app,
             &mut data.turns,
+            audio_16k.as_deref(),
             || RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst),
             move |done, total| {
                 emit_progress(
@@ -957,8 +979,9 @@ async fn run_transcript_refinement<R: Runtime>(
         )
         .await;
         info!(
-            "AI fix-up boundaries: {} sandwiches ({} merged), {} boundaries, {} queried, {} moved, {} failures",
-            stats.sandwiches, stats.merged, stats.boundaries, stats.queried, stats.moved, stats.failures
+            "AI fix-up boundaries: {} sandwiches ({} merged), {} boundaries, {} queried, {} moved ({} acoustic, {} confirmed), {} failures",
+            stats.sandwiches, stats.merged, stats.boundaries, stats.queried, stats.moved,
+            stats.acoustic_moved, stats.acoustic_confirmed, stats.failures
         );
     }
 
