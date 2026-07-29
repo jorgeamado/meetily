@@ -186,3 +186,24 @@ Fix shipped in diarize-helper (--merge-threshold, default 0.8): after
 clustering, embed clean segments, iteratively merge major clusters
 (>= 10s clean speech) at cos >= 0.8, then fold debris clusters into majors
 (voice floor 0.60, temporal fallback). Disable with <= 0.
+
+## Sandwich-pass instrumentation (2026-07-29, commit dca7b7e)
+
+Pass 1 now scans past its 16-query share (count-only once budget is spent) and
+logs declined merges. First real data, Jul 27 meeting (post over-split fix,
+4 speakers):
+
+- Retranscribe pass merged 16 (capped); standalone fix-up then found the
+  remaining 13 → **~29 true sandwiches** in the 68-min meeting.
+- **Merge rate 100%** (29/29, zero declines) — qwen3.5:2b has never kept a
+  sandwich. Rubber-stamping is measured fact now, not suspicion.
+- Second fix-up run: **0 sandwiches** → the pass converges; merging does not
+  create new sandwich patterns.
+- Most merged texts are debris ("но пишет, а", "Большую"), but at 3775.9s it
+  merged "Да, я понимаю." — a complete backchannel that may be a real
+  second-speaker interjection. With diarization now trustworthy, a 100%-merge
+  policy erases real short interjections along with debris.
+
+Candidate fix (not built): acoustic guard — keep a sandwich when its span is
+long enough to embed reliably (≥1s) and voice-matches a *different* speaker's
+centroid; sub-second blips stay auto-merge (embeddings are coin flips there).
