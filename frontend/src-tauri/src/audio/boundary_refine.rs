@@ -580,43 +580,57 @@ pub async fn refine_turns<R: Runtime>(
     // refined).
     let mut i = 1;
     while i + 1 < turns.len() {
-        if cancelled() || ctx.exhausted(&stats) || stats.queried >= MAX_QUERIES / 2 {
+        if cancelled() {
             break;
         }
         if is_sandwich(&turns[i - 1], &turns[i], &turns[i + 1]) {
             stats.sandwiches += 1;
-            let prompt = build_sandwich_prompt(&turns[i - 1], &turns[i], &turns[i + 1]);
-            if let Some(reply) = ctx.ask(&prompt, &mut stats).await {
-                match parse_key(&reply, "merge") {
-                    Some(1) => {
-                        info!(
-                            "Boundary refine: merging phantom interjection {:?} at {:.1}s",
-                            turns[i].text.trim(),
-                            turns[i].start_ms / 1000.0
-                        );
-                        merge_sandwich(turns, i);
-                        stats.merged += 1;
-                        // Same index now holds the following turn; re-check
-                        // without advancing
-                        continue;
-                    }
-                    Some(0) => {}
-                    other => {
-                        warn!("Boundary refine: unparseable merge reply {:?} ({:?})", reply, other);
-                        stats.failures += 1;
+            // Once the pass-1 query share is spent, keep scanning without
+            // querying so `sandwiches` reports how many actually exist.
+            if !ctx.exhausted(&stats) && stats.queried < MAX_QUERIES / 2 {
+                let prompt = build_sandwich_prompt(&turns[i - 1], &turns[i], &turns[i + 1]);
+                if let Some(reply) = ctx.ask(&prompt, &mut stats).await {
+                    match parse_key(&reply, "merge") {
+                        Some(1) => {
+                            info!(
+                                "Boundary refine: merging phantom interjection {:?} at {:.1}s",
+                                turns[i].text.trim(),
+                                turns[i].start_ms / 1000.0
+                            );
+                            merge_sandwich(turns, i);
+                            stats.merged += 1;
+                            // Same index now holds the following turn; re-check
+                            // without advancing
+                            continue;
+                        }
+                        Some(0) => {
+                            info!(
+                                "Boundary refine: keeping interjection {:?} at {:.1}s",
+                                turns[i].text.trim(),
+                                turns[i].start_ms / 1000.0
+                            );
+                        }
+                        other => {
+                            warn!(
+                                "Boundary refine: unparseable merge reply {:?} ({:?})",
+                                reply, other
+                            );
+                            stats.failures += 1;
+                        }
                     }
                 }
             }
         }
         i += 1;
     }
+    let pass1_queried = stats.queried;
 
     // Pass 2: cut positions on the (possibly merged) turn list
     let boundaries = find_boundaries(turns);
     stats.boundaries = boundaries.len();
     info!(
-        "Boundary refine: {} sandwiches ({} merged), {} tight boundaries, model {}",
-        stats.sandwiches, stats.merged, stats.boundaries, ctx.model_name
+        "Boundary refine: {} sandwiches ({} queried, {} merged), {} tight boundaries, model {}",
+        stats.sandwiches, pass1_queried, stats.merged, stats.boundaries, ctx.model_name
     );
     let total = boundaries.len();
 
