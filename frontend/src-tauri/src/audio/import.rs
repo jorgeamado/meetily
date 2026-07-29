@@ -637,6 +637,52 @@ async fn run_import<R: Runtime>(
         None
     };
 
+    // First use of a freshly installed CoreML encoder blocks inside whisper
+    // while macOS compiles it for the Neural Engine (~15 min for large
+    // models, cached afterwards). Same treatment as retranscription: tick
+    // elapsed time until the first segment returns, then write the marker.
+    struct AbortOnDrop(Option<tauri::async_runtime::JoinHandle<()>>);
+    impl Drop for AbortOnDrop {
+        fn drop(&mut self) {
+            if let Some(h) = self.0.take() {
+                h.abort();
+            }
+        }
+    }
+    #[cfg(target_os = "macos")]
+    let mut ane_marker: Option<PathBuf> = match whisper_engine.as_ref() {
+        Some(engine) => {
+            let name = model.as_deref().unwrap_or(DEFAULT_WHISPER_MODEL);
+            match engine.model_path(name).await {
+                Some(p) => crate::whisper_engine::coreml::first_use_pending(&p),
+                None => None,
+            }
+        }
+        None => None,
+    };
+    #[cfg(not(target_os = "macos"))]
+    let mut ane_marker: Option<PathBuf> = None;
+    let mut ane_ticker = AbortOnDrop(ane_marker.as_ref().map(|_| {
+        let app_for_tick = app.clone();
+        let started = std::time::Instant::now();
+        tauri::async_runtime::spawn(async move {
+            loop {
+                tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+                let secs = started.elapsed().as_secs();
+                emit_progress(
+                    &app_for_tick,
+                    "transcribing",
+                    30,
+                    &format!(
+                        "Optimizing model for the Neural Engine — one-time, up to ~15 min ({}m {:02}s)...",
+                        secs / 60,
+                        secs % 60
+                    ),
+                );
+            }
+        })
+    }));
+
     // Split very long segments at silence boundaries for better transcription quality.
     // Hard cuts at arbitrary sample positions lose words at boundaries. Instead, scan
     // for the lowest-energy window near the target split point and cut there.
@@ -712,6 +758,14 @@ async fn run_import<R: Runtime>(
                 .map_err(|e| anyhow!("Whisper transcription failed on segment {}: {}", i, e))?;
             (text, conf)
         };
+
+        // First transcription returned: the ANE compile (if any) is done —
+        // stop the ticker and remember so future runs skip the warning
+        if let Some(marker) = ane_marker.take() {
+            ane_ticker = AbortOnDrop(None);
+            let _ = std::fs::write(&marker, "ok");
+            info!("CoreML encoder ready (ANE compile complete), marker at {}", marker.display());
+        }
 
         let trimmed = text.trim();
         if !trimmed.is_empty() {
