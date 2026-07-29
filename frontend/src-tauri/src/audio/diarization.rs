@@ -3,7 +3,7 @@
 
 use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -785,6 +785,10 @@ async fn run_diarize_helper(
                 Ok(Some(line)) => match parse_progress_line(&line) {
                     Some(event) => progress_queue_for_task.lock().unwrap().push_back(event),
                     None => {
+                        // cluster-repair decisions are worth having in the log
+                        if line.starts_with("oversplit:") {
+                            info!("diarize-helper {}", line);
+                        }
                         buf.push_str(&line);
                         buf.push('\n');
                     }
