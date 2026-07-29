@@ -14,6 +14,11 @@ pub struct MeetingModel {
     #[sqlx(default)]
     #[serde(default)]
     pub transcript_count: i64,
+    /// Recording length in seconds (max transcript end time); populated
+    /// only by get_meetings, None for meetings without transcripts
+    #[sqlx(default)]
+    #[serde(default)]
+    pub duration_seconds: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type)]

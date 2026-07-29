@@ -9,7 +9,8 @@ pub struct MeetingsRepository;
 impl MeetingsRepository {
     pub async fn get_meetings(pool: &SqlitePool) -> Result<Vec<MeetingModel>, sqlx::Error> {
         let meetings = sqlx::query_as::<_, MeetingModel>(
-            "SELECT m.*, (SELECT COUNT(*) FROM transcripts t WHERE t.meeting_id = m.id) AS transcript_count \
+            "SELECT m.*, (SELECT COUNT(*) FROM transcripts t WHERE t.meeting_id = m.id) AS transcript_count, \
+             (SELECT MAX(t.audio_end_time) FROM transcripts t WHERE t.meeting_id = m.id) AS duration_seconds \
              FROM meetings m ORDER BY m.created_at DESC",
         )
         .fetch_all(pool)

@@ -53,7 +53,7 @@ export function TranscriptButtonGroup({
           title={transcriptCount === 0 ? 'No transcript available' : 'Copy Transcript'}
         >
           <Copy />
-          <span className="hidden lg:inline">Copy</span>
+          <span className="sr-only">Copy</span>
         </Button>
 
         <Button
@@ -67,7 +67,7 @@ export function TranscriptButtonGroup({
           title="Open Recording Folder"
         >
           <FolderOpen className="xl:mr-2" size={18} />
-          <span className="hidden lg:inline">Recording</span>
+          <span className="sr-only">Recording</span>
         </Button>
 
         {betaFeatures.importAndRetranscribe && meetingId && meetingFolderPath && (
@@ -82,7 +82,7 @@ export function TranscriptButtonGroup({
             title="Retranscribe to enhance your recorded audio"
           >
             <RefreshCw className="xl:mr-2" size={18} />
-            <span className="hidden lg:inline">Enhance</span>
+            <span className="sr-only">Enhance</span>
           </Button>
         )}
 
@@ -104,7 +104,7 @@ export function TranscriptButtonGroup({
             title="Re-run the AI speaker-boundary and wording passes without retranscribing"
           >
             <Sparkles className="xl:mr-2" size={18} />
-            <span className="hidden lg:inline">AI fix-up</span>
+            <span className="sr-only">AI fix-up</span>
           </Button>
         )}
       </ButtonGroup>

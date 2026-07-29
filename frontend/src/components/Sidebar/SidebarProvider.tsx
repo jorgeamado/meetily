@@ -12,12 +12,22 @@ interface SidebarItem {
   title: string;
   type: 'folder' | 'file';
   hasTranscripts?: boolean;
+  durationSeconds?: number | null;
   children?: SidebarItem[];
 }
 
 export interface CurrentMeeting {
   id: string;
   title: string;
+  has_transcripts?: boolean;
+  duration_seconds?: number | null;
+}
+
+/// Live processing state for a meeting (transcription/retranscription/AI fix-up)
+export interface MeetingActivity {
+  stage: string;
+  progress: number;
+  message: string;
 }
 
 // Search result type for transcript search
@@ -52,7 +62,12 @@ interface SidebarContextType {
   stopSummaryPolling: (meetingId: string) => void;
   // Refetch meetings from backend
   refetchMeetings: () => Promise<void>;
-
+  // Per-meeting live processing state (keyed by meeting id)
+  meetingActivity: Map<string, MeetingActivity>;
+  // Meetings whose background run finished and hasn't been looked at yet
+  recentlyCompleted: Set<string>;
+  // Clear the completion marker (called when the meeting is opened)
+  acknowledgeCompletion: (meetingId: string) => void;
 }
 
 const SidebarContext = createContext<SidebarContextType | null>(null);
@@ -87,11 +102,12 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const fetchMeetings = React.useCallback(async () => {
     if (serverAddress) {
       try {
-        const meetings = await invoke('api_get_meetings') as Array<{ id: string, title: string, has_transcripts?: boolean }>;
+        const meetings = await invoke('api_get_meetings') as Array<{ id: string, title: string, has_transcripts?: boolean, duration_seconds?: number | null }>;
         const transformedMeetings = meetings.map((meeting: any) => ({
           id: meeting.id,
           title: meeting.title,
-          has_transcripts: meeting.has_transcripts
+          has_transcripts: meeting.has_transcripts,
+          duration_seconds: meeting.duration_seconds
         }));
         setMeetings(transformedMeetings);
         Analytics.trackBackendConnection(true);
@@ -102,6 +118,72 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       }
     }
   }, [serverAddress]);
+
+  // Track background transcription/fix-up runs app-wide so the meeting list
+  // can show progress and completion regardless of which page is open.
+  const [meetingActivity, setMeetingActivity] = useState<Map<string, MeetingActivity>>(new Map());
+  const [recentlyCompleted, setRecentlyCompleted] = useState<Set<string>>(new Set());
+
+  const acknowledgeCompletion = React.useCallback((meetingId: string) => {
+    setRecentlyCompleted(prev => {
+      if (!prev.has(meetingId)) return prev;
+      const next = new Set(prev);
+      next.delete(meetingId);
+      return next;
+    });
+  }, []);
+
+  useEffect(() => {
+    const unlisteners: Array<() => void> = [];
+    let cancelled = false;
+
+    const setup = async () => {
+      const { listen } = await import('@tauri-apps/api/event');
+
+      const finish = (meetingId: string, ok: boolean) => {
+        setMeetingActivity(prev => {
+          const next = new Map(prev);
+          next.delete(meetingId);
+          return next;
+        });
+        if (ok) {
+          // Acknowledged state, not a timer: the check stays until the user
+          // opens the meeting, so a run finishing while they look away is
+          // still noticeable.
+          setRecentlyCompleted(prev => new Set(prev).add(meetingId));
+          // Durations and has_transcripts may have changed
+          fetchMeetings();
+        }
+      };
+
+      const uProgress = await listen<any>('retranscription-progress', (event) => {
+        const { meeting_id, stage, progress_percentage, message } = event.payload;
+        setMeetingActivity(prev => new Map(prev).set(meeting_id, {
+          stage,
+          progress: progress_percentage,
+          message
+        }));
+      });
+      const uComplete = await listen<any>('retranscription-complete', (event) => {
+        finish(event.payload.meeting_id, true);
+      });
+      const uError = await listen<any>('retranscription-error', (event) => {
+        finish(event.payload.meeting_id, false);
+      });
+
+      if (cancelled) {
+        uProgress(); uComplete(); uError();
+        return;
+      }
+      unlisteners.push(uProgress, uComplete, uError);
+    };
+    setup();
+
+    return () => {
+      cancelled = true;
+      unlisteners.forEach(u => u());
+    };
+  }, [fetchMeetings]);
 
   useEffect(() => {
     fetchMeetings();
@@ -121,7 +203,13 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       title: 'Meeting Notes',
       type: 'folder' as const,
       children: [
-        ...meetings.map(meeting => ({ id: meeting.id, title: meeting.title, type: 'file' as const, hasTranscripts: (meeting as any).has_transcripts !== false }))
+        ...meetings.map(meeting => ({
+          id: meeting.id,
+          title: meeting.title,
+          type: 'file' as const,
+          hasTranscripts: meeting.has_transcripts !== false,
+          durationSeconds: meeting.duration_seconds ?? null
+        }))
       ]
     },
   ];
@@ -314,7 +402,9 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       startSummaryPolling,
       stopSummaryPolling,
       refetchMeetings: fetchMeetings,
-
+      meetingActivity,
+      recentlyCompleted,
+      acknowledgeCompletion,
     }}>
       {children}
     </SidebarContext.Provider>
