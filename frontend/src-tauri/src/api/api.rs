@@ -34,6 +34,9 @@ pub struct Meeting {
     /// a live-transcription model) — the list shows a "no transcript" hint
     #[serde(default = "default_true")]
     pub has_transcripts: bool,
+    /// Recording length in seconds (None when no transcripts exist yet)
+    #[serde(default)]
+    pub duration_seconds: Option<f64>,
 }
 
 fn default_true() -> bool {
@@ -362,6 +365,7 @@ pub async fn api_get_meetings<R: Runtime>(
                     id: m.id,
                     title: m.title,
                     has_transcripts: m.transcript_count > 0,
+                    duration_seconds: m.duration_seconds,
                 })
                 .collect();
             Ok(result)

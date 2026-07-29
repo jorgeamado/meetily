@@ -91,7 +91,7 @@ export function TranscriptButtonGroup({
           <Button
             size="sm"
             variant="outline"
-            className="xl:px-4"
+            className="px-2 @[22rem]:px-4"
             disabled={transcriptCount === 0}
             onClick={async () => {
               Analytics.trackButtonClick('ai_fixup_transcript', 'meeting_details');
@@ -104,8 +104,8 @@ export function TranscriptButtonGroup({
             }}
             title="Re-run the AI speaker-boundary and wording passes without retranscribing"
           >
-            <Sparkles className="xl:mr-2" size={18} />
-            <span className="hidden lg:inline">AI fix-up</span>
+            <Sparkles className="@[22rem]:mr-2" size={18} />
+            <span className="hidden @[22rem]:inline">AI fix-up</span>
           </Button>
         )}
       </ButtonGroup>

@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useMemo, useEffect, useCallback } from 'react';
-import { ChevronDown, ChevronRight, File, Settings, ChevronLeftCircle, ChevronRightCircle, Calendar, StickyNote, Home, Trash2, Mic, Square, Plus, Search, Pencil, NotebookPen, SearchIcon, X, Upload } from 'lucide-react';
+import { ChevronDown, ChevronRight, File, Settings, ChevronLeftCircle, ChevronRightCircle, Calendar, StickyNote, Home, Trash2, Mic, Square, Plus, Search, Pencil, NotebookPen, SearchIcon, X, Upload, Check, Loader2 } from 'lucide-react';
 import { useRouter, usePathname } from 'next/navigation';
 import { useSidebar } from './SidebarProvider';
 import type { CurrentMeeting } from '@/components/Sidebar/SidebarProvider';
@@ -54,7 +54,10 @@ const Sidebar: React.FC = () => {
     isSearching,
     meetings,
     setMeetings,
-    serverAddress
+    serverAddress,
+    meetingActivity,
+    recentlyCompleted,
+    acknowledgeCompletion
   } = useSidebar();
 
   // Get recording state from RecordingStateContext (single source of truth)
@@ -551,6 +554,25 @@ const Sidebar: React.FC = () => {
     return searchResults.find(result => result.id === itemId);
   };
 
+  // "0:42" / "12:07" / "1:04:09"
+  const formatDuration = (seconds: number) => {
+    const s = Math.round(seconds);
+    const h = Math.floor(s / 3600);
+    const m = Math.floor((s % 3600) / 60);
+    const sec = String(s % 60).padStart(2, '0');
+    return h > 0 ? `${h}:${String(m).padStart(2, '0')}:${sec}` : `${m}:${sec}`;
+  };
+
+  // Short human label for a processing stage
+  const stageLabel = (stage: string) => ({
+    decoding: 'Decoding',
+    vad: 'Analyzing audio',
+    transcribing: 'Transcribing',
+    diarizing: 'Detecting speakers',
+    saving: 'Finalizing',
+    refining: 'AI fix-up',
+  } as Record<string, string>)[stage] ?? stage;
+
   const renderItem = (item: SidebarItem, depth = 0) => {
     const isExpanded = expandedFolders.has(item.id);
     const paddingLeft = `${depth * 12 + 12}px`;
@@ -561,14 +583,20 @@ const Sidebar: React.FC = () => {
     const matchingResult = isMeetingItem ? findMatchingSnippet(item.id) : null;
     const hasTranscriptMatch = !!matchingResult;
 
+    // Live processing / just-finished state for this meeting
+    const activity = isMeetingItem ? meetingActivity.get(item.id) : undefined;
+    const justCompleted = isMeetingItem && recentlyCompleted.has(item.id);
+    const durationSeconds = isMeetingItem ? (item as any).durationSeconds : null;
+
     if (isCollapsed) return null;
 
     return (
       <div key={item.id}>
         <div
-          className={`flex items-center transition-all duration-150 group ${item.type === 'folder' && depth === 0
+          className={`relative overflow-hidden flex items-center transition-all duration-150 group ${item.type === 'folder' && depth === 0
             ? 'p-3 text-lg font-semibold h-10 mx-3 mt-3 rounded-lg'
             : `px-3 py-2 my-0.5 rounded-md text-sm ${isActive ? 'bg-blue-100 text-blue-700 font-medium' :
+              justCompleted ? 'bg-green-50' :
               hasTranscriptMatch ? 'bg-yellow-50' : 'hover:bg-gray-50'
             } cursor-pointer`
             }`}
@@ -578,6 +606,7 @@ const Sidebar: React.FC = () => {
               toggleFolder(item.id);
             } else {
               setCurrentMeeting({ id: item.id, title: item.title });
+              acknowledgeCompletion(item.id);
               const basePath = item.id.startsWith('intro-call') ? '/' :
                 item.id.includes('-') ? `/meeting-details?id=${item.id}` : `/notes/${item.id}`;
               router.push(basePath);
@@ -604,30 +633,40 @@ const Sidebar: React.FC = () => {
               )}
             </>
           ) : (
-            <div className="flex flex-col w-full">
-              <div className="flex items-center w-full">
+            <div className="flex flex-col w-full min-w-0">
+              <div className="flex items-center w-full min-w-0">
+                {/* Avatar doubles as status: spinner while processing, check
+                    until the finished meeting is opened, file icon otherwise */}
                 {isMeetingItem ? (
-                  <div className="flex-shrink-0 flex items-center justify-center w-6 h-6 rounded-full mr-2 bg-gray-100">
-                    <File className="w-3.5 h-3.5 text-gray-600" />
-                  </div>
+                  activity ? (
+                    <div className="flex-shrink-0 flex items-center justify-center w-6 h-6 rounded-full mr-2 bg-blue-50" title={activity.message}>
+                      <Loader2 className="w-3.5 h-3.5 text-blue-600 animate-spin" />
+                    </div>
+                  ) : justCompleted ? (
+                    <div className="flex-shrink-0 flex items-center justify-center w-6 h-6 rounded-full mr-2 bg-green-100" title="Processing finished">
+                      <Check className="w-3.5 h-3.5 text-green-600" />
+                    </div>
+                  ) : (
+                    <div className="flex-shrink-0 flex items-center justify-center w-6 h-6 rounded-full mr-2 bg-gray-100">
+                      <File className="w-3.5 h-3.5 text-gray-600" />
+                    </div>
+                  )
                 ) : (
                   <div className="flex-shrink-0 flex items-center justify-center w-6 h-6 rounded-full mr-2 bg-blue-100">
                     <Plus className="w-3.5 h-3.5 text-blue-600" />
                   </div>
                 )}
-                <span className="flex-1 break-words">
+                <span className="flex-1 min-w-0 truncate" title={item.title}>
                   {item.title}
-                  {isMeetingItem && (item as any).hasTranscripts === false && (
-                    <span
-                      className="ml-1.5 align-middle inline-block text-[10px] leading-4 px-1.5 rounded-full bg-amber-50 border border-amber-200 text-amber-700"
-                      title="Recorded without live transcription — use Enhance to transcribe"
-                    >
-                      no transcript
-                    </span>
-                  )}
                 </span>
-                {isMeetingItem && (
-                  <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity duration-150">
+                {/* Fixed trailing slot: duration normally, actions on hover */}
+                {isMeetingItem && durationSeconds != null && (
+                  <span className={`flex-shrink-0 ml-1 text-[11px] text-gray-400 tabular-nums ${activity ? '' : 'group-hover:hidden'}`}>
+                    {formatDuration(durationSeconds)}
+                  </span>
+                )}
+                {isMeetingItem && !activity && (
+                  <div className="hidden group-hover:flex items-center gap-1 flex-shrink-0">
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
@@ -651,6 +690,34 @@ const Sidebar: React.FC = () => {
                   </div>
                 )}
               </div>
+
+              {/* Status line: live stage while processing, otherwise the
+                  no-transcript hint */}
+              {isMeetingItem && activity && (
+                <div className="ml-8 text-[11px] text-blue-600 truncate" title={activity.message}>
+                  {stageLabel(activity.stage)} · {activity.progress}%
+                </div>
+              )}
+              {isMeetingItem && !activity && (item as any).hasTranscripts === false && (
+                <div className="ml-8 mt-0.5">
+                  <span
+                    className="inline-block text-[10px] leading-4 px-1.5 rounded-full bg-amber-50 border border-amber-200 text-amber-700"
+                    title="Recorded without live transcription — use Enhance to transcribe"
+                  >
+                    no transcript
+                  </span>
+                </div>
+              )}
+
+              {/* Thin progress bar along the bottom edge while processing */}
+              {isMeetingItem && activity && (
+                <div className="absolute bottom-0 left-0 right-0 h-0.5 bg-blue-100">
+                  <div
+                    className="h-full bg-blue-500 transition-all duration-500"
+                    style={{ width: `${Math.max(2, Math.min(100, activity.progress))}%` }}
+                  />
+                </div>
+              )}
 
               {/* Show transcript match snippet if available */}
               {hasTranscriptMatch && (
@@ -690,7 +757,7 @@ const Sidebar: React.FC = () => {
           }`}
       >
         {/*  Header with traffic light spacing */}
-        <div className="flex-shrink-0 h-22 flex items-center">
+        <div className="flex-shrink-0 flex items-center">
 
           {/* Title container */}
 
