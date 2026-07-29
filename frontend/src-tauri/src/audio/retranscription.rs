@@ -1347,6 +1347,30 @@ pub async fn start_retranscription_command<R: Runtime>(
         return Err("Retranscription already in progress".to_string());
     }
 
+    // The dialog captures folder_path when the page opens; a rename or a
+    // sidebar-folder move may have relocated the recording since. Prefer
+    // the database's current path when the captured one is gone.
+    let mut meeting_folder_path = meeting_folder_path;
+    if !std::path::Path::new(&meeting_folder_path).is_dir() {
+        if let Some(state) = app.try_state::<crate::state::AppState>() {
+            if let Ok(Some(current)) =
+                crate::database::repositories::meeting::MeetingsRepository::get_meeting_folder_path(
+                    state.db_manager.pool(),
+                    &meeting_id,
+                )
+                .await
+            {
+                if std::path::Path::new(&current).is_dir() {
+                    info!(
+                        "Retranscribe: folder path was stale, using {} from database",
+                        current
+                    );
+                    meeting_folder_path = current;
+                }
+            }
+        }
+    }
+
     // Clone values for the spawned task
     let meeting_id_clone = meeting_id.clone();
 

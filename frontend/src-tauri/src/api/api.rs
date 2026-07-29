@@ -1030,7 +1030,7 @@ pub async fn api_create_folder<R: Runtime>(
 
 #[tauri::command]
 pub async fn api_rename_folder<R: Runtime>(
-    _app: AppHandle<R>,
+    app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
     folder_id: String,
     title: String,
@@ -1040,6 +1040,7 @@ pub async fn api_rename_folder<R: Runtime>(
         return Err("Folder name cannot be empty".to_string());
     }
     let pool = state.db_manager.pool();
+    crate::audio::recording_layout::sync_folder_rename(&app, pool, &folder_id, &title).await?;
     match MeetingsRepository::rename_folder(pool, &folder_id, &title).await {
         Ok(true) => Ok(()),
         Ok(false) => Err(format!("No folder found with id {}", folder_id)),
@@ -1049,11 +1050,13 @@ pub async fn api_rename_folder<R: Runtime>(
 
 #[tauri::command]
 pub async fn api_delete_folder<R: Runtime>(
-    _app: AppHandle<R>,
+    app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
     folder_id: String,
 ) -> Result<(), String> {
     let pool = state.db_manager.pool();
+    // must run while meetings still reference the folder
+    crate::audio::recording_layout::sync_folder_delete(&app, pool, &folder_id).await?;
     match MeetingsRepository::delete_folder(pool, &folder_id).await {
         Ok(true) => Ok(()),
         Ok(false) => Err(format!("No folder found with id {}", folder_id)),
@@ -1063,12 +1066,14 @@ pub async fn api_delete_folder<R: Runtime>(
 
 #[tauri::command]
 pub async fn api_set_meeting_folder<R: Runtime>(
-    _app: AppHandle<R>,
+    app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
     meeting_id: String,
     folder_id: Option<String>,
 ) -> Result<(), String> {
     let pool = state.db_manager.pool();
+    crate::audio::recording_layout::sync_meeting_move(&app, pool, &meeting_id, folder_id.as_deref())
+        .await?;
     match MeetingsRepository::set_meeting_folder(pool, &meeting_id, folder_id.as_deref()).await {
         Ok(true) => Ok(()),
         Ok(false) => Err(format!("No meeting found with id {}", meeting_id)),
@@ -1078,7 +1083,7 @@ pub async fn api_set_meeting_folder<R: Runtime>(
 
 #[tauri::command]
 pub async fn api_save_meeting_title<R: Runtime>(
-    _app: AppHandle<R>,
+    app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
     meeting_id: String,
     title: String,
@@ -1090,6 +1095,7 @@ pub async fn api_save_meeting_title<R: Runtime>(
         auth_token.is_some()
     );
     let pool = state.db_manager.pool();
+    crate::audio::recording_layout::sync_meeting_rename(&app, pool, &meeting_id, &title).await?;
     match MeetingsRepository::update_meeting_title(pool, &meeting_id, &title).await {
         Ok(true) => {
             log_info!("Successfully saved meeting title");
