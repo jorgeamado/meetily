@@ -218,6 +218,51 @@ impl MeetingsRepository {
         Ok(result.rows_affected() > 0)
     }
 
+    pub async fn get_folder_title(
+        pool: &SqlitePool,
+        folder_id: &str,
+    ) -> Result<Option<String>, SqlxError> {
+        sqlx::query_scalar("SELECT title FROM folders WHERE id = ?")
+            .bind(folder_id)
+            .fetch_optional(pool)
+            .await
+    }
+
+    pub async fn get_meeting_folder_path(
+        pool: &SqlitePool,
+        meeting_id: &str,
+    ) -> Result<Option<String>, SqlxError> {
+        sqlx::query_scalar("SELECT folder_path FROM meetings WHERE id = ?")
+            .bind(meeting_id)
+            .fetch_optional(pool)
+            .await
+            .map(|row: Option<Option<String>>| row.flatten())
+    }
+
+    pub async fn update_meeting_folder_path(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        folder_path: &str,
+    ) -> Result<bool, SqlxError> {
+        let result = sqlx::query("UPDATE meetings SET folder_path = ? WHERE id = ?")
+            .bind(folder_path)
+            .bind(meeting_id)
+            .execute(pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// (meeting_id, folder_path) of every meeting in a sidebar folder.
+    pub async fn get_meeting_paths_in_folder(
+        pool: &SqlitePool,
+        folder_id: &str,
+    ) -> Result<Vec<(String, Option<String>)>, SqlxError> {
+        sqlx::query_as("SELECT id, folder_path FROM meetings WHERE folder_id = ?")
+            .bind(folder_id)
+            .fetch_all(pool)
+            .await
+    }
+
     /// Move a meeting into a folder (None = top level).
     pub async fn set_meeting_folder(
         pool: &SqlitePool,
