@@ -712,6 +712,7 @@ async fn run_retranscription<R: Runtime>(
         let stats = boundary_refine::refine_turns(
             &app,
             &mut turns,
+            &diarized_segments,
             Some(&audio_samples[..]),
             || RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst),
             move |done, total| {
@@ -726,8 +727,8 @@ async fn run_retranscription<R: Runtime>(
         )
         .await;
         info!(
-            "Boundary refinement: {} sandwiches ({} merged), {} tight boundaries, {} queried, {} moved ({} acoustic, {} confirmed), {} failures",
-            stats.sandwiches, stats.merged, stats.boundaries, stats.queried, stats.moved,
+            "Boundary refinement: {} sandwiches ({} merged, {} kept by voice), {} tight boundaries, {} queried, {} moved ({} acoustic, {} confirmed), {} failures",
+            stats.sandwiches, stats.merged, stats.kept_voice, stats.boundaries, stats.queried, stats.moved,
             stats.acoustic_moved, stats.acoustic_confirmed, stats.failures
         );
     }
@@ -966,6 +967,7 @@ async fn run_transcript_refinement<R: Runtime>(
         let stats = boundary_refine::refine_turns(
             &app,
             &mut data.turns,
+            &data.diarized,
             audio_16k.as_deref(),
             || RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst),
             move |done, total| {
@@ -980,8 +982,8 @@ async fn run_transcript_refinement<R: Runtime>(
         )
         .await;
         info!(
-            "AI fix-up boundaries: {} sandwiches ({} merged), {} boundaries, {} queried, {} moved ({} acoustic, {} confirmed), {} failures",
-            stats.sandwiches, stats.merged, stats.boundaries, stats.queried, stats.moved,
+            "AI fix-up boundaries: {} sandwiches ({} merged, {} kept by voice), {} boundaries, {} queried, {} moved ({} acoustic, {} confirmed), {} failures",
+            stats.sandwiches, stats.merged, stats.kept_voice, stats.boundaries, stats.queried, stats.moved,
             stats.acoustic_moved, stats.acoustic_confirmed, stats.failures
         );
     }

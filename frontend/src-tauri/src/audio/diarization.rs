@@ -209,6 +209,11 @@ pub struct DiarizedSegment {
     pub start: f32,
     pub end: f32,
     pub speaker: usize,
+    /// The label is confirmed by the span's own voice embedding (or, for the
+    /// stereo local speaker, by the mic channel). Old refine-data lacks the
+    /// field and defaults to unconfirmed.
+    #[serde(default)]
+    pub voice: bool,
 }
 
 struct ModelPaths {
@@ -221,6 +226,8 @@ struct HelperSegment {
     start: f32,
     end: f32,
     speaker: i32,
+    #[serde(default)]
+    voice: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -266,6 +273,7 @@ pub async fn diarize<R: Runtime>(
             start: s.start,
             end: s.end,
             speaker: s.speaker.max(0) as usize,
+            voice: s.voice,
         })
         .collect();
 
@@ -919,7 +927,7 @@ mod tests {
     use super::*;
 
     fn seg(start: f32, end: f32, speaker: usize) -> DiarizedSegment {
-        DiarizedSegment { start, end, speaker }
+        DiarizedSegment { start, end, speaker, voice: false }
     }
 
     #[test]
@@ -985,7 +993,7 @@ mod tests {
     }
 
     fn d(start: f32, end: f32, speaker: usize) -> DiarizedSegment {
-        DiarizedSegment { start, end, speaker }
+        DiarizedSegment { start, end, speaker, voice: false }
     }
 
     #[test]

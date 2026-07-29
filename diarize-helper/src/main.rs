@@ -122,6 +122,9 @@ const CLEAN_CAP_SECS: f32 = 12.0;
 const MAJOR_MIN_CLEAN_SECS: f32 = 10.0;
 const DEBRIS_MIN_SECS: f32 = 0.25;
 const DEBRIS_VOICE_FLOOR: f32 = 0.60;
+/// Minimum span for the per-segment voice confirmation exported to the app —
+/// sub-second embeddings are coin flips (2026-07-29 calibration).
+const VOICE_CONFIRM_MIN_SECS: f32 = 1.0;
 
 struct EmbeddingExtractor {
     ptr: *const sys::SpeakerEmbeddingExtractor,
@@ -225,18 +228,23 @@ fn embed_span(
 /// other segment) vote on cluster identity — overlapped spans carry mixed
 /// voices and previously made split halves of one voice look distinct.
 /// Segments are expected to be sorted by start time.
+///
+/// Returns one flag per segment: true when the segment's final label is
+/// voice-confirmed (>= VOICE_CONFIRM_MIN_SECS, its own centroid is the best
+/// match, cos >= DEBRIS_VOICE_FLOOR). Downstream text passes use this to
+/// keep short interjections the labels prove are a different speaker.
 fn repair_oversplit(
     segments: &mut [sys::OfflineSpeakerDiarizationSegment],
     samples: &[f32],
     sample_rate: i32,
     extractor: &EmbeddingExtractor,
     merge_threshold: f32,
-) {
+) -> Vec<bool> {
     use std::collections::HashMap;
 
     let n = segments.len();
     if n < 2 {
-        return;
+        return vec![false; n];
     }
 
     let mut clean = vec![false; n];
@@ -296,7 +304,7 @@ fn repair_oversplit(
     majors.sort_unstable();
     if majors.is_empty() {
         eprintln!("oversplit: no cluster has enough clean speech; leaving clusters unchanged");
-        return;
+        return vec![false; n];
     }
 
     // Iteratively merge the closest major pair while it clears the bar.
@@ -403,6 +411,31 @@ fn repair_oversplit(
             by_time
         );
     }
+
+    // Per-segment voice confirmation of the final labels, exported to the
+    // app: does this span's own voice actually sound like its speaker?
+    let mut voice = vec![false; n];
+    let mut confirmed = 0usize;
+    for i in 0..n {
+        let (s0, e0) = (segments[i].start, segments[i].end);
+        if e0 - s0 < VOICE_CONFIRM_MIN_SECS {
+            continue;
+        }
+        let Some(v) = embed_span(extractor, samples, sample_rate, s0, e0) else {
+            continue;
+        };
+        let bm = majors
+            .iter()
+            .map(|m| (cosine(&v, &centroids[m]), *m))
+            .fold((f32::MIN, -1), |acc, c| if c.0 > acc.0 { c } else { acc });
+        voice[i] = bm.1 == segments[i].speaker && bm.0 >= DEBRIS_VOICE_FLOOR;
+        confirmed += voice[i] as usize;
+    }
+    eprintln!(
+        "oversplit: voice-confirmed {} of {} segment(s) (>= {:.1}s)",
+        confirmed, n, VOICE_CONFIRM_MIN_SECS
+    );
+    voice
 }
 
 #[derive(Parser, Debug)]
@@ -444,6 +477,8 @@ struct Segment {
     start: f32,
     end: f32,
     speaker: i32,
+    /// The final label is confirmed by this span's own voice embedding.
+    voice: bool,
 }
 
 #[derive(Serialize)]
@@ -581,6 +616,7 @@ fn run(args: Args) -> Result<Output> {
 
     let mut raw_segments = result.sort_by_start_time();
 
+    let mut voice_flags = vec![false; raw_segments.len()];
     if args.merge_threshold > 0.0 && !raw_segments.is_empty() {
         let extractor_config = sys::SpeakerEmbeddingExtractorConfig {
             model: emb_model.as_ptr(),
@@ -589,13 +625,15 @@ fn run(args: Args) -> Result<Output> {
             provider: cpu_provider.as_ptr(),
         };
         match EmbeddingExtractor::create(&extractor_config) {
-            Some(extractor) => repair_oversplit(
-                &mut raw_segments,
-                &samples,
-                sample_rate as i32,
-                &extractor,
-                args.merge_threshold,
-            ),
+            Some(extractor) => {
+                voice_flags = repair_oversplit(
+                    &mut raw_segments,
+                    &samples,
+                    sample_rate as i32,
+                    &extractor,
+                    args.merge_threshold,
+                )
+            }
             None => eprintln!("oversplit: failed to create embedding extractor; skipping repair"),
         }
     }
@@ -609,13 +647,15 @@ fn run(args: Args) -> Result<Output> {
 
     let segments = raw_segments
         .into_iter()
-        .map(|s| Segment {
+        .zip(voice_flags)
+        .map(|(s, voice)| Segment {
             start: s.start,
             end: s.end,
             speaker: speaker_ids
                 .iter()
                 .position(|&id| id == s.speaker)
                 .expect("speaker id was just collected above") as i32,
+            voice,
         })
         .collect();
 
