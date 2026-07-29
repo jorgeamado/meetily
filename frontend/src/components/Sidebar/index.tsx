@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useMemo, useEffect, useCallback } from 'react';
-import { ChevronDown, ChevronRight, File, Settings, ChevronLeftCircle, ChevronRightCircle, Calendar, StickyNote, Home, Trash2, Mic, Square, Plus, Search, Pencil, NotebookPen, SearchIcon, X, Upload, Check, Loader2 } from 'lucide-react';
+import { ChevronDown, ChevronRight, File, Settings, ChevronLeftCircle, ChevronRightCircle, Calendar, StickyNote, Home, Trash2, Mic, Square, Plus, Search, Pencil, NotebookPen, SearchIcon, X, Upload, Check, Loader2, Folder, FolderOpen, FolderInput, FolderPlus } from 'lucide-react';
 import { useRouter, usePathname } from 'next/navigation';
 import { useSidebar } from './SidebarProvider';
 import type { CurrentMeeting } from '@/components/Sidebar/SidebarProvider';
@@ -57,7 +57,12 @@ const Sidebar: React.FC = () => {
     serverAddress,
     meetingActivity,
     recentlyCompleted,
-    acknowledgeCompletion
+    acknowledgeCompletion,
+    folders,
+    createFolder,
+    renameFolder,
+    deleteFolder,
+    moveMeetingToFolder
   } = useSidebar();
 
   // Get recording state from RecordingStateContext (single source of truth)
@@ -87,6 +92,78 @@ const Sidebar: React.FC = () => {
     currentTitle: ''
   });
   const [editingTitle, setEditingTitle] = useState<string>('');
+
+  // Folder create/rename dialog (folderId null = create)
+  const [folderEditState, setFolderEditState] = useState<{ isOpen: boolean; folderId: string | null }>({
+    isOpen: false,
+    folderId: null
+  });
+  const [folderTitleDraft, setFolderTitleDraft] = useState<string>('');
+  const [folderDeleteState, setFolderDeleteState] = useState<{ isOpen: boolean; folderId: string | null }>({
+    isOpen: false,
+    folderId: null
+  });
+  // Move-to-folder dialog
+  const [moveModalState, setMoveModalState] = useState<{ isOpen: boolean; meetingId: string | null }>({
+    isOpen: false,
+    meetingId: null
+  });
+  const [moveNewFolderName, setMoveNewFolderName] = useState<string>('');
+
+  const handleFolderSave = async () => {
+    const title = folderTitleDraft.trim();
+    if (!title) {
+      toast.error('Folder name cannot be empty');
+      return;
+    }
+    if (folderEditState.folderId) {
+      const ok = await renameFolder(folderEditState.folderId, title);
+      if (ok) toast.success('Folder renamed'); else toast.error('Failed to rename folder');
+    } else {
+      const folder = await createFolder(title);
+      if (folder) {
+        toast.success(`Folder "${title}" created`);
+        setExpandedFolders(prev => new Set(prev).add(folder.id));
+      } else {
+        toast.error('Failed to create folder');
+      }
+    }
+    setFolderEditState({ isOpen: false, folderId: null });
+    setFolderTitleDraft('');
+  };
+
+  const handleFolderDeleteConfirm = async () => {
+    if (folderDeleteState.folderId) {
+      const ok = await deleteFolder(folderDeleteState.folderId);
+      if (ok) toast.success('Folder deleted — its meetings moved to the top level');
+      else toast.error('Failed to delete folder');
+    }
+    setFolderDeleteState({ isOpen: false, folderId: null });
+  };
+
+  const handleMoveTo = async (folderId: string | null) => {
+    if (!moveModalState.meetingId) return;
+    const ok = await moveMeetingToFolder(moveModalState.meetingId, folderId);
+    if (ok) {
+      if (folderId) setExpandedFolders(prev => new Set(prev).add(folderId));
+      toast.success(folderId ? 'Meeting moved' : 'Meeting moved to top level');
+    } else {
+      toast.error('Failed to move meeting');
+    }
+    setMoveModalState({ isOpen: false, meetingId: null });
+    setMoveNewFolderName('');
+  };
+
+  const handleMoveToNewFolder = async () => {
+    const title = moveNewFolderName.trim();
+    if (!title || !moveModalState.meetingId) return;
+    const folder = await createFolder(title);
+    if (!folder) {
+      toast.error('Failed to create folder');
+      return;
+    }
+    await handleMoveTo(folder.id);
+  };
 
   // Ensure 'meetings' folder is always expanded
   useEffect(() => {
@@ -258,67 +335,32 @@ const Sidebar: React.FC = () => {
     }
   }, [expandedFolders, searchTranscripts]);
 
-  // Combine search results with sidebar items
+  // Combine search results with sidebar items. Recursive: user folders live
+  // inside the top-level "Meeting Notes" folder, and their meetings must be
+  // searchable too. A folder survives if it matches or contains a match.
   const filteredSidebarItems = useMemo(() => {
     if (!searchQuery.trim()) return sidebarItems;
 
-    // If we have search results, highlight matching meetings
-    if (searchResults.length > 0) {
-      // Get the IDs of meetings that matched in transcripts
-      const matchedMeetingIds = new Set(searchResults.map(result => result.id));
+    const query = searchQuery.toLowerCase();
+    const matchedMeetingIds = new Set(searchResults.map(result => result.id));
 
-      return sidebarItems
-        .map(folder => {
-          // Always include folders in the results
-          if (folder.type === 'folder') {
-            if (!folder.children) return folder;
-
-            // Filter children based on search results or title match
-            const filteredChildren = folder.children.filter(item => {
-              // Include if the meeting ID is in our search results
-              if (matchedMeetingIds.has(item.id)) return true;
-
-              // Or if the title matches the search query
-              return item.title.toLowerCase().includes(searchQuery.toLowerCase());
-            });
-
-            return {
-              ...folder,
-              children: filteredChildren
-            };
+    const filterItems = (items: SidebarItem[], keepTopFolder: boolean): SidebarItem[] =>
+      items
+        .map(item => {
+          if (item.type === 'folder') {
+            const children = filterItems(item.children ?? [], false);
+            if (keepTopFolder || children.length > 0 || item.title.toLowerCase().includes(query)) {
+              return { ...item, children };
+            }
+            return undefined;
           }
-
-          // For non-folder items, check if they match the search
-          return (matchedMeetingIds.has(folder.id) ||
-            folder.title.toLowerCase().includes(searchQuery.toLowerCase()))
-            ? folder : undefined;
+          return (matchedMeetingIds.has(item.id) || item.title.toLowerCase().includes(query))
+            ? item : undefined;
         })
-        .filter((item): item is SidebarItem => item !== undefined); // Type-safe filter
-    } else {
-      // Fall back to title-only filtering if no transcript results
-      return sidebarItems
-        .map(folder => {
-          // Always include folders in the results
-          if (folder.type === 'folder') {
-            if (!folder.children) return folder;
+        .filter((item): item is SidebarItem => item !== undefined);
 
-            // Filter children based on search query
-            const filteredChildren = folder.children.filter(item =>
-              item.title.toLowerCase().includes(searchQuery.toLowerCase())
-            );
-
-            return {
-              ...folder,
-              children: filteredChildren
-            };
-          }
-
-          // For non-folder items, check if they match the search
-          return folder.title.toLowerCase().includes(searchQuery.toLowerCase()) ? folder : undefined;
-        })
-        .filter((item): item is SidebarItem => item !== undefined); // Type-safe filter
-    }
-  }, [sidebarItems, searchQuery, searchResults, expandedFolders]);
+    return filterItems(sidebarItems, true);
+  }, [sidebarItems, searchQuery, searchResults]);
 
 
   const handleDelete = async (itemId: string) => {
@@ -573,8 +615,22 @@ const Sidebar: React.FC = () => {
     refining: 'AI fix-up',
   } as Record<string, string>)[stage] ?? stage;
 
+  // "Jul 28" this year, "Jul 28, 2025" otherwise
+  const formatDate = (iso?: string) => {
+    if (!iso) return null;
+    const d = new Date(iso);
+    if (isNaN(d.getTime())) return null;
+    const sameYear = d.getFullYear() === new Date().getFullYear();
+    return d.toLocaleDateString('en-US', {
+      month: 'short',
+      day: 'numeric',
+      ...(sameYear ? {} : { year: 'numeric' })
+    });
+  };
+
   const renderItem = (item: SidebarItem, depth = 0) => {
-    const isExpanded = expandedFolders.has(item.id);
+    // While searching, matches inside collapsed folders must be visible
+    const isExpanded = expandedFolders.has(item.id) || !!searchQuery.trim();
     const paddingLeft = `${depth * 12 + 12}px`;
     const isActive = item.type === 'file' && currentMeeting?.id === item.id;
     const isMeetingItem = item.id.includes('-') && !item.id.startsWith('intro-call');
@@ -615,13 +671,45 @@ const Sidebar: React.FC = () => {
         >
           {item.type === 'folder' ? (
             <>
-              {item.id === 'meetings' ? (
+              {item.id === 'meetings' || item.id === 'notes' ? (
                 <Calendar className="w-4 h-4 mr-2" />
-              ) : item.id === 'notes' ? (
-                <Calendar className="w-4 h-4 mr-2" />
-              ) : null}
-              <span className={depth === 0 ? "" : "font-medium"}>{item.title}</span>
-              <div className="ml-auto">
+              ) : isExpanded ? (
+                <FolderOpen className="w-4 h-4 mr-2 flex-shrink-0 text-gray-500" />
+              ) : (
+                <Folder className="w-4 h-4 mr-2 flex-shrink-0 text-gray-500" />
+              )}
+              <span className={`min-w-0 truncate ${depth === 0 ? "" : "font-medium"}`} title={item.title}>{item.title}</span>
+              {depth > 0 && (
+                <span className="ml-1.5 flex-shrink-0 text-[11px] text-gray-400">
+                  {item.children?.length ?? 0}
+                </span>
+              )}
+              {depth > 0 && (
+                <div className="hidden group-hover:flex items-center gap-1 flex-shrink-0 ml-auto">
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setFolderTitleDraft(item.title);
+                      setFolderEditState({ isOpen: true, folderId: item.id });
+                    }}
+                    className="hover:text-blue-600 p-1 rounded-md hover:bg-blue-50"
+                    aria-label="Rename folder"
+                  >
+                    <Pencil className="w-4 h-4" />
+                  </button>
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      setFolderDeleteState({ isOpen: true, folderId: item.id });
+                    }}
+                    className="hover:text-red-600 p-1 rounded-md hover:bg-red-50"
+                    aria-label="Delete folder"
+                  >
+                    <Trash2 className="w-4 h-4" />
+                  </button>
+                </div>
+              )}
+              <div className={depth > 0 ? "group-hover:hidden ml-auto" : "ml-auto"}>
                 {isExpanded ? (
                   <ChevronDown className="w-4 h-4 text-gray-500" />
                 ) : (
@@ -659,14 +747,18 @@ const Sidebar: React.FC = () => {
                 <span className="flex-1 min-w-0 truncate" title={item.title}>
                   {item.title}
                 </span>
-                {/* Fixed trailing slot: duration normally, actions on hover */}
-                {isMeetingItem && durationSeconds != null && (
-                  <span className={`flex-shrink-0 ml-1 text-[11px] text-gray-400 tabular-nums ${activity ? '' : 'group-hover:hidden'}`}>
-                    {formatDuration(durationSeconds)}
-                  </span>
-                )}
                 {isMeetingItem && !activity && (
                   <div className="hidden group-hover:flex items-center gap-1 flex-shrink-0">
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        setMoveModalState({ isOpen: true, meetingId: item.id });
+                      }}
+                      className="hover:text-blue-600 p-1 rounded-md hover:bg-blue-50 flex-shrink-0"
+                      aria-label="Move to folder"
+                    >
+                      <FolderInput className="w-4 h-4" />
+                    </button>
                     <button
                       onClick={(e) => {
                         e.stopPropagation();
@@ -691,21 +783,29 @@ const Sidebar: React.FC = () => {
                 )}
               </div>
 
-              {/* Status line: live stage while processing, otherwise the
-                  no-transcript hint */}
-              {isMeetingItem && activity && (
+              {/* Meta / status line: live stage while processing, otherwise
+                  recording date · duration (+ the no-transcript hint) */}
+              {isMeetingItem && activity ? (
                 <div className="ml-8 text-[11px] text-blue-600 truncate" title={activity.message}>
                   {stageLabel(activity.stage)} · {activity.progress}%
                 </div>
-              )}
-              {isMeetingItem && !activity && (item as any).hasTranscripts === false && (
-                <div className="ml-8 mt-0.5">
-                  <span
-                    className="inline-block text-[10px] leading-4 px-1.5 rounded-full bg-amber-50 border border-amber-200 text-amber-700"
-                    title="Recorded without live transcription — use Enhance to transcribe"
-                  >
-                    no transcript
-                  </span>
+              ) : isMeetingItem && (
+                <div className="ml-8 flex items-center gap-1.5 text-[11px] text-gray-400 tabular-nums">
+                  {formatDate((item as any).createdAt) && <span>{formatDate((item as any).createdAt)}</span>}
+                  {durationSeconds != null && (
+                    <>
+                      {formatDate((item as any).createdAt) && <span>·</span>}
+                      <span>{formatDuration(durationSeconds)}</span>
+                    </>
+                  )}
+                  {(item as any).hasTranscripts === false && (
+                    <span
+                      className="inline-block text-[10px] leading-4 px-1.5 rounded-full bg-amber-50 border border-amber-200 text-amber-700"
+                      title="Recorded without live transcription — use Enhance to transcribe"
+                    >
+                      no transcript
+                    </span>
+                  )}
                 </div>
               )}
 
@@ -819,12 +919,25 @@ const Sidebar: React.FC = () => {
                 {filteredSidebarItems.filter(item => item.type === 'folder').map(item => (
                   <div key={item.id}>
                     <div
-                      className="flex items-center transition-all duration-150 p-3 text-lg font-semibold h-10 mx-3 mt-3 rounded-lg"
+                      className="flex items-center transition-all duration-150 p-3 text-lg font-semibold h-10 mx-3 mt-3 rounded-lg group"
                     >
                       <NotebookPen className="w-4 h-4 mr-2 text-gray-600" />
                       <span className="text-gray-700">{item.title}</span>
                       {searchQuery && item.id === 'meetings' && isSearching && (
                         <span className="ml-2 text-xs text-blue-500 animate-pulse">Searching...</span>
+                      )}
+                      {item.id === 'meetings' && (
+                        <button
+                          onClick={() => {
+                            setFolderTitleDraft('');
+                            setFolderEditState({ isOpen: true, folderId: null });
+                          }}
+                          className="ml-auto p-1 rounded-md text-gray-400 hover:text-blue-600 hover:bg-blue-50"
+                          title="New folder"
+                          aria-label="New folder"
+                        >
+                          <FolderPlus className="w-4 h-4" />
+                        </button>
                       )}
                     </div>
                   </div>
@@ -901,6 +1014,122 @@ const Sidebar: React.FC = () => {
         onConfirm={handleDeleteConfirm}
         onCancel={() => setDeleteModalState({ isOpen: false, itemId: null })}
       />
+
+      {/* Confirmation Modal for Folder Delete */}
+      <ConfirmationModal
+        isOpen={folderDeleteState.isOpen}
+        text="Delete this folder? Its meetings are kept and move back to the top level."
+        onConfirm={handleFolderDeleteConfirm}
+        onCancel={() => setFolderDeleteState({ isOpen: false, folderId: null })}
+      />
+
+      {/* Create / Rename Folder */}
+      <Dialog open={folderEditState.isOpen} onOpenChange={(open) => {
+        if (!open) { setFolderEditState({ isOpen: false, folderId: null }); setFolderTitleDraft(''); }
+      }}>
+        <DialogContent className="sm:max-w-[425px]">
+          <VisuallyHidden>
+            <DialogTitle>{folderEditState.folderId ? 'Rename Folder' : 'New Folder'}</DialogTitle>
+          </VisuallyHidden>
+          <div className="py-4">
+            <h3 className="text-lg font-semibold mb-4">{folderEditState.folderId ? 'Rename Folder' : 'New Folder'}</h3>
+            <input
+              type="text"
+              value={folderTitleDraft}
+              onChange={(e) => setFolderTitleDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') handleFolderSave();
+                else if (e.key === 'Escape') { setFolderEditState({ isOpen: false, folderId: null }); setFolderTitleDraft(''); }
+              }}
+              className="w-full px-3 py-2 border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+              placeholder="Folder name"
+              autoFocus
+            />
+          </div>
+          <DialogFooter>
+            <button
+              onClick={() => { setFolderEditState({ isOpen: false, folderId: null }); setFolderTitleDraft(''); }}
+              className="px-4 py-2 text-sm font-medium text-gray-700 bg-gray-100 hover:bg-gray-200 rounded-md transition-colors"
+            >
+              Cancel
+            </button>
+            <button
+              onClick={handleFolderSave}
+              className="px-4 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 rounded-md transition-colors"
+            >
+              {folderEditState.folderId ? 'Save' : 'Create'}
+            </button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
+
+      {/* Move meeting to folder */}
+      <Dialog open={moveModalState.isOpen} onOpenChange={(open) => {
+        if (!open) { setMoveModalState({ isOpen: false, meetingId: null }); setMoveNewFolderName(''); }
+      }}>
+        <DialogContent className="sm:max-w-[425px]">
+          <VisuallyHidden>
+            <DialogTitle>Move to Folder</DialogTitle>
+          </VisuallyHidden>
+          <div className="py-4">
+            <h3 className="text-lg font-semibold mb-4">Move to Folder</h3>
+            <div className="space-y-1 max-h-64 overflow-y-auto">
+              {(() => {
+                const meeting = meetings.find((m: CurrentMeeting) => m.id === moveModalState.meetingId);
+                const currentFolderId = meeting?.folder_id ?? null;
+                return (
+                  <>
+                    {currentFolderId && (
+                      <button
+                        onClick={() => handleMoveTo(null)}
+                        className="w-full flex items-center px-3 py-2 text-sm rounded-md hover:bg-gray-100 text-left"
+                      >
+                        <X className="w-4 h-4 mr-2 text-gray-500" />
+                        Remove from folder
+                      </button>
+                    )}
+                    {folders.map(folder => (
+                      <button
+                        key={folder.id}
+                        onClick={() => handleMoveTo(folder.id)}
+                        disabled={folder.id === currentFolderId}
+                        className={`w-full flex items-center px-3 py-2 text-sm rounded-md text-left ${folder.id === currentFolderId
+                          ? 'bg-blue-50 text-blue-700 cursor-default'
+                          : 'hover:bg-gray-100'
+                          }`}
+                      >
+                        <Folder className="w-4 h-4 mr-2 text-gray-500 flex-shrink-0" />
+                        <span className="truncate">{folder.title}</span>
+                        {folder.id === currentFolderId && <Check className="w-4 h-4 ml-auto" />}
+                      </button>
+                    ))}
+                    {folders.length === 0 && (
+                      <div className="px-3 py-2 text-sm text-gray-500">No folders yet — create one below.</div>
+                    )}
+                  </>
+                );
+              })()}
+            </div>
+            <div className="mt-3 flex gap-2">
+              <input
+                type="text"
+                value={moveNewFolderName}
+                onChange={(e) => setMoveNewFolderName(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') handleMoveToNewFolder(); }}
+                className="flex-1 px-3 py-2 text-sm border border-gray-300 rounded-md focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+                placeholder="New folder…"
+              />
+              <button
+                onClick={handleMoveToNewFolder}
+                disabled={!moveNewFolderName.trim()}
+                className="px-3 py-2 text-sm font-medium text-white bg-blue-600 hover:bg-blue-700 disabled:bg-gray-300 rounded-md transition-colors"
+              >
+                Create & move
+              </button>
+            </div>
+          </div>
+        </DialogContent>
+      </Dialog>
 
       {/* Edit Meeting Title Modal */}
       <Dialog open={editModalState.isOpen} onOpenChange={(open) => {

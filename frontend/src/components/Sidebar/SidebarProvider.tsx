@@ -13,6 +13,7 @@ interface SidebarItem {
   type: 'folder' | 'file';
   hasTranscripts?: boolean;
   durationSeconds?: number | null;
+  createdAt?: string;
   children?: SidebarItem[];
 }
 
@@ -21,6 +22,13 @@ export interface CurrentMeeting {
   title: string;
   has_transcripts?: boolean;
   duration_seconds?: number | null;
+  created_at?: string;
+  folder_id?: string | null;
+}
+
+export interface MeetingFolder {
+  id: string;
+  title: string;
 }
 
 /// Live processing state for a meeting (transcription/retranscription/AI fix-up)
@@ -68,6 +76,12 @@ interface SidebarContextType {
   recentlyCompleted: Set<string>;
   // Clear the completion marker (called when the meeting is opened)
   acknowledgeCompletion: (meetingId: string) => void;
+  // User folders for organizing meetings
+  folders: MeetingFolder[];
+  createFolder: (title: string) => Promise<MeetingFolder | null>;
+  renameFolder: (folderId: string, title: string) => Promise<boolean>;
+  deleteFolder: (folderId: string) => Promise<boolean>;
+  moveMeetingToFolder: (meetingId: string, folderId: string | null) => Promise<boolean>;
 }
 
 const SidebarContext = createContext<SidebarContextType | null>(null);
@@ -98,18 +112,27 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
 
-  // Extract fetchMeetings as a reusable function
+  const [folders, setFolders] = useState<MeetingFolder[]>([]);
+
+  // Extract fetchMeetings as a reusable function (folders come along — the
+  // sidebar tree needs both to stay consistent)
   const fetchMeetings = React.useCallback(async () => {
     if (serverAddress) {
       try {
-        const meetings = await invoke('api_get_meetings') as Array<{ id: string, title: string, has_transcripts?: boolean, duration_seconds?: number | null }>;
+        const [meetings, folderList] = await Promise.all([
+          invoke('api_get_meetings') as Promise<Array<CurrentMeeting>>,
+          (invoke('api_list_folders') as Promise<MeetingFolder[]>).catch(() => [] as MeetingFolder[]),
+        ]);
         const transformedMeetings = meetings.map((meeting: any) => ({
           id: meeting.id,
           title: meeting.title,
           has_transcripts: meeting.has_transcripts,
-          duration_seconds: meeting.duration_seconds
+          duration_seconds: meeting.duration_seconds,
+          created_at: meeting.created_at,
+          folder_id: meeting.folder_id
         }));
         setMeetings(transformedMeetings);
+        setFolders(folderList);
         Analytics.trackBackendConnection(true);
       } catch (error) {
         console.error('Error fetching meetings:', error);
@@ -118,6 +141,51 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       }
     }
   }, [serverAddress]);
+
+  const createFolder = React.useCallback(async (title: string): Promise<MeetingFolder | null> => {
+    try {
+      const folder = await invoke('api_create_folder', { title }) as MeetingFolder;
+      setFolders(prev => [...prev, folder].sort((a, b) => a.title.localeCompare(b.title)));
+      return folder;
+    } catch (error) {
+      console.error('Failed to create folder:', error);
+      return null;
+    }
+  }, []);
+
+  const renameFolder = React.useCallback(async (folderId: string, title: string) => {
+    try {
+      await invoke('api_rename_folder', { folderId, title });
+      setFolders(prev => prev.map(f => f.id === folderId ? { ...f, title } : f));
+      return true;
+    } catch (error) {
+      console.error('Failed to rename folder:', error);
+      return false;
+    }
+  }, []);
+
+  const deleteFolder = React.useCallback(async (folderId: string) => {
+    try {
+      await invoke('api_delete_folder', { folderId });
+      setFolders(prev => prev.filter(f => f.id !== folderId));
+      setMeetings(prev => prev.map(m => m.folder_id === folderId ? { ...m, folder_id: null } : m));
+      return true;
+    } catch (error) {
+      console.error('Failed to delete folder:', error);
+      return false;
+    }
+  }, []);
+
+  const moveMeetingToFolder = React.useCallback(async (meetingId: string, folderId: string | null) => {
+    try {
+      await invoke('api_set_meeting_folder', { meetingId, folderId });
+      setMeetings(prev => prev.map(m => m.id === meetingId ? { ...m, folder_id: folderId } : m));
+      return true;
+    } catch (error) {
+      console.error('Failed to move meeting:', error);
+      return false;
+    }
+  }, []);
 
   // Track background transcription/fix-up runs app-wide so the meeting list
   // can show progress and completion regardless of which page is open.
@@ -197,20 +265,46 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     fetchSettings();
   }, []);
 
+  const meetingToItem = (meeting: CurrentMeeting): SidebarItem => ({
+    id: meeting.id,
+    title: meeting.title,
+    type: 'file' as const,
+    hasTranscripts: meeting.has_transcripts !== false,
+    durationSeconds: meeting.duration_seconds ?? null,
+    createdAt: meeting.created_at
+  });
+
+  // Newest first (backend already sorts, but folder grouping re-partitions)
+  const byDateDesc = (a: CurrentMeeting, b: CurrentMeeting) =>
+    (b.created_at ?? '').localeCompare(a.created_at ?? '');
+
+  const folderNodes: SidebarItem[] = folders
+    .map(folder => {
+      const inFolder = meetings.filter(m => m.folder_id === folder.id).sort(byDateDesc);
+      return {
+        id: folder.id,
+        title: folder.title,
+        type: 'folder' as const,
+        children: inFolder.map(meetingToItem)
+      };
+    })
+    // Folders with recent activity first; empty folders last, alphabetical
+    .sort((a, b) => {
+      const newest = (n: SidebarItem) => n.children?.[0]?.createdAt ?? '';
+      return newest(b).localeCompare(newest(a)) || a.title.localeCompare(b.title);
+    });
+
+  const ungrouped = meetings
+    .filter(m => !m.folder_id || !folders.some(f => f.id === m.folder_id))
+    .sort(byDateDesc)
+    .map(meetingToItem);
+
   const baseItems: SidebarItem[] = [
     {
       id: 'meetings',
       title: 'Meeting Notes',
       type: 'folder' as const,
-      children: [
-        ...meetings.map(meeting => ({
-          id: meeting.id,
-          title: meeting.title,
-          type: 'file' as const,
-          hasTranscripts: meeting.has_transcripts !== false,
-          durationSeconds: meeting.duration_seconds ?? null
-        }))
-      ]
+      children: [...folderNodes, ...ungrouped]
     },
   ];
 
@@ -227,10 +321,10 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     setSidebarItems(baseItems);
   }, [pathname]);
 
-  // Update sidebar items when meetings change
+  // Update sidebar items when meetings or folders change
   useEffect(() => {
     setSidebarItems(baseItems);
-  }, [meetings]);
+  }, [meetings, folders]);
 
   // Function to handle recording toggle from sidebar
   const handleRecordingToggle = () => {
@@ -405,6 +499,11 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       meetingActivity,
       recentlyCompleted,
       acknowledgeCompletion,
+      folders,
+      createFolder,
+      renameFolder,
+      deleteFolder,
+      moveMeetingToFolder,
     }}>
       {children}
     </SidebarContext.Provider>

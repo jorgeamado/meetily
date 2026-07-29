@@ -19,6 +19,18 @@ pub struct MeetingModel {
     #[sqlx(default)]
     #[serde(default)]
     pub duration_seconds: Option<f64>,
+    /// User folder this meeting belongs to (sidebar organization); NULL = top level
+    #[sqlx(default)]
+    #[serde(default)]
+    pub folder_id: Option<String>,
+}
+
+/// User-created sidebar folder for organizing meetings
+#[derive(Debug, Clone, FromRow, Serialize, Deserialize)]
+pub struct FolderModel {
+    pub id: String,
+    pub title: String,
+    pub created_at: DateTimeUtc,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, sqlx::Type)]
