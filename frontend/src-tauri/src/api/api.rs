@@ -37,6 +37,18 @@ pub struct Meeting {
     /// Recording length in seconds (None when no transcripts exist yet)
     #[serde(default)]
     pub duration_seconds: Option<f64>,
+    /// Recording date (RFC3339) — the list is sorted by this, newest first
+    #[serde(default)]
+    pub created_at: String,
+    /// Sidebar folder the meeting lives in (None = top level)
+    #[serde(default)]
+    pub folder_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct Folder {
+    pub id: String,
+    pub title: String,
 }
 
 fn default_true() -> bool {
@@ -366,6 +378,8 @@ pub async fn api_get_meetings<R: Runtime>(
                     title: m.title,
                     has_transcripts: m.transcript_count > 0,
                     duration_seconds: m.duration_seconds,
+                    created_at: m.created_at.0.to_rfc3339(),
+                    folder_id: m.folder_id,
                 })
                 .collect();
             Ok(result)
@@ -980,6 +994,85 @@ pub async fn api_get_meeting_transcripts<R: Runtime>(
             log_error!("Error retrieving transcripts for meeting {}: {}", meeting_id, e);
             Err(format!("Failed to retrieve transcripts: {}", e))
         }
+    }
+}
+
+
+#[tauri::command]
+pub async fn api_list_folders<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+) -> Result<Vec<Folder>, String> {
+    let pool = state.db_manager.pool();
+    MeetingsRepository::get_folders(pool)
+        .await
+        .map(|fs| fs.into_iter().map(|f| Folder { id: f.id, title: f.title }).collect())
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn api_create_folder<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    title: String,
+) -> Result<Folder, String> {
+    let title = title.trim().to_string();
+    if title.is_empty() {
+        return Err("Folder name cannot be empty".to_string());
+    }
+    let id = format!("folder-{}", uuid::Uuid::new_v4());
+    let pool = state.db_manager.pool();
+    MeetingsRepository::create_folder(pool, &id, &title)
+        .await
+        .map(|_| Folder { id, title })
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+pub async fn api_rename_folder<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    folder_id: String,
+    title: String,
+) -> Result<(), String> {
+    let title = title.trim().to_string();
+    if title.is_empty() {
+        return Err("Folder name cannot be empty".to_string());
+    }
+    let pool = state.db_manager.pool();
+    match MeetingsRepository::rename_folder(pool, &folder_id, &title).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!("No folder found with id {}", folder_id)),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub async fn api_delete_folder<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    folder_id: String,
+) -> Result<(), String> {
+    let pool = state.db_manager.pool();
+    match MeetingsRepository::delete_folder(pool, &folder_id).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!("No folder found with id {}", folder_id)),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+#[tauri::command]
+pub async fn api_set_meeting_folder<R: Runtime>(
+    _app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    meeting_id: String,
+    folder_id: Option<String>,
+) -> Result<(), String> {
+    let pool = state.db_manager.pool();
+    match MeetingsRepository::set_meeting_folder(pool, &meeting_id, folder_id.as_deref()).await {
+        Ok(true) => Ok(()),
+        Ok(false) => Err(format!("No meeting found with id {}", meeting_id)),
+        Err(e) => Err(e.to_string()),
     }
 }
 

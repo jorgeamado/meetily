@@ -1,5 +1,5 @@
 use crate::api::{MeetingDetails, MeetingTranscript};
-use crate::database::models::{MeetingModel, Transcript};
+use crate::database::models::{FolderModel, MeetingModel, Transcript};
 use chrono::Utc;
 use sqlx::{Connection, Error as SqlxError, SqliteConnection, SqlitePool};
 use tracing::{error, info};
@@ -167,6 +167,69 @@ impl MeetingsRepository {
         .await?;
 
         Ok((transcripts, total.0))
+    }
+
+    pub async fn get_folders(pool: &SqlitePool) -> Result<Vec<FolderModel>, SqlxError> {
+        sqlx::query_as::<_, FolderModel>("SELECT * FROM folders ORDER BY title COLLATE NOCASE")
+            .fetch_all(pool)
+            .await
+    }
+
+    pub async fn create_folder(
+        pool: &SqlitePool,
+        id: &str,
+        title: &str,
+    ) -> Result<(), SqlxError> {
+        sqlx::query("INSERT INTO folders (id, title, created_at) VALUES (?, ?, ?)")
+            .bind(id)
+            .bind(title)
+            .bind(Utc::now().naive_utc())
+            .execute(pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn rename_folder(
+        pool: &SqlitePool,
+        folder_id: &str,
+        title: &str,
+    ) -> Result<bool, SqlxError> {
+        let result = sqlx::query("UPDATE folders SET title = ? WHERE id = ?")
+            .bind(title)
+            .bind(folder_id)
+            .execute(pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Delete a folder; its meetings move back to the top level.
+    pub async fn delete_folder(pool: &SqlitePool, folder_id: &str) -> Result<bool, SqlxError> {
+        let mut conn = pool.acquire().await?;
+        let mut transaction = conn.begin().await?;
+        sqlx::query("UPDATE meetings SET folder_id = NULL WHERE folder_id = ?")
+            .bind(folder_id)
+            .execute(&mut *transaction)
+            .await?;
+        let result = sqlx::query("DELETE FROM folders WHERE id = ?")
+            .bind(folder_id)
+            .execute(&mut *transaction)
+            .await?;
+        transaction.commit().await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Move a meeting into a folder (None = top level).
+    pub async fn set_meeting_folder(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        folder_id: Option<&str>,
+    ) -> Result<bool, SqlxError> {
+        let result = sqlx::query("UPDATE meetings SET folder_id = ? WHERE id = ?")
+            .bind(folder_id)
+            .bind(meeting_id)
+            .execute(pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
     }
 
     pub async fn update_meeting_title(
