@@ -20,6 +20,7 @@ use log::{info, warn};
 use tauri::{AppHandle, Manager, Runtime};
 
 use super::diarization::SpeakerTurn;
+use super::segmentation::{self, SegmentationModel};
 use crate::summary::summary_engine::{self, models};
 
 /// Only boundaries with a gap this small between the last word of one turn
@@ -82,6 +83,10 @@ pub struct RefineStats {
     pub moved: usize,
     pub merged: usize,
     pub failures: usize,
+    /// Cuts decided by frame-level voice-change evidence (no LLM query):
+    /// confirmed in place / moved onto the voice change.
+    pub acoustic_confirmed: usize,
+    pub acoustic_moved: usize,
 }
 
 /// Group a turn's tokens into words: a word starts at token 0 or at a token
@@ -396,6 +401,67 @@ fn apply_shift(left: &mut SpeakerTurn, right: &mut SpeakerTurn, shift: i32) {
     right.rebuild_from_words();
 }
 
+/// The instant (ms) where the cut would fall for a given shift: the middle
+/// of the gap between the last A-side word and the first B-side word.
+pub fn cut_instant_ms(left: &SpeakerTurn, right: &SpeakerTurn, shift: i32) -> Option<f64> {
+    let l_ranges = word_ranges(left);
+    let r_ranges = word_ranges(right);
+    let word_end = |turn: &SpeakerTurn, r: &(usize, usize)| turn.words[r.1 - 1].end_ms;
+    let word_start = |turn: &SpeakerTurn, r: &(usize, usize)| turn.words[r.0].start_ms;
+    let (a_end_ms, b_start_ms) = if shift < 0 {
+        let keep = l_ranges.len().checked_sub((-shift) as usize)?;
+        if keep == 0 {
+            return None;
+        }
+        (
+            word_end(left, l_ranges.get(keep - 1)?),
+            word_start(left, l_ranges.get(keep)?),
+        )
+    } else if shift > 0 {
+        (
+            word_end(right, r_ranges.get(shift as usize - 1)?),
+            word_start(right, r_ranges.get(shift as usize)?),
+        )
+    } else {
+        (word_end(left, l_ranges.last()?), word_start(right, r_ranges.first()?))
+    };
+    Some((a_end_ms + b_start_ms) / 2.0)
+}
+
+/// Frame-level acoustic verdict for one boundary: Some(shift) when exactly
+/// one candidate cut falls on the pause between two different sustained
+/// voices near the current cut (0 = the current cut is confirmed there).
+/// None = no usable evidence; fall through to the LLM.
+///
+/// Deliberately asymmetric: this can reposition or confirm a cut, never
+/// remove one — the segmentation model sometimes hears two real speakers
+/// as one local voice, so "same voice" must not veto a boundary.
+fn acoustic_verdict(
+    seg: &mut SegmentationModel,
+    audio_16k: &[f32],
+    left: &SpeakerTurn,
+    right: &SpeakerTurn,
+    shifts: &[i32],
+) -> Option<i32> {
+    let t_cut = cut_instant_ms(left, right, 0)? / 1000.0;
+    let duration = audio_16k.len() as f64 / segmentation::SAMPLE_RATE as f64;
+    let window_start = (t_cut - segmentation::WINDOW_SECS / 2.0)
+        .clamp(0.0, (duration - segmentation::WINDOW_SECS).max(0.0));
+    let runs = match seg.voice_runs(audio_16k, window_start) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Boundary refine: segmentation window failed: {}", e);
+            return None;
+        }
+    };
+    let gap = segmentation::change_gap_near(&runs, t_cut)?;
+    let instants: Vec<(i32, f64)> = shifts
+        .iter()
+        .filter_map(|&s| cut_instant_ms(left, right, s).map(|ms| (s, ms / 1000.0)))
+        .collect();
+    segmentation::unique_candidate_in_gap(&instants, gap)
+}
+
 /// Pick the best available local model for micro-queries: prefer the smaller
 /// Qwen if downloaded, fall back to any downloaded built-in model.
 pub fn pick_model(app_data_dir: &PathBuf) -> Option<models::ModelDef> {
@@ -468,6 +534,7 @@ impl QueryCtx {
 pub async fn refine_turns<R: Runtime>(
     app: &AppHandle<R>,
     turns: &mut Vec<SpeakerTurn>,
+    audio_16k: Option<&[f32]>,
     cancelled: impl Fn() -> bool,
     mut on_progress: impl FnMut(usize, usize),
 ) -> RefineStats {
@@ -484,6 +551,22 @@ pub async fn refine_turns<R: Runtime>(
         info!("Boundary refine: no local LLM downloaded, skipping");
         return stats;
     };
+
+    // Frame-level acoustic evidence (needs the audio and the downloaded
+    // segmentation model). Unavailable is fine — the LLM path stands alone.
+    let mut seg_model = audio_16k.and_then(|_| {
+        let path = super::diarization::segmentation_model_path(app).ok()?;
+        if !path.exists() {
+            return None;
+        }
+        match SegmentationModel::load(&path) {
+            Ok(m) => Some(m),
+            Err(e) => {
+                warn!("Boundary refine: segmentation model load failed: {}", e);
+                None
+            }
+        }
+    });
     let mut ctx = QueryCtx {
         app_data_dir,
         model_name: model.name.clone(),
@@ -543,6 +626,42 @@ pub async fn refine_turns<R: Runtime>(
             break;
         }
         on_progress(done, total);
+
+        // Acoustic gate: when frame-level segmentation places exactly one
+        // candidate cut on the voice change, the decision is made without
+        // (and above) the LLM — measured stronger than both the local 2B
+        // and a frontier model on the labeled handover cases.
+        if let (Some(seg), Some(audio)) = (seg_model.as_mut(), audio_16k) {
+            let (left_slice, right_slice) = turns.split_at_mut(boundary.left_idx + 1);
+            let left = &mut left_slice[boundary.left_idx];
+            let right = &mut right_slice[0];
+            let l_words = words_text(left, &word_ranges(left));
+            let r_words = words_text(right, &word_ranges(right));
+            let shifts = candidate_shifts(&l_words, &r_words);
+            match acoustic_verdict(seg, audio, left, right, &shifts) {
+                Some(0) => {
+                    info!(
+                        "Boundary refine: acoustic voice change confirms cut at {:.1}s",
+                        right.start_ms / 1000.0
+                    );
+                    stats.acoustic_confirmed += 1;
+                    continue;
+                }
+                Some(shift) => {
+                    info!(
+                        "Boundary refine: acoustic voice change moves {} word(s) {} at {:.1}s",
+                        shift.abs(),
+                        if shift < 0 { "right" } else { "left" },
+                        right.start_ms / 1000.0
+                    );
+                    apply_shift(left, right, shift);
+                    stats.moved += 1;
+                    stats.acoustic_moved += 1;
+                    continue;
+                }
+                None => {}
+            }
+        }
 
         let mut rounds = 0;
         loop {
@@ -644,6 +763,89 @@ mod tests {
             0,
         );
         (left, right)
+    }
+
+    /// Dry-run the acoustic gate against a real meeting folder (no LLM, no
+    /// writes): prints each tight boundary's verdict for inspection.
+    ///
+    ///   BOUNDARY_DRYRUN_FOLDER="~/Movies/meetily-recordings/<meeting>" \
+    ///     cargo test --lib boundary_dryrun -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn boundary_dryrun_on_real_meeting() {
+        let Ok(folder) = std::env::var("BOUNDARY_DRYRUN_FOLDER") else {
+            eprintln!("BOUNDARY_DRYRUN_FOLDER not set");
+            return;
+        };
+        let folder = std::path::PathBuf::from(folder);
+        #[derive(serde::Deserialize)]
+        struct Data {
+            turns: Vec<SpeakerTurn>,
+        }
+        let raw = std::fs::read_to_string(folder.join("refine-data.json")).expect("refine-data.json");
+        let data: Data = serde_json::from_str(&raw).expect("parse refine-data");
+        let decoded = crate::audio::decoder::decode_audio_file(&folder.join("audio.mp4")).expect("decode");
+        let audio = decoded.to_whisper_format();
+        let model_path = dirs::data_dir()
+            .expect("data dir")
+            .join("com.meetily.ai/models/diarization/segmentation-3.0.onnx");
+        let mut seg = SegmentationModel::load(&model_path).expect("segmentation model");
+
+        let turns = data.turns;
+        let boundaries = find_boundaries(&turns);
+        println!("{} turns, {} tight boundaries", turns.len(), boundaries.len());
+        for b in boundaries {
+            let left = &turns[b.left_idx];
+            let right = &turns[b.left_idx + 1];
+            let l_words = words_text(left, &word_ranges(left));
+            let r_words = words_text(right, &word_ranges(right));
+            let shifts = candidate_shifts(&l_words, &r_words);
+            let verdict = acoustic_verdict(&mut seg, &audio, left, right, &shifts);
+            let t = cut_instant_ms(left, right, 0).unwrap_or(0.0) / 1000.0;
+            let tail: Vec<_> = l_words.iter().rev().take(5).rev().cloned().collect();
+            let head: Vec<_> = r_words.iter().take(5).cloned().collect();
+            println!(
+                "t={:7.2}s verdict={:>8} shifts={:?} | ...{} ‖ {}...",
+                t,
+                verdict.map(|s| s.to_string()).unwrap_or_else(|| "none".into()),
+                shifts,
+                tail.join(" "),
+                head.join(" ")
+            );
+            if std::env::var("BOUNDARY_DRYRUN_VERBOSE").is_ok() {
+                let ws = (t - segmentation::WINDOW_SECS / 2.0)
+                    .clamp(0.0, (audio.len() as f64 / 16000.0 - segmentation::WINDOW_SECS).max(0.0));
+                let runs = seg.voice_runs(&audio, ws).unwrap();
+                let speech: Vec<_> = runs
+                    .iter()
+                    .filter(|r| r.class != 0)
+                    .map(|r| format!("{:.2}-{:.2} c{}", r.start, r.end, r.class))
+                    .collect();
+                println!("  speech runs: {:?}", speech);
+                println!("  gap near {:.2}: {:?}", t, segmentation::change_gap_near(&runs, t));
+                println!(
+                    "  instants: {:?}",
+                    shifts
+                        .iter()
+                        .map(|&s| (s, cut_instant_ms(left, right, s).map(|m| (m / 1000.0 * 100.0).round() / 100.0)))
+                        .collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cut_instants_track_word_gaps() {
+        let (left, right) = are_boundary();
+        // Current cut: between "Are" (ends 29200) and "they" (starts 30100)
+        assert_eq!(cut_instant_ms(&left, &right, 0), Some(29650.0));
+        // Shift -1: between "them?" (ends 28600) and "Are" (starts 28900)
+        assert_eq!(cut_instant_ms(&left, &right, -1), Some(28750.0));
+        // Shift +1: between "they" (ends 30300) and "moving" (starts 30300)
+        assert_eq!(cut_instant_ms(&left, &right, 1), Some(30300.0));
+        // Shifts that would empty a side are rejected
+        assert_eq!(cut_instant_ms(&left, &right, -6), None);
+        assert_eq!(cut_instant_ms(&left, &right, 5), None);
     }
 
     #[test]
