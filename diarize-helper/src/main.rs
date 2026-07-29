@@ -239,12 +239,12 @@ fn repair_oversplit(
     sample_rate: i32,
     extractor: &EmbeddingExtractor,
     merge_threshold: f32,
-) -> Vec<bool> {
+) -> (Vec<bool>, Vec<Centroid>) {
     use std::collections::HashMap;
 
     let n = segments.len();
     if n < 2 {
-        return vec![false; n];
+        return (vec![false; n], Vec::new());
     }
 
     let mut clean = vec![false; n];
@@ -304,7 +304,7 @@ fn repair_oversplit(
     majors.sort_unstable();
     if majors.is_empty() {
         eprintln!("oversplit: no cluster has enough clean speech; leaving clusters unchanged");
-        return vec![false; n];
+        return (vec![false; n], Vec::new());
     }
 
     // Iteratively merge the closest major pair while it clears the bar.
@@ -435,7 +435,16 @@ fn repair_oversplit(
         "oversplit: voice-confirmed {} of {} segment(s) (>= {:.1}s)",
         confirmed, n, VOICE_CONFIRM_MIN_SECS
     );
-    voice
+
+    let cents = majors
+        .iter()
+        .map(|m| Centroid {
+            speaker: *m,
+            clean_secs: weight[m],
+            embedding: centroids[m].clone(),
+        })
+        .collect();
+    (voice, cents)
 }
 
 #[derive(Parser, Debug)]
@@ -481,10 +490,20 @@ struct Segment {
     voice: bool,
 }
 
+/// Clean-speech voice centroid of one final speaker cluster, exported so the
+/// app can match speakers against a library of named voiceprints.
+#[derive(Serialize)]
+struct Centroid {
+    speaker: i32,
+    clean_secs: f32,
+    embedding: Vec<f32>,
+}
+
 #[derive(Serialize)]
 struct Output {
     segments: Vec<Segment>,
     num_speakers: i32,
+    centroids: Vec<Centroid>,
 }
 
 fn read_wav_as_f32_mono(path: &PathBuf) -> Result<(Vec<f32>, u32)> {
@@ -617,6 +636,7 @@ fn run(args: Args) -> Result<Output> {
     let mut raw_segments = result.sort_by_start_time();
 
     let mut voice_flags = vec![false; raw_segments.len()];
+    let mut raw_centroids: Vec<Centroid> = Vec::new();
     if args.merge_threshold > 0.0 && !raw_segments.is_empty() {
         let extractor_config = sys::SpeakerEmbeddingExtractorConfig {
             model: emb_model.as_ptr(),
@@ -626,7 +646,7 @@ fn run(args: Args) -> Result<Output> {
         };
         match EmbeddingExtractor::create(&extractor_config) {
             Some(extractor) => {
-                voice_flags = repair_oversplit(
+                (voice_flags, raw_centroids) = repair_oversplit(
                     &mut raw_segments,
                     &samples,
                     sample_rate as i32,
@@ -659,12 +679,24 @@ fn run(args: Args) -> Result<Output> {
         })
         .collect();
 
+    // Remap centroid cluster ids onto the same positional speaker indices.
+    let centroids = raw_centroids
+        .into_iter()
+        .filter_map(|c| {
+            speaker_ids.iter().position(|&id| id == c.speaker).map(|pos| Centroid {
+                speaker: pos as i32,
+                ..c
+            })
+        })
+        .collect();
+
     let num_speakers = speaker_ids.len() as i32;
     eprintln!("done: {} speaker(s) detected", num_speakers);
 
     Ok(Output {
         segments,
         num_speakers,
+        centroids,
     })
 }
 
