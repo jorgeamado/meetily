@@ -83,6 +83,24 @@ impl TranscriptsRepository {
         Ok(meeting_id)
     }
 
+    /// Relabel all of one speaker's rows in a meeting (speaker naming).
+    /// Returns the number of rows changed.
+    pub async fn rename_speaker_rows(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        old_speaker: &str,
+        new_speaker: &str,
+    ) -> Result<u64, SqlxError> {
+        let result =
+            sqlx::query("UPDATE transcripts SET speaker = ? WHERE meeting_id = ? AND speaker = ?")
+                .bind(new_speaker)
+                .bind(meeting_id)
+                .bind(old_speaker)
+                .execute(pool)
+                .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Searches for a query string within the transcripts.
     /// It returns a list of matching transcripts with context.
     pub async fn search_transcripts(

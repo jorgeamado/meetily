@@ -757,6 +757,12 @@ pub fn run() {
             audio::glossary::glossary_get,
             audio::glossary::glossary_save,
             audio::retranscription::is_retranscription_in_progress_command,
+            // Speaker naming commands
+            audio::voiceprints::speakers_overview,
+            audio::voiceprints::speaker_rename,
+            audio::voiceprints::speaker_clear_name,
+            audio::voiceprints::voices_list,
+            audio::voiceprints::voice_delete,
             // Import audio commands
             audio::import::select_and_validate_audio_command,
             audio::import::validate_audio_file_command,

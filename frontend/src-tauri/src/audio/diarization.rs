@@ -231,20 +231,31 @@ struct HelperSegment {
 }
 
 #[derive(Debug, Deserialize)]
+struct HelperCentroid {
+    speaker: i32,
+    clean_secs: f32,
+    embedding: Vec<f32>,
+}
+
+#[derive(Debug, Deserialize)]
 struct HelperOutput {
     segments: Vec<HelperSegment>,
     num_speakers: i32,
+    #[serde(default)]
+    centroids: Vec<HelperCentroid>,
 }
 
-/// Run speaker diarization on 16kHz mono samples. Returns diarized segments and the
-/// number of speakers detected. Reports 0-100 progress with a human-readable message
-/// via `on_progress` as models are downloaded and the helper runs.
+/// Run speaker diarization on 16kHz mono samples. Returns diarized segments, the
+/// number of speakers detected, and each final cluster's clean-speech voice
+/// centroid (for cross-meeting speaker naming). Reports 0-100 progress with a
+/// human-readable message via `on_progress` as models are downloaded and the
+/// helper runs.
 pub async fn diarize<R: Runtime>(
     samples_16k_mono: &[f32],
     opts: &DiarizeOptions,
     app: &AppHandle<R>,
     mut on_progress: impl FnMut(u32, &str) + Send,
-) -> Result<(Vec<DiarizedSegment>, u32)> {
+) -> Result<(Vec<DiarizedSegment>, u32, Vec<super::voiceprints::ClusterCentroid>)> {
     on_progress(0, "Preparing speaker diarization models...");
     let models = ensure_models(app, opts.embedding_model.as_deref(), |pct, msg| on_progress(pct / 2, msg)).await?;
 
@@ -277,7 +288,17 @@ pub async fn diarize<R: Runtime>(
         })
         .collect();
 
-    Ok((segments, output.num_speakers.max(0) as u32))
+    let centroids = output
+        .centroids
+        .into_iter()
+        .map(|c| super::voiceprints::ClusterCentroid {
+            cluster: c.speaker.max(0) as usize,
+            clean_secs: c.clean_secs,
+            embedding: c.embedding,
+        })
+        .collect();
+
+    Ok((segments, output.num_speakers.max(0) as u32, centroids))
 }
 
 /// Given a transcript segment's [start, end] range (seconds), pick the diarized speaker

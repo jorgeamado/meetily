@@ -371,7 +371,11 @@ async fn run_retranscription<R: Runtime>(
 
     // Run speaker diarization (if enabled) concurrently with transcription below. Failures
     // here must not fail the whole retranscription - we just fall back to no speaker labels.
-    let mut diarize_handle: Option<tauri::async_runtime::JoinHandle<Vec<diarization::DiarizedSegment>>> =
+    type DiarizeTaskResult = (
+        Vec<diarization::DiarizedSegment>,
+        Vec<crate::audio::voiceprints::ClusterCentroid>,
+    );
+    let mut diarize_handle: Option<tauri::async_runtime::JoinHandle<DiarizeTaskResult>> =
         if let Some(samples) = audio_samples_for_diarization {
             if RETRANSCRIPTION_CANCELLED.load(Ordering::SeqCst) {
                 return Err(anyhow!("Retranscription cancelled"));
@@ -394,7 +398,7 @@ async fn run_retranscription<R: Runtime>(
                 .await;
 
                 match diarize_result {
-                    Ok((segments, num_speakers)) => {
+                    Ok((segments, num_speakers, centroids)) => {
                         info!(
                             "Speaker diarization found {} speaker(s) across {} segments",
                             num_speakers,
@@ -410,9 +414,9 @@ async fn run_retranscription<R: Runtime>(
                                 segments.len(),
                                 overlaid.len()
                             );
-                            return overlaid;
+                            return (overlaid, centroids);
                         }
-                        segments
+                        (segments, centroids)
                     }
                     Err(e) => {
                         warn!("Speaker diarization failed, continuing without speaker labels: {}", e);
@@ -423,7 +427,7 @@ async fn run_retranscription<R: Runtime>(
                             100,
                             "Speaker identification failed, continuing without speaker labels",
                         );
-                        Vec::new()
+                        (Vec::new(), Vec::new())
                     }
                 }
             }))
@@ -653,9 +657,9 @@ async fn run_retranscription<R: Runtime>(
     // moving past the dual-progress phase; a failed or panicked task just means
     // no speaker labels. The spawned task keeps emitting "diarizing" progress
     // while we wait, so the UI stays live until it finishes.
-    let diarized_segments: Vec<diarization::DiarizedSegment> = if let Some(handle) = diarize_handle {
+    let (diarized_segments, cluster_centroids): DiarizeTaskResult = if let Some(handle) = diarize_handle {
         match handle.await {
-            Ok(segments) => segments,
+            Ok(result) => result,
             Err(join_err) => {
                 warn!("Speaker diarization task panicked: {}", join_err);
                 emit_progress(
@@ -665,11 +669,29 @@ async fn run_retranscription<R: Runtime>(
                     100,
                     "Speaker identification failed, continuing without speaker labels",
                 );
-                Vec::new()
+                (Vec::new(), Vec::new())
             }
         }
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
+    };
+
+    // Cross-meeting speaker naming: store this run's voice centroids and
+    // match them against the library of remembered voices. Recognized
+    // colleagues get their names applied to the rows saved below.
+    let speaker_names = if !cluster_centroids.is_empty() {
+        let model_key = diarize_opts
+            .embedding_model
+            .clone()
+            .unwrap_or_else(|| diarization::DEFAULT_EMBEDDING_MODEL.to_string());
+        crate::audio::voiceprints::recognize_and_store(
+            &app,
+            &folder_path,
+            &model_key,
+            cluster_centroids,
+        )
+    } else {
+        std::collections::HashMap::new()
     };
 
     emit_progress(&app, &meeting_id, "saving", 80, "Saving transcripts...");
@@ -763,7 +785,7 @@ async fn run_retranscription<R: Runtime>(
     let labeled_blocks: Vec<(String, f64, f64, Option<usize>)> = diarization::turns_to_rows(&turns);
 
     // Create transcript segments with proper timestamps from VAD
-    let segments = save_transcript_rows(&app, &meeting_id, &labeled_blocks).await?;
+    let segments = save_transcript_rows(&app, &meeting_id, &labeled_blocks, &speaker_names).await?;
 
     // Persist the refinement inputs so the AI passes can be re-run later
     // without redoing transcription (standalone "AI fix-up")
@@ -840,6 +862,7 @@ async fn save_transcript_rows<R: Runtime>(
     app: &AppHandle<R>,
     meeting_id: &str,
     labeled_blocks: &[(String, f64, f64, Option<usize>)],
+    speaker_names: &std::collections::HashMap<usize, String>,
 ) -> Result<Vec<crate::api::TranscriptSegment>> {
     let plain_blocks: Vec<(String, f64, f64)> = labeled_blocks
         .iter()
@@ -865,7 +888,8 @@ async fn save_transcript_rows<R: Runtime>(
         .map_err(|e| anyhow!("Failed to delete existing transcripts: {}", e))?;
 
     for (segment, (_, _, _, speaker_idx)) in segments.iter().zip(labeled_blocks.iter()) {
-        let speaker = speaker_idx.map(diarization::speaker_label);
+        let speaker =
+            speaker_idx.map(|i| crate::audio::voiceprints::display_name(i, speaker_names));
 
         sqlx::query(
             "INSERT INTO transcripts (id, meeting_id, transcript, timestamp, audio_start_time, audio_end_time, duration, speaker)
@@ -1022,7 +1046,9 @@ async fn run_transcript_refinement<R: Runtime>(
 
     emit_progress(&app, &meeting_id, "refining", 92, "Saving transcripts...");
     let labeled_blocks = diarization::turns_to_rows(&data.turns);
-    let segments = save_transcript_rows(&app, &meeting_id, &labeled_blocks).await?;
+    // Re-apply this meeting's speaker names (manual and recognized)
+    let speaker_names = crate::audio::voiceprints::meeting_name_map(&folder_path);
+    let segments = save_transcript_rows(&app, &meeting_id, &labeled_blocks, &speaker_names).await?;
     if let Err(e) = write_refine_data(&folder_path, &data.turns, &data.diarized) {
         warn!("Failed to update refine-data.json: {}", e);
     }
