@@ -83,14 +83,10 @@ export function useRecordingStart(
     try {
       const provider = await getTranscriptionProvider();
       const commands = getProviderCommands(provider);
+      if (!commands) return true; // Cloud providers manage their own models.
 
-      if (commands) {
-        await invoke(commands.initialize);
-        return await invoke<boolean>(commands.hasAvailableModels);
-      }
-
-      console.error(`Unsupported transcription provider: ${provider}`);
-      return false;
+      await invoke(commands.initialize);
+      return await invoke<boolean>(commands.hasAvailableModels);
     } catch (error) {
       console.error('Failed to check transcription model status:', error);
       return false;
@@ -112,8 +108,24 @@ export function useRecordingStart(
     }
   }, [getTranscriptionProvider]);
 
-  // The Rust recording command validates the same provider again before capture.
-  const checkModelReady = checkTranscriptionModelReady;
+  // A missing live model must never block recording: the audio is saved
+  // either way and Enhance produces the transcript afterwards. The check is
+  // provider-aware (upstream #639) — cloud providers manage their own models
+  // and report ready, so only a missing LOCAL model produces the warning.
+  const warnIfNoLiveModel = useCallback(async (source: string) => {
+    const modelReady = await checkTranscriptionModelReady();
+    if (modelReady) {
+      return;
+    }
+    const isDownloading = await checkIfModelDownloading();
+    toast.warning('Recording without live transcription', {
+      description: isDownloading
+        ? 'The live model is still downloading. The recording is unaffected — Enhance it afterwards for the full transcript.'
+        : 'No live transcription model is installed. The recording is unaffected — Enhance it afterwards for the full transcript.',
+      duration: 6000,
+    });
+    Analytics.trackButtonClick('start_recording_without_live_model', source);
+  }, [checkTranscriptionModelReady, checkIfModelDownloading]);
 
   // Handle manual recording start (from button click)
   const handleRecordingStart = useCallback(async () => {
@@ -123,31 +135,11 @@ export function useRecordingStart(
     }
     isStartingRef.current = true;
     try {
-      console.log('handleRecordingStart called - checking selected transcription model status');
+      console.log('handleRecordingStart called - checking live model status');
 
-      // Check the selected transcription model before starting.
-      const modelReady = await checkModelReady();
-      if (!modelReady) {
-        const isDownloading = await checkIfModelDownloading();
-        if (isDownloading) {
-          toast.info('Model download in progress', {
-            description: 'Please wait for the transcription model to finish downloading before recording.',
-            duration: 5000,
-          });
-          Analytics.trackButtonClick('start_recording_blocked_downloading', 'home_page');
-        } else {
-          toast.error('Transcription model not ready', {
-            description: 'Please download a transcription model before recording.',
-            duration: 5000,
-          });
-          showModal?.('modelSelector', 'Transcription model setup required');
-          Analytics.trackButtonClick('start_recording_blocked_missing', 'home_page');
-        }
-        setStatus(RecordingStatus.IDLE);
-        return;
-      }
-
-      console.log('Selected transcription model ready - setting up meeting title and state');
+      // A missing live model must never block recording: the audio is saved
+      // either way and Enhance produces the transcript afterwards. Just warn.
+      await warnIfNoLiveModel('home_page');
 
       const randomTitle = generateMeetingTitle();
       setMeetingTitle(randomTitle);
@@ -205,7 +197,7 @@ export function useRecordingStart(
     } finally {
       isStartingRef.current = false;
     }
-  }, [generateMeetingTitle, setMeetingTitle, setIsRecording, clearTranscripts, setIsMeetingActive, checkModelReady, checkIfModelDownloading, selectedDevices, showModal, setStatus]);
+  }, [generateMeetingTitle, setMeetingTitle, setIsRecording, clearTranscripts, setIsMeetingActive, warnIfNoLiveModel, selectedDevices, setStatus]);
 
   // Check for autoStartRecording flag and start recording automatically
   useEffect(() => {
@@ -217,28 +209,8 @@ export function useRecordingStart(
           setIsAutoStarting(true);
           sessionStorage.removeItem('autoStartRecording'); // Clear the flag
 
-          // Check the selected transcription model before starting.
-          const modelReady = await checkModelReady();
-          if (!modelReady) {
-            const isDownloading = await checkIfModelDownloading();
-            if (isDownloading) {
-              toast.info('Model download in progress', {
-                description: 'Please wait for the transcription model to finish downloading before recording.',
-                duration: 5000,
-              });
-              Analytics.trackButtonClick('start_recording_blocked_downloading', 'sidebar_auto');
-            } else {
-              toast.error('Transcription model not ready', {
-                description: 'Please download a transcription model before recording.',
-                duration: 5000,
-              });
-              showModal?.('modelSelector', 'Transcription model setup required');
-              Analytics.trackButtonClick('start_recording_blocked_missing', 'sidebar_auto');
-            }
-            setStatus(RecordingStatus.IDLE);
-            setIsAutoStarting(false);
-            return;
-          }
+          // A missing live model never blocks recording — warn and proceed
+          await warnIfNoLiveModel('sidebar_auto');
 
           // Start the actual backend recording
           try {
@@ -299,9 +271,7 @@ export function useRecordingStart(
     setIsRecording,
     clearTranscripts,
     setIsMeetingActive,
-    checkModelReady,
-    checkIfModelDownloading,
-    showModal,
+    warnIfNoLiveModel,
     setStatus,
   ]);
 
@@ -313,31 +283,11 @@ export function useRecordingStart(
         return;
       }
 
-      console.log('Direct start from sidebar - checking selected transcription model status');
+      console.log('Direct start from sidebar - checking live model status');
       setIsAutoStarting(true);
 
-      // Check the selected transcription model before starting.
-      const modelReady = await checkModelReady();
-      if (!modelReady) {
-        const isDownloading = await checkIfModelDownloading();
-        if (isDownloading) {
-          toast.info('Model download in progress', {
-            description: 'Please wait for the transcription model to finish downloading before recording.',
-            duration: 5000,
-          });
-          Analytics.trackButtonClick('start_recording_blocked_downloading', 'sidebar_direct');
-        } else {
-          toast.error('Transcription model not ready', {
-            description: 'Please download a transcription model before recording.',
-            duration: 5000,
-          });
-          showModal?.('modelSelector', 'Transcription model setup required');
-          Analytics.trackButtonClick('start_recording_blocked_missing', 'sidebar_direct');
-        }
-        setStatus(RecordingStatus.IDLE);
-        setIsAutoStarting(false);
-        return;
-      }
+      // A missing live model never blocks recording — warn and proceed
+      await warnIfNoLiveModel('sidebar_direct');
 
       try {
         // Generate meeting title
@@ -399,9 +349,7 @@ export function useRecordingStart(
     setIsRecording,
     clearTranscripts,
     setIsMeetingActive,
-    checkModelReady,
-    checkIfModelDownloading,
-    showModal,
+    warnIfNoLiveModel,
     setStatus,
   ]);
 
