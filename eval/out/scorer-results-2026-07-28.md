@@ -146,3 +146,43 @@ Suspicious observation for a future hypothesis: the 2B approved ALL 32
 sandwich merges (32/32). Short replies like "Нет. Только голос.",
 "согласен.", "динамику?" read as real interjections — the merge pass may
 be rubber-stamping. Worth an ablation before trusting it on ru calls.
+
+## Over-split probe (2026-07-29): why "8 speakers" on a 3-4 person call
+
+Data: campplus + eres2net embeddings of the diarized segments from
+refine-data.json, on the two 8-cluster meetings (Jul 27 ru 68min, Jul 28 ru
+60min) and the small Jul 27 3-cluster meeting.
+
+Key method finding: cluster similarity must be computed on CLEAN segments
+only (>= 1.5s, zero time-overlap with any other segment, center-capped 12s).
+Raw centroids are poisoned by overlapped spans carrying mixed voices —
+s2–s7 read 0.76 raw but 0.50/0.41 clean; the raw numbers made a
+different-voice pair look mergeable.
+
+Jul 27 meeting (8 clusters): clean-segment centroids show s5–s7 =
+0.938 campplus / 0.929 eres2net — same voice, split in two (433 segments,
+28 phantom handovers between them = the turn-fragmentation flood that fed
+the sandwich pass). Every other major pair <= 0.62. s2 overlaps s5 for
+60.5s of simultaneous speech (genuinely different people — one can't
+overlap oneself). True speaker structure: 4 majors {5+7, 2, 6, 0} + 31
+debris segments (s1/s3/s4, 36s total, sub-second blips, no clean speech).
+So the call was 3-4 people, not 2 as assumed.
+
+Jul 28 meeting (8 clusters): 3 real voices (479s/801s/1399s, all pairwise
+<= 0.62 in both models — correctly separate) + 5 debris clusters totaling
+42s. The "8 speakers" here is pure debris.
+
+Margin across all meetings & both models: same voice >= 0.93, different
+voices <= 0.68 (small clusters) / <= 0.62 (majors). Wide empty band around
+0.8.
+
+Debris scores: per-segment embeddings of sub-second blips are coin flips
+(0.1-0.5, no margin); segments > 1s score 0.62-0.68 to their true major.
+Hence: voice-match debris only at cos >= 0.60, else fold into temporally
+nearest major (low harm: blip text joins surrounding turn instead of
+minting a phantom speaker row).
+
+Fix shipped in diarize-helper (--merge-threshold, default 0.8): after
+clustering, embed clean segments, iteratively merge major clusters
+(>= 10s clean speech) at cos >= 0.8, then fold debris clusters into majors
+(voice floor 0.60, temporal fallback). Disable with <= 0.

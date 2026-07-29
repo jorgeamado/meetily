@@ -113,6 +113,298 @@ impl Drop for DiarizationResult {
     }
 }
 
+/// Post-clustering over-split repair. FastClustering routinely shatters one
+/// voice into several clusters (observed: 8 clusters on a 3-4 person call).
+/// Verified on clean speech the split halves score cos >= 0.93 while genuinely
+/// different voices stay <= 0.68, so a 0.8 merge bar has wide margin.
+const CLEAN_MIN_SECS: f32 = 1.5;
+const CLEAN_CAP_SECS: f32 = 12.0;
+const MAJOR_MIN_CLEAN_SECS: f32 = 10.0;
+const DEBRIS_MIN_SECS: f32 = 0.25;
+const DEBRIS_VOICE_FLOOR: f32 = 0.60;
+
+struct EmbeddingExtractor {
+    ptr: *const sys::SpeakerEmbeddingExtractor,
+    dim: usize,
+}
+
+impl EmbeddingExtractor {
+    fn create(config: &sys::SpeakerEmbeddingExtractorConfig) -> Option<Self> {
+        let ptr = unsafe { sys::SherpaOnnxCreateSpeakerEmbeddingExtractor(config) };
+        if ptr.is_null() {
+            None
+        } else {
+            let dim = unsafe { sys::SherpaOnnxSpeakerEmbeddingExtractorDim(ptr) } as usize;
+            Some(Self { ptr, dim })
+        }
+    }
+
+    /// L2-normalized speaker embedding of a span of samples, or None if the
+    /// span is too short for the model to produce one.
+    fn embed(&self, samples: &[f32], sample_rate: i32) -> Option<Vec<f32>> {
+        if samples.is_empty() {
+            return None;
+        }
+        unsafe {
+            let stream = sys::SherpaOnnxSpeakerEmbeddingExtractorCreateStream(self.ptr);
+            if stream.is_null() {
+                return None;
+            }
+            sys::SherpaOnnxOnlineStreamAcceptWaveform(
+                stream,
+                sample_rate,
+                samples.as_ptr(),
+                samples.len() as i32,
+            );
+            sys::SherpaOnnxOnlineStreamInputFinished(stream);
+            let out = if sys::SherpaOnnxSpeakerEmbeddingExtractorIsReady(self.ptr, stream) != 0 {
+                let v = sys::SherpaOnnxSpeakerEmbeddingExtractorComputeEmbedding(self.ptr, stream);
+                if v.is_null() {
+                    None
+                } else {
+                    let e = std::slice::from_raw_parts(v, self.dim).to_vec();
+                    sys::SherpaOnnxSpeakerEmbeddingExtractorDestroyEmbedding(v);
+                    normalized(e)
+                }
+            } else {
+                None
+            };
+            sys::SherpaOnnxDestroyOnlineStream(stream);
+            out
+        }
+    }
+}
+
+impl Drop for EmbeddingExtractor {
+    fn drop(&mut self) {
+        unsafe {
+            if !self.ptr.is_null() {
+                sys::SherpaOnnxDestroySpeakerEmbeddingExtractor(self.ptr);
+            }
+        }
+    }
+}
+
+fn normalized(mut v: Vec<f32>) -> Option<Vec<f32>> {
+    let norm = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm < 1e-6 {
+        return None;
+    }
+    for x in &mut v {
+        *x /= norm;
+    }
+    Some(v)
+}
+
+fn cosine(a: &[f32], b: &[f32]) -> f32 {
+    a.iter().zip(b).map(|(x, y)| x * y).sum()
+}
+
+/// Embed [start, end] seconds of audio, center-cropped to CLEAN_CAP_SECS.
+fn embed_span(
+    extractor: &EmbeddingExtractor,
+    samples: &[f32],
+    sample_rate: i32,
+    start: f32,
+    end: f32,
+) -> Option<Vec<f32>> {
+    let (mut s, mut e) = (start, end);
+    if e - s > CLEAN_CAP_SECS {
+        let mid = (s + e) / 2.0;
+        s = mid - CLEAN_CAP_SECS / 2.0;
+        e = mid + CLEAN_CAP_SECS / 2.0;
+    }
+    let sr = sample_rate as f32;
+    let lo = ((s * sr) as usize).min(samples.len());
+    let hi = ((e * sr) as usize).min(samples.len());
+    extractor.embed(&samples[lo..hi], sample_rate)
+}
+
+/// Merge same-voice clusters and fold tiny "debris" clusters into the real
+/// speakers. Only clean spans (>= CLEAN_MIN_SECS, no time overlap with any
+/// other segment) vote on cluster identity — overlapped spans carry mixed
+/// voices and previously made split halves of one voice look distinct.
+/// Segments are expected to be sorted by start time.
+fn repair_oversplit(
+    segments: &mut [sys::OfflineSpeakerDiarizationSegment],
+    samples: &[f32],
+    sample_rate: i32,
+    extractor: &EmbeddingExtractor,
+    merge_threshold: f32,
+) {
+    use std::collections::HashMap;
+
+    let n = segments.len();
+    if n < 2 {
+        return;
+    }
+
+    let mut clean = vec![false; n];
+    for i in 0..n {
+        let a = &segments[i];
+        if a.end - a.start < CLEAN_MIN_SECS {
+            continue;
+        }
+        let mut ok = true;
+        for j in (0..i).rev() {
+            if segments[j].end > a.start {
+                ok = false;
+                break;
+            }
+            if a.start - segments[j].end > 15.0 {
+                break;
+            }
+        }
+        if ok && i + 1 < n && segments[i + 1].start < a.end {
+            ok = false;
+        }
+        clean[i] = ok;
+    }
+
+    // Duration-weighted centroid of clean spans per cluster.
+    let mut sums: HashMap<i32, (Vec<f32>, f32)> = HashMap::new();
+    for i in 0..n {
+        if !clean[i] {
+            continue;
+        }
+        let seg = &segments[i];
+        let Some(e) = embed_span(extractor, samples, sample_rate, seg.start, seg.end) else {
+            continue;
+        };
+        let d = seg.end - seg.start;
+        let entry = sums.entry(seg.speaker).or_insert_with(|| (vec![0.0; e.len()], 0.0));
+        for (acc, x) in entry.0.iter_mut().zip(&e) {
+            *acc += x * d;
+        }
+        entry.1 += d;
+    }
+
+    let mut centroids: HashMap<i32, Vec<f32>> = HashMap::new();
+    let mut clean_time: HashMap<i32, f32> = HashMap::new();
+    for (k, (sum, w)) in sums {
+        if let Some(c) = normalized(sum) {
+            centroids.insert(k, c);
+            clean_time.insert(k, w);
+        }
+    }
+
+    let mut majors: Vec<i32> = centroids
+        .keys()
+        .copied()
+        .filter(|k| clean_time[k] >= MAJOR_MIN_CLEAN_SECS)
+        .collect();
+    majors.sort_unstable();
+    if majors.is_empty() {
+        eprintln!("oversplit: no cluster has enough clean speech; leaving clusters unchanged");
+        return;
+    }
+
+    // Iteratively merge the closest major pair while it clears the bar.
+    let mut remap: HashMap<i32, i32> = HashMap::new();
+    let mut weight: HashMap<i32, f32> = clean_time.clone();
+    loop {
+        let mut best = (f32::MIN, 0usize, 0usize);
+        for x in 0..majors.len() {
+            for y in (x + 1)..majors.len() {
+                let s = cosine(&centroids[&majors[x]], &centroids[&majors[y]]);
+                if s > best.0 {
+                    best = (s, x, y);
+                }
+            }
+        }
+        if majors.len() < 2 || best.0 < merge_threshold {
+            if majors.len() >= 2 {
+                eprintln!(
+                    "oversplit: closest major pair {} & {} at cos {:.3} (< {:.2}); majors: {:?}",
+                    majors[best.1], majors[best.2], best.0, merge_threshold, majors
+                );
+            }
+            break;
+        }
+        let (keep, gone) = (majors[best.1], majors[best.2]);
+        eprintln!(
+            "oversplit: merged speaker cluster {} into {} (cos {:.3})",
+            gone, keep, best.0
+        );
+        let (wk, wg) = (weight[&keep], weight[&gone]);
+        let merged: Vec<f32> = centroids[&keep]
+            .iter()
+            .zip(&centroids[&gone])
+            .map(|(a, b)| a * wk + b * wg)
+            .collect();
+        if let Some(c) = normalized(merged) {
+            centroids.insert(keep, c);
+        }
+        weight.insert(keep, wk + wg);
+        centroids.remove(&gone);
+        majors.remove(best.2);
+        for v in remap.values_mut() {
+            if *v == gone {
+                *v = keep;
+            }
+        }
+        remap.insert(gone, keep);
+    }
+
+    // Relabel major segments first so debris has final labels to fall back on.
+    let mut major_mids: Vec<(f32, i32)> = Vec::new();
+    for seg in segments.iter_mut() {
+        let mapped = remap.get(&seg.speaker).copied().unwrap_or(seg.speaker);
+        if majors.contains(&mapped) {
+            seg.speaker = mapped;
+            major_mids.push(((seg.start + seg.end) / 2.0, mapped));
+        }
+    }
+
+    // Debris: confident voice match wins; otherwise fold into the temporally
+    // nearest real speaker so stray blips join the surrounding conversation
+    // instead of surfacing as phantom speakers.
+    let (mut by_voice, mut by_time, mut debris_secs) = (0usize, 0usize, 0f32);
+    for i in 0..n {
+        let spk = segments[i].speaker;
+        let mapped = remap.get(&spk).copied().unwrap_or(spk);
+        if majors.contains(&mapped) {
+            continue;
+        }
+        let (s0, e0) = (segments[i].start, segments[i].end);
+        debris_secs += e0 - s0;
+        let mut assigned = None;
+        if e0 - s0 >= DEBRIS_MIN_SECS {
+            if let Some(v) = embed_span(extractor, samples, sample_rate, s0, e0) {
+                let bm = majors
+                    .iter()
+                    .map(|m| (cosine(&v, &centroids[m]), *m))
+                    .fold((f32::MIN, -1), |acc, c| if c.0 > acc.0 { c } else { acc });
+                if bm.0 >= DEBRIS_VOICE_FLOOR {
+                    assigned = Some(bm.1);
+                    by_voice += 1;
+                }
+            }
+        }
+        let label = assigned.unwrap_or_else(|| {
+            by_time += 1;
+            let mid = (s0 + e0) / 2.0;
+            major_mids
+                .iter()
+                .min_by(|a, b| {
+                    (a.0 - mid).abs().partial_cmp(&(b.0 - mid).abs()).expect("finite times")
+                })
+                .map(|&(_, lab)| lab)
+                .expect("majors is non-empty")
+        });
+        segments[i].speaker = label;
+    }
+    if by_voice + by_time > 0 {
+        eprintln!(
+            "oversplit: folded {} debris segment(s) ({:.1}s) into real speakers ({} by voice, {} by adjacency)",
+            by_voice + by_time,
+            debris_secs,
+            by_voice,
+            by_time
+        );
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "diarize-helper")]
 struct Args {
@@ -140,6 +432,11 @@ struct Args {
     /// Override the ONNX intra-op thread count (default: min(cores, 8))
     #[arg(long = "num-threads")]
     num_threads: Option<i32>,
+
+    /// Merge clusters whose clean-speech centroids exceed this cosine
+    /// similarity and fold tiny clusters into real speakers (<= 0 disables)
+    #[arg(long = "merge-threshold", default_value_t = 0.8)]
+    merge_threshold: f32,
 }
 
 #[derive(Serialize)]
@@ -282,7 +579,26 @@ fn run(args: Args) -> Result<Output> {
         .process_with_progress(&samples)
         .context("diarization processing failed")?;
 
-    let raw_segments = result.sort_by_start_time();
+    let mut raw_segments = result.sort_by_start_time();
+
+    if args.merge_threshold > 0.0 && !raw_segments.is_empty() {
+        let extractor_config = sys::SpeakerEmbeddingExtractorConfig {
+            model: emb_model.as_ptr(),
+            num_threads,
+            debug: 0,
+            provider: cpu_provider.as_ptr(),
+        };
+        match EmbeddingExtractor::create(&extractor_config) {
+            Some(extractor) => repair_oversplit(
+                &mut raw_segments,
+                &samples,
+                sample_rate as i32,
+                &extractor,
+                args.merge_threshold,
+            ),
+            None => eprintln!("oversplit: failed to create embedding extractor; skipping repair"),
+        }
+    }
 
     let mut speaker_ids: Vec<i32> = Vec::new();
     for s in &raw_segments {
