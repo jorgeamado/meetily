@@ -35,6 +35,10 @@ export interface VirtualizedTranscriptViewProps {
     totalCount?: number;
     loadedCount?: number;
     onLoadMore?: () => void;
+
+    /** Custom renderer for the speaker label (speaker naming popover).
+     *  Receives the speaker string; when omitted, a plain label renders. */
+    renderSpeaker?: (speaker: string) => React.ReactNode;
 }
 
 // Threshold for enabling virtualization (below this, use simple rendering)
@@ -74,6 +78,7 @@ const TranscriptSegment = memo(function TranscriptSegment({
     showConfidence,
     speaker,
     showSpeaker,
+    renderSpeaker,
 }: {
     id: string;
     timestamp: number;
@@ -83,15 +88,20 @@ const TranscriptSegment = memo(function TranscriptSegment({
     showConfidence: boolean;
     speaker?: string;
     showSpeaker?: boolean;
+    renderSpeaker?: (speaker: string) => React.ReactNode;
 }) {
     const displayText = cleanStopWords(text) || (text.trim() === '' ? '[Silence]' : text);
 
     return (
         <div id={`segment-${id}`} className="mb-3">
             {showSpeaker && speaker && (
-                <span className={`block text-[10px] font-semibold uppercase tracking-wide mb-1 ml-[58px] ${getSpeakerColorClass(speaker)}`}>
-                    {speaker}
-                </span>
+                renderSpeaker ? (
+                    renderSpeaker(speaker)
+                ) : (
+                    <span className={`block text-[10px] font-semibold uppercase tracking-wide mb-1 ml-[58px] ${getSpeakerColorClass(speaker)}`}>
+                        {speaker}
+                    </span>
+                )
             )}
             <div className="flex items-start gap-2">
                 <Tooltip>
@@ -134,6 +144,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
     totalCount = 0,
     loadedCount = 0,
     onLoadMore,
+    renderSpeaker,
 }) => {
     // Create scroll ref first - shared between virtualizer and auto-scroll hook
     const scrollRef = useRef<HTMLDivElement>(null);
@@ -309,6 +320,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         showConfidence={showConfidence}
                                         speaker={segment.speaker}
                                         showSpeaker={segment.speaker !== previousSpeaker}
+                                        renderSpeaker={renderSpeaker}
                                     />
                                 </div>
                             );
@@ -368,6 +380,7 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                                         showConfidence={showConfidence}
                                         speaker={segment.speaker}
                                         showSpeaker={segment.speaker !== previousSpeaker}
+                                        renderSpeaker={renderSpeaker}
                                     />
                                 </motion.div>
                             );
