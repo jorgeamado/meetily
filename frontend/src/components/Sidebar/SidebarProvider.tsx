@@ -81,7 +81,7 @@ interface SidebarContextType {
   createFolder: (title: string) => Promise<MeetingFolder | null>;
   renameFolder: (folderId: string, title: string) => Promise<boolean>;
   deleteFolder: (folderId: string) => Promise<boolean>;
-  moveMeetingToFolder: (meetingId: string, folderId: string | null) => Promise<boolean>;
+  moveMeetingToFolder: (meetingId: string, folderId: string | null) => Promise<true | string>;
 }
 
 const SidebarContext = createContext<SidebarContextType | null>(null);
@@ -183,7 +183,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       return true;
     } catch (error) {
       console.error('Failed to move meeting:', error);
-      return false;
+      return typeof error === 'string' ? error : 'Failed to move meeting';
     }
   }, []);
 
