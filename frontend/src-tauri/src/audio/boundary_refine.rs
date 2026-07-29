@@ -574,10 +574,13 @@ pub async fn refine_turns<R: Runtime>(
         consecutive_failures: 0,
     };
 
-    // Pass 1: phantom interjections
+    // Pass 1: phantom interjections. Capped at half the query budget so a
+    // sandwich-heavy meeting cannot starve pass 2 (observed: a 57-min call
+    // produced 32 sandwiches and consumed every query before any cut was
+    // refined).
     let mut i = 1;
     while i + 1 < turns.len() {
-        if cancelled() || ctx.exhausted(&stats) {
+        if cancelled() || ctx.exhausted(&stats) || stats.queried >= MAX_QUERIES / 2 {
             break;
         }
         if is_sandwich(&turns[i - 1], &turns[i], &turns[i + 1]) {
@@ -617,10 +620,11 @@ pub async fn refine_turns<R: Runtime>(
     );
     let total = boundaries.len();
 
+    let mut llm_stopped = false;
     for (done, boundary) in boundaries.iter().enumerate() {
-        if cancelled() || ctx.exhausted(&stats) {
+        if cancelled() {
             warn!(
-                "Boundary refine: stopping after {} of {} boundaries ({} queries)",
+                "Boundary refine: cancelled after {} of {} boundaries ({} queries)",
                 done, total, stats.queried
             );
             break;
@@ -661,6 +665,21 @@ pub async fn refine_turns<R: Runtime>(
                 }
                 None => {}
             }
+        }
+
+        // The acoustic gate above is free; only the LLM fallback needs
+        // budget. Keep walking boundaries after exhaustion so the gate
+        // still decides what it can (observed: a 57-min meeting's sandwich
+        // pass drained every query and the gate never ran).
+        if ctx.exhausted(&stats) {
+            if !llm_stopped {
+                warn!(
+                    "Boundary refine: LLM budget exhausted at {} of {} boundaries ({} queries); acoustic gate continues",
+                    done, total, stats.queried
+                );
+                llm_stopped = true;
+            }
+            continue;
         }
 
         let mut rounds = 0;
