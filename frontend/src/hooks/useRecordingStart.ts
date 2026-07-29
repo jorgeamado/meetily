@@ -34,7 +34,7 @@ export function useRecordingStart(
 
   const { clearTranscripts, setMeetingTitle } = useTranscripts();
   const { setIsMeetingActive } = useSidebar();
-  const { selectedDevices } = useConfig();
+  const { selectedDevices, transcriptModelConfig } = useConfig();
   const { setStatus } = useRecordingState();
 
   // Generate meeting title with timestamp
@@ -79,34 +79,35 @@ export function useRecordingStart(
     }
   }, []);
 
+  // A missing live model must never block recording: the audio is saved
+  // either way and Enhance produces the transcript afterwards. Only the
+  // Parakeet provider is checked — other providers manage their own models.
+  const warnIfNoLiveModel = useCallback(async (source: string) => {
+    if (transcriptModelConfig.provider !== 'parakeet') {
+      return;
+    }
+    const parakeetReady = await checkParakeetReady();
+    if (parakeetReady) {
+      return;
+    }
+    const isDownloading = await checkIfModelDownloading();
+    toast.warning('Recording without live transcription', {
+      description: isDownloading
+        ? 'The live model is still downloading. The recording is unaffected — Enhance it afterwards for the full transcript.'
+        : 'No live transcription model is installed. The recording is unaffected — Enhance it afterwards for the full transcript.',
+      duration: 6000,
+    });
+    Analytics.trackButtonClick('start_recording_without_live_model', source);
+  }, [transcriptModelConfig.provider, checkParakeetReady, checkIfModelDownloading]);
+
   // Handle manual recording start (from button click)
   const handleRecordingStart = useCallback(async () => {
     try {
-      console.log('handleRecordingStart called - checking Parakeet model status');
+      console.log('handleRecordingStart called - checking live model status');
 
-      // Check if Parakeet transcription model is ready before starting
-      const parakeetReady = await checkParakeetReady();
-      if (!parakeetReady) {
-        const isDownloading = await checkIfModelDownloading();
-        if (isDownloading) {
-          toast.info('Model download in progress', {
-            description: 'Please wait for the transcription model to finish downloading before recording.',
-            duration: 5000,
-          });
-          Analytics.trackButtonClick('start_recording_blocked_downloading', 'home_page');
-        } else {
-          toast.error('Transcription model not ready', {
-            description: 'Please download a transcription model before recording.',
-            duration: 5000,
-          });
-          showModal?.('modelSelector', 'Transcription model setup required');
-          Analytics.trackButtonClick('start_recording_blocked_missing', 'home_page');
-        }
-        setStatus(RecordingStatus.IDLE);
-        return;
-      }
-
-      console.log('Parakeet ready - setting up meeting title and state');
+      // A missing live model must never block recording: the audio is saved
+      // either way and Enhance produces the transcript afterwards. Just warn.
+      await warnIfNoLiveModel('home_page');
 
       const randomTitle = generateMeetingTitle();
       setMeetingTitle(randomTitle);
@@ -141,7 +142,7 @@ export function useRecordingStart(
       // Re-throw so RecordingControls can handle device-specific errors
       throw error;
     }
-  }, [generateMeetingTitle, setMeetingTitle, setIsRecording, clearTranscripts, setIsMeetingActive, checkParakeetReady, checkIfModelDownloading, selectedDevices, showModal, setStatus]);
+  }, [generateMeetingTitle, setMeetingTitle, setIsRecording, clearTranscripts, setIsMeetingActive, warnIfNoLiveModel, selectedDevices, setStatus]);
 
   // Check for autoStartRecording flag and start recording automatically
   useEffect(() => {
@@ -153,28 +154,8 @@ export function useRecordingStart(
           setIsAutoStarting(true);
           sessionStorage.removeItem('autoStartRecording'); // Clear the flag
 
-          // Check if Parakeet transcription model is ready before starting
-          const parakeetReady = await checkParakeetReady();
-          if (!parakeetReady) {
-            const isDownloading = await checkIfModelDownloading();
-            if (isDownloading) {
-              toast.info('Model download in progress', {
-                description: 'Please wait for the transcription model to finish downloading before recording.',
-                duration: 5000,
-              });
-              Analytics.trackButtonClick('start_recording_blocked_downloading', 'sidebar_auto');
-            } else {
-              toast.error('Transcription model not ready', {
-                description: 'Please download a transcription model before recording.',
-                duration: 5000,
-              });
-              showModal?.('modelSelector', 'Transcription model setup required');
-              Analytics.trackButtonClick('start_recording_blocked_missing', 'sidebar_auto');
-            }
-            setStatus(RecordingStatus.IDLE);
-            setIsAutoStarting(false);
-            return;
-          }
+          // A missing live model never blocks recording — warn and proceed
+          await warnIfNoLiveModel('sidebar_auto');
 
           // Start the actual backend recording
           try {
@@ -224,9 +205,7 @@ export function useRecordingStart(
     setIsRecording,
     clearTranscripts,
     setIsMeetingActive,
-    checkParakeetReady,
-    checkIfModelDownloading,
-    showModal,
+    warnIfNoLiveModel,
     setStatus,
   ]);
 
@@ -238,31 +217,11 @@ export function useRecordingStart(
         return;
       }
 
-      console.log('Direct start from sidebar - checking Parakeet model status');
+      console.log('Direct start from sidebar - checking live model status');
       setIsAutoStarting(true);
 
-      // Check if Parakeet transcription model is ready before starting
-      const parakeetReady = await checkParakeetReady();
-      if (!parakeetReady) {
-        const isDownloading = await checkIfModelDownloading();
-        if (isDownloading) {
-          toast.info('Model download in progress', {
-            description: 'Please wait for the transcription model to finish downloading before recording.',
-            duration: 5000,
-          });
-          Analytics.trackButtonClick('start_recording_blocked_downloading', 'sidebar_direct');
-        } else {
-          toast.error('Transcription model not ready', {
-            description: 'Please download a transcription model before recording.',
-            duration: 5000,
-          });
-          showModal?.('modelSelector', 'Transcription model setup required');
-          Analytics.trackButtonClick('start_recording_blocked_missing', 'sidebar_direct');
-        }
-        setStatus(RecordingStatus.IDLE);
-        setIsAutoStarting(false);
-        return;
-      }
+      // A missing live model never blocks recording — warn and proceed
+      await warnIfNoLiveModel('sidebar_direct');
 
       try {
         // Generate meeting title
@@ -313,9 +272,7 @@ export function useRecordingStart(
     setIsRecording,
     clearTranscripts,
     setIsMeetingActive,
-    checkParakeetReady,
-    checkIfModelDownloading,
-    showModal,
+    warnIfNoLiveModel,
     setStatus,
   ]);
 
