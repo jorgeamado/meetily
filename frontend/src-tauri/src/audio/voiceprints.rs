@@ -54,6 +54,10 @@ pub struct Voiceprint {
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct VoiceLibrary {
     pub voices: Vec<Voiceprint>,
+    /// Display name for the local (mic-channel) speaker; None shows "You".
+    /// Never enters voice matching — the mic channel is hardware identity.
+    #[serde(default)]
+    pub local_name: Option<String>,
 }
 
 /// Clean-speech centroid of one cluster, as exported by diarize-helper.
@@ -145,6 +149,13 @@ pub fn meeting_name_map(folder: &Path) -> HashMap<usize, String> {
     let mut map = ms.auto;
     map.extend(ms.names);
     map
+}
+
+/// The configured display name for the local mic-channel speaker, if any.
+pub fn local_display_name<R: Runtime>(app: &AppHandle<R>) -> Option<String> {
+    let name = load_library(app).local_name?;
+    let name = name.trim().to_string();
+    (!name.is_empty()).then_some(name)
 }
 
 /// Display string for a cluster index under a name map.
@@ -484,6 +495,26 @@ pub async fn voices_list<R: Runtime>(app: AppHandle<R>) -> Result<Vec<VoiceInfo>
             updated_at: v.updated_at.clone(),
         })
         .collect())
+}
+
+#[tauri::command]
+pub async fn local_name_get<R: Runtime>(app: AppHandle<R>) -> Result<Option<String>, String> {
+    Ok(load_library(&app).local_name)
+}
+
+/// Set (or clear, with an empty string) the local speaker's display name.
+/// Applies to rows the next time a meeting is enhanced or fixed up.
+#[tauri::command]
+pub async fn local_name_set<R: Runtime>(app: AppHandle<R>, name: String) -> Result<(), String> {
+    let mut lib = load_library(&app);
+    let trimmed = name.trim().to_string();
+    lib.local_name = (!trimmed.is_empty() && trimmed != "You").then_some(trimmed.clone());
+    save_library(&app, &lib).map_err(|e| e.to_string())?;
+    info!(
+        "Local speaker display name {}",
+        if lib.local_name.is_some() { format!("set to '{}'", trimmed) } else { "cleared (shows as You)".to_string() }
+    );
+    Ok(())
 }
 
 #[tauri::command]

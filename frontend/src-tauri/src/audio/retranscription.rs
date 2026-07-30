@@ -679,7 +679,7 @@ async fn run_retranscription<R: Runtime>(
     // Cross-meeting speaker naming: store this run's voice centroids and
     // match them against the library of remembered voices. Recognized
     // colleagues get their names applied to the rows saved below.
-    let speaker_names = if !cluster_centroids.is_empty() {
+    let mut speaker_names = if !cluster_centroids.is_empty() {
         let model_key = diarize_opts
             .embedding_model
             .clone()
@@ -693,6 +693,10 @@ async fn run_retranscription<R: Runtime>(
     } else {
         std::collections::HashMap::new()
     };
+    // Optional real name for the mic-channel speaker (default "You")
+    if let Some(n) = crate::audio::voiceprints::local_display_name(&app) {
+        speaker_names.insert(diarization::LOCAL_SPEAKER, n);
+    }
 
     emit_progress(&app, &meeting_id, "saving", 80, "Saving transcripts...");
 
@@ -1047,7 +1051,10 @@ async fn run_transcript_refinement<R: Runtime>(
     emit_progress(&app, &meeting_id, "refining", 92, "Saving transcripts...");
     let labeled_blocks = diarization::turns_to_rows(&data.turns);
     // Re-apply this meeting's speaker names (manual and recognized)
-    let speaker_names = crate::audio::voiceprints::meeting_name_map(&folder_path);
+    let mut speaker_names = crate::audio::voiceprints::meeting_name_map(&folder_path);
+    if let Some(n) = crate::audio::voiceprints::local_display_name(&app) {
+        speaker_names.insert(diarization::LOCAL_SPEAKER, n);
+    }
     let segments = save_transcript_rows(&app, &meeting_id, &labeled_blocks, &speaker_names).await?;
     if let Err(e) = write_refine_data(&folder_path, &data.turns, &data.diarized) {
         warn!("Failed to update refine-data.json: {}", e);

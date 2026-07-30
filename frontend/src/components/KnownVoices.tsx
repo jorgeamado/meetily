@@ -32,6 +32,8 @@ function formatDate(iso: string): string {
 
 export function KnownVoices() {
   const [voices, setVoices] = useState<VoiceInfo[] | null>(null);
+  const [localName, setLocalName] = useState('');
+  const [savedLocalName, setSavedLocalName] = useState('');
 
   const refresh = useCallback(async () => {
     try {
@@ -39,11 +41,35 @@ export function KnownVoices() {
     } catch {
       setVoices([]);
     }
+    try {
+      const name = (await invoke<string | null>('local_name_get')) ?? '';
+      setLocalName(name);
+      setSavedLocalName(name);
+    } catch {
+      /* keep defaults */
+    }
   }, []);
 
   useEffect(() => {
     refresh();
   }, [refresh]);
+
+  const saveLocalName = async () => {
+    const trimmed = localName.trim();
+    if (trimmed === savedLocalName.trim()) return;
+    try {
+      await invoke('local_name_set', { name: trimmed });
+      setSavedLocalName(trimmed);
+      toast.success(
+        trimmed && trimmed !== 'You'
+          ? `Your turns will be labeled "${trimmed}"`
+          : 'Your turns will be labeled "You"',
+        { description: 'Applies the next time a meeting is enhanced or fixed up.' }
+      );
+    } catch (e) {
+      toast.error('Failed to save name', { description: typeof e === 'string' ? e : undefined });
+    }
+  };
 
   const remove = async (v: VoiceInfo) => {
     try {
@@ -64,6 +90,26 @@ export function KnownVoices() {
         People you have named with &ldquo;Rename &amp; remember&rdquo;. New meetings are matched
         against these voices locally — nothing leaves this Mac.
       </p>
+
+      <div className="mb-5 pb-5 border-b border-gray-100">
+        <label className="block text-sm font-medium text-gray-700 mb-1">Show yourself as</label>
+        <div className="flex items-center gap-2">
+          <input
+            value={localName}
+            onChange={(e) => setLocalName(e.target.value)}
+            onBlur={saveLocalName}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter') (e.target as HTMLInputElement).blur();
+            }}
+            placeholder="You"
+            className="w-56 px-3 py-1.5 border border-gray-200 rounded-md text-sm focus:outline-none focus:ring-1 focus:ring-blue-500"
+          />
+        </div>
+        <p className="text-xs text-gray-400 mt-1">
+          Your side is identified from the microphone channel. Leave empty to show
+          &ldquo;You&rdquo;; a name here is used the next time a meeting is enhanced.
+        </p>
+      </div>
 
       {voices === null ? (
         <p className="text-sm text-gray-400">Loading…</p>

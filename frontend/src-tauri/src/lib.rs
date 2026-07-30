@@ -763,6 +763,8 @@ pub fn run() {
             audio::voiceprints::speaker_clear_name,
             audio::voiceprints::voices_list,
             audio::voiceprints::voice_delete,
+            audio::voiceprints::local_name_get,
+            audio::voiceprints::local_name_set,
             // Import audio commands
             audio::import::select_and_validate_audio_command,
             audio::import::validate_audio_file_command,
