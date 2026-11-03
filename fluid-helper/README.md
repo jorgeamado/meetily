@@ -40,7 +40,19 @@ swift test --filter FluidHelperCoreTests
      ```
      Loading an already-loaded version is a fast no-op that still responds with `loaded`. Loading a different version replaces the currently loaded model.
 
-2. **Transcribe WAV file**
+2. **Model status**
+   - Request:
+     ```json
+     {"type":"status","version":"v3","models_dir":"/abs/path"}
+     ```
+     (`"version"` may be `"v3"` or `"ultra"`.)
+   - Response:
+     ```json
+     {"type":"status","version":"v3","downloaded":true,"path":"/abs/path/parakeet-tdt-0.6b-v3"}
+     ```
+     Checks `AsrModels.modelsExist(at:version:)` using the same repository path resolution as `load`, without downloading or loading any models. Works when no model is loaded.
+
+3. **Transcribe WAV file**
    - Request:
      ```json
      {"type":"transcribe","id":7,"wav_path":"/abs/file.wav"}
@@ -52,15 +64,15 @@ swift test --filter FluidHelperCoreTests
      ```
      Tokens are decoded text pieces where a leading space marks a word start. FluidAudio's `language` script filter is intentionally omitted so mixed Cyrillic/Latin speech is preserved.
 
-3. **Ping**
+4. **Ping**
    - Request: `{"type":"ping"}`
    - Response: `{"type":"pong"}`
 
-4. **Shutdown**
+5. **Shutdown**
    - Request: `{"type":"shutdown"}`
    - Response: `{"type":"goodbye"}` (then exits `0`)
 
-5. **Errors**
+6. **Errors**
    - Any request or runtime failure emits:
      ```json
      {"type":"error","id":7,"message":"..."}

@@ -1,6 +1,8 @@
 // FluidAudio Parakeet (CoreML / Apple Neural Engine) speech-to-text sidecar client.
 // Communicates with the `fluid-helper` Swift binary over line-delimited JSON on stdin/stdout.
 
+pub mod commands;
+
 use crate::audio::diarization::{build_wav_bytes, target_triple, WordSpan};
 use anyhow::{anyhow, Context, Result};
 use log::{debug, info, warn};
@@ -19,10 +21,13 @@ use uuid::Uuid;
 
 const MACOS_ONLY_ERR: &str = "FluidAudio transcription is only available on macOS";
 const LOAD_LINE_TIMEOUT: Duration = Duration::from_secs(600);
+const STATUS_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const MIN_TRANSCRIBE_TIMEOUT_SECS: f64 = 60.0;
 const TRANSCRIBE_DURATION_MULTIPLIER: f64 = 10.0;
 const SAMPLE_RATE_HZ: f64 = 16000.0;
+/// FluidAudio rejects audio shorter than 300 ms ("Must be at least 300ms of 16kHz audio").
+const MIN_TRANSCRIBE_SAMPLES: usize = 4800;
 
 /// Global FluidAudio engine instance shared across batch retranscription and audio import.
 pub static FLUID_ENGINE: Lazy<Arc<FluidAudioEngine>> =
@@ -108,12 +113,27 @@ pub struct FluidTranscript {
     pub words: Vec<WordSpan>,
 }
 
+/// On-disk model readiness status returned by `FluidAudioEngine::model_status`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FluidModelStatus {
+    pub downloaded: bool,
+    pub path: PathBuf,
+}
+
 // ============================================================================
 // Wire Protocol Types
 // ============================================================================
 
 #[derive(Debug, Serialize)]
 pub(crate) struct LoadRequest<'a> {
+    #[serde(rename = "type")]
+    pub req_type: &'static str,
+    pub version: &'a str,
+    pub models_dir: &'a str,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct StatusRequest<'a> {
     #[serde(rename = "type")]
     pub req_type: &'static str,
     pub version: &'a str,
@@ -184,6 +204,12 @@ pub(crate) enum HelperResponse {
         version: Option<String>,
         #[serde(default)]
         load_secs: Option<f64>,
+    },
+    Status {
+        #[serde(default)]
+        version: Option<String>,
+        downloaded: bool,
+        path: String,
     },
     Result {
         id: i64,
@@ -460,6 +486,10 @@ impl FluidJobBookkeeping {
     pub(crate) fn active_model(&self) -> Option<FluidModel> {
         self.active_model
     }
+
+    pub(crate) fn is_model_in_use(&self, model: FluidModel) -> bool {
+        self.active_jobs > 0 && self.active_model == Some(model)
+    }
 }
 
 /// RAII guard representing an active batch transcription job on `FluidAudioEngine`.
@@ -572,6 +602,15 @@ impl FluidAudioEngine {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .active_jobs()
+    }
+
+    /// Check whether `model` is currently in use by one or more active batch jobs.
+    pub fn is_model_in_use(&self, model: FluidModel) -> bool {
+        self.inner
+            .jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_model_in_use(model)
     }
 
     fn spawn_helper() -> Result<HelperProcess> {
@@ -858,6 +897,247 @@ impl FluidAudioEngine {
         })
     }
 
+    async fn send_status_command(
+        proc: &mut HelperProcess,
+        model: FluidModel,
+        models_dir: &Path,
+    ) -> std::result::Result<FluidModelStatus, (bool, anyhow::Error)> {
+        let models_dir_str = models_dir.to_string_lossy();
+        let req = StatusRequest {
+            req_type: "status",
+            version: model.wire_version(),
+            models_dir: &models_dir_str,
+        };
+        let mut payload = serde_json::to_string(&req)
+            .map_err(|e| (false, anyhow!("Failed to serialize status request: {}", e)))?;
+        payload.push('\n');
+
+        let io_fut = async {
+            proc.stdin
+                .write_all(payload.as_bytes())
+                .await
+                .map_err(|e| {
+                    (
+                        true,
+                        anyhow!("Failed to write status request to fluid-helper: {}", e),
+                    )
+                })?;
+            proc.stdin
+                .flush()
+                .await
+                .map_err(|e| (true, anyhow!("Failed to flush fluid-helper stdin: {}", e)))?;
+
+            let mut line = String::new();
+            loop {
+                line.clear();
+                let bytes_read = proc.stdout.read_line(&mut line).await.map_err(|e| {
+                    (
+                        true,
+                        anyhow!(
+                            "Failed reading from fluid-helper stdout during status: {}",
+                            e
+                        ),
+                    )
+                })?;
+                if bytes_read == 0 {
+                    return Err((
+                        true,
+                        anyhow!(
+                            "fluid-helper exited unexpectedly (EOF) while checking status for '{}'",
+                            model.model_id()
+                        ),
+                    ));
+                }
+
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                match serde_json::from_str::<HelperResponse>(trimmed) {
+                    Ok(HelperResponse::Status {
+                        downloaded, path, ..
+                    }) => {
+                        return Ok(FluidModelStatus {
+                            downloaded,
+                            path: PathBuf::from(path),
+                        });
+                    }
+                    Ok(HelperResponse::Error { message, .. }) => {
+                        return Err((
+                            false,
+                            anyhow!(
+                                "fluid-helper failed to check status for model '{}': {}",
+                                model.model_id(),
+                                message
+                            ),
+                        ));
+                    }
+                    Ok(other) => {
+                        debug!(
+                            "Ignoring unexpected fluid-helper response during status: {:?}",
+                            other
+                        );
+                    }
+                    Err(e) => {
+                        debug!(
+                            "Ignoring malformed fluid-helper line during status ({}): {}",
+                            e, trimmed
+                        );
+                    }
+                }
+            }
+        };
+
+        match tokio::time::timeout(STATUS_TIMEOUT, io_fut).await {
+            Ok(res) => res,
+            Err(_) => Err((
+                true,
+                anyhow!(
+                    "Timed out after {:?} waiting for fluid-helper status of '{}'",
+                    STATUS_TIMEOUT,
+                    model.model_id()
+                ),
+            )),
+        }
+    }
+
+    async fn model_status_locked(
+        &self,
+        proc_guard: &mut Option<HelperProcess>,
+        model: FluidModel,
+        models_dir: &Path,
+    ) -> Result<FluidModelStatus> {
+        if !cfg!(target_os = "macos") {
+            return Err(anyhow!(MACOS_ONLY_ERR));
+        }
+
+        if let Some(proc) = proc_guard.as_mut() {
+            match proc.child.try_wait() {
+                Ok(None) => {}
+                Ok(Some(status)) => {
+                    info!(
+                        "fluid-helper had exited with status {}; respawning for status",
+                        status
+                    );
+                    *proc_guard = None;
+                    *self.inner.loaded_model.lock().await = None;
+                    *self.inner.models_dir.lock().await = None;
+                }
+                Err(e) => {
+                    warn!("Failed to check fluid-helper status ({}); respawning", e);
+                    *proc_guard = None;
+                    *self.inner.loaded_model.lock().await = None;
+                    *self.inner.models_dir.lock().await = None;
+                }
+            }
+        }
+
+        std::fs::create_dir_all(models_dir).with_context(|| {
+            format!(
+                "Failed to create FluidAudio models dir: {}",
+                models_dir.display()
+            )
+        })?;
+
+        if proc_guard.is_none() {
+            *proc_guard = Some(Self::spawn_helper()?);
+        }
+
+        let proc = proc_guard.as_mut().expect("helper process spawned above");
+        match Self::send_status_command(proc, model, models_dir).await {
+            Ok(status) => Ok(status),
+            Err((kill_and_clear, err)) => {
+                if kill_and_clear {
+                    self.clear_state_and_kill(proc_guard).await;
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Query `fluid-helper` for on-disk readiness and resolved path of `model` under `models_dir`.
+    /// Spawns `fluid-helper` if it is not already running, without loading any model.
+    pub async fn model_status(
+        &self,
+        model: FluidModel,
+        models_dir: &Path,
+    ) -> Result<FluidModelStatus> {
+        if !cfg!(target_os = "macos") {
+            return Err(anyhow!(MACOS_ONLY_ERR));
+        }
+
+        let mut proc_guard = self.inner.process.lock().await;
+        self.model_status_locked(&mut proc_guard, model, models_dir)
+            .await
+    }
+
+    /// Atomically check that `model` is not in use by an active job, shut down the helper if `model`
+    /// is currently loaded and idle, query its on-disk path via `status`, run `verify` on the path,
+    /// and delete the directory — all while holding the process mutex so no job can start in between.
+    pub async fn delete_model_files(
+        &self,
+        model: FluidModel,
+        models_dir: &Path,
+        verify: impl FnOnce(&Path) -> Result<()>,
+    ) -> Result<()> {
+        let mut proc_guard = self.inner.process.lock().await;
+
+        let active_jobs = {
+            let jobs = self
+                .inner
+                .jobs
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if jobs.is_model_in_use(model) {
+                return Err(anyhow!(
+                    "Cannot delete '{}' while it is in use by an active transcription job",
+                    model.model_id()
+                ));
+            }
+            jobs.active_jobs()
+        };
+
+        if !cfg!(target_os = "macos") {
+            return Err(anyhow!(MACOS_ONLY_ERR));
+        }
+
+        let is_loaded_model = *self.inner.loaded_model.lock().await == Some(model);
+        if is_loaded_model && active_jobs == 0 {
+            self.shutdown_locked(&mut proc_guard).await;
+        }
+
+        let status = self
+            .model_status_locked(&mut proc_guard, model, models_dir)
+            .await
+            .map_err(|e| anyhow!("Failed to inspect model '{}': {}", model.model_id(), e))?;
+
+        verify(&status.path)?;
+
+        if status.path.exists() {
+            std::fs::remove_dir_all(&status.path).map_err(|e| {
+                anyhow!(
+                    "Failed to remove FluidAudio model directory '{}': {}",
+                    status.path.display(),
+                    e
+                )
+            })?;
+            info!(
+                "Deleted FluidAudio model '{}' at '{}'",
+                model.model_id(),
+                status.path.display()
+            );
+        } else {
+            info!(
+                "FluidAudio model '{}' directory '{}' was already absent",
+                model.model_id(),
+                status.path.display()
+            );
+        }
+
+        Ok(())
+    }
+
     async fn run_transcribe_attempt(
         proc: &mut HelperProcess,
         req_id: i64,
@@ -1001,6 +1281,8 @@ impl FluidAudioEngine {
             .clone()
             .ok_or_else(|| anyhow!("No FluidAudio models directory configured"))?;
 
+        let samples = pad_to_min_transcribe_len(samples);
+        let samples = samples.as_ref();
         let wav_bytes = build_wav_bytes(samples);
         let temp_path = std::env::temp_dir().join(format!("meetily-fluid-{}.wav", Uuid::new_v4()));
         let _temp_guard = TempWavGuard(temp_path.clone());
@@ -1217,9 +1499,36 @@ impl crate::audio::transcription::provider::TranscriptionProvider for FluidAudio
 // Tests
 // ============================================================================
 
+/// Pad short clips with trailing silence up to FluidAudio's minimum length. Trailing
+/// padding leaves the word timestamps (relative to the clip start) unchanged.
+fn pad_to_min_transcribe_len(samples: &[f32]) -> std::borrow::Cow<'_, [f32]> {
+    if samples.len() >= MIN_TRANSCRIBE_SAMPLES {
+        return std::borrow::Cow::Borrowed(samples);
+    }
+    let mut padded = Vec::with_capacity(MIN_TRANSCRIBE_SAMPLES);
+    padded.extend_from_slice(samples);
+    padded.resize(MIN_TRANSCRIBE_SAMPLES, 0.0);
+    std::borrow::Cow::Owned(padded)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn short_clips_are_padded_to_fluidaudio_minimum() {
+        let short = vec![0.5f32; 1600];
+        let padded = pad_to_min_transcribe_len(&short);
+        assert_eq!(padded.len(), MIN_TRANSCRIBE_SAMPLES);
+        assert_eq!(&padded[..1600], &short[..]);
+        assert!(padded[1600..].iter().all(|&x| x == 0.0));
+
+        let long = vec![0.5f32; MIN_TRANSCRIBE_SAMPLES + 1];
+        assert!(matches!(
+            pad_to_min_transcribe_len(&long),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
 
     #[test]
     fn parses_fluid_model_ids_and_wire_versions() {
@@ -1280,6 +1589,29 @@ mod tests {
             HelperResponse::Loaded {
                 version: Some("v3".to_string()),
                 load_secs: Some(12.3),
+            }
+        );
+
+        // 2b. status
+        let status_raw = r#"{"type":"status","version":"v3","downloaded":true,"path":"/abs/models/parakeet-tdt-0.6b-v3","extra":1}"#;
+        let status: HelperResponse = serde_json::from_str(status_raw).unwrap();
+        assert_eq!(
+            status,
+            HelperResponse::Status {
+                version: Some("v3".to_string()),
+                downloaded: true,
+                path: "/abs/models/parakeet-tdt-0.6b-v3".to_string(),
+            }
+        );
+
+        let status_missing_raw = r#"{"type":"status","version":"ultra","downloaded":false,"path":"/abs/models/parakeet-ultra"}"#;
+        let status_missing: HelperResponse = serde_json::from_str(status_missing_raw).unwrap();
+        assert_eq!(
+            status_missing,
+            HelperResponse::Status {
+                version: Some("ultra".to_string()),
+                downloaded: false,
+                path: "/abs/models/parakeet-ultra".to_string(),
             }
         );
 
@@ -1621,6 +1953,8 @@ mod tests {
             jobs.begin(FluidModel::V3).unwrap();
         }
         assert_eq!(engine.active_job_count(), 2);
+        assert!(engine.is_model_in_use(FluidModel::V3));
+        assert!(!engine.is_model_in_use(FluidModel::Ultra));
 
         let guard1 = FluidJobGuard {
             engine: Arc::clone(&engine),
@@ -1631,9 +1965,40 @@ mod tests {
 
         drop(guard1);
         assert_eq!(engine.active_job_count(), 1);
+        assert!(engine.is_model_in_use(FluidModel::V3));
 
         drop(guard2);
         assert_eq!(engine.active_job_count(), 0);
+        assert!(!engine.is_model_in_use(FluidModel::V3));
+    }
+
+    #[tokio::test]
+    async fn delete_model_files_refuses_when_model_is_in_use() {
+        let engine = FluidAudioEngine::new();
+        {
+            let mut jobs = engine.inner.jobs.lock().unwrap();
+            jobs.begin(FluidModel::V3).unwrap();
+        }
+
+        let mut verify_called = false;
+        let err = engine
+            .delete_model_files(FluidModel::V3, Path::new("/tmp"), |_| {
+                verify_called = true;
+                Ok(())
+            })
+            .await
+            .unwrap_err()
+            .to_string();
+
+        assert!(
+            err.contains("Cannot delete 'fluid-parakeet-v3' while it is in use"),
+            "Unexpected error message: {}",
+            err
+        );
+        assert!(
+            !verify_called,
+            "verify callback must not run when model is in use"
+        );
     }
 
     fn parse_pcm16_mono_16k_wav(bytes: &[u8]) -> Result<Vec<f32>> {

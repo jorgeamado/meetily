@@ -10,17 +10,28 @@ actor FakeTranscriber: Transcriber {
         let modelsDir: String
     }
 
+    struct StatusCall: Sendable, Equatable {
+        let version: ModelVersion
+        let modelsDir: String
+    }
+
     struct TranscribeCall: Sendable, Equatable {
         let wavPath: String
         let includeTokens: Bool
     }
 
     private(set) var loadCalls: [LoadCall] = []
+    private(set) var statusCalls: [StatusCall] = []
     private(set) var transcribeCalls: [TranscribeCall] = []
     var simulatedLoadSecs: Double = 1.25
+    var downloadedVersions: Set<ModelVersion> = []
     var failingWavPaths: Set<String> = []
     var failingLoadVersions: Set<ModelVersion> = []
     var remainingLoadFailures: Int = 0
+
+    func setDownloadedVersions(_ versions: Set<ModelVersion>) {
+        downloadedVersions = versions
+    }
 
     func setFailingWavPaths(_ paths: Set<String>) {
         failingWavPaths = paths
@@ -32,6 +43,32 @@ actor FakeTranscriber: Transcriber {
 
     func setRemainingLoadFailures(_ count: Int) {
         remainingLoadFailures = count
+    }
+
+    private static func fakeFolderName(for version: ModelVersion) -> String {
+        switch version {
+        case .v3:
+            return "parakeet-tdt-0.6b-v3"
+        case .ultra:
+            return "parakeet-ultra"
+        }
+    }
+
+    func modelStatus(
+        version: ModelVersion,
+        modelsDir: String
+    ) async throws -> ModelStatusOutput {
+        statusCalls.append(StatusCall(version: version, modelsDir: modelsDir))
+        let expandedBaseDir = (modelsDir as NSString).expandingTildeInPath
+        let baseDirURL = URL(fileURLWithPath: expandedBaseDir, isDirectory: true)
+        let modelDirURL = baseDirURL.appendingPathComponent(
+            Self.fakeFolderName(for: version),
+            isDirectory: true
+        )
+        return ModelStatusOutput(
+            downloaded: downloadedVersions.contains(version),
+            path: modelDirURL.path
+        )
     }
 
     func load(
@@ -49,6 +86,7 @@ actor FakeTranscriber: Transcriber {
         }
         onProgress(.download, 0.5)
         onProgress(.compile, 1.0)
+        downloadedVersions.insert(version)
         return simulatedLoadSecs
     }
 
@@ -94,6 +132,16 @@ struct FluidHelperCoreTests {
             from: #"{"type":"load","version":"ultra","models_dir":"/abs/models"}"#
         )
         #expect(loadUltra == .load(version: .ultra, modelsDir: "/abs/models"))
+
+        let statusV3 = try ProtocolCodec.decodeRequest(
+            from: #"{"type":"status","version":"v3","models_dir":"/abs/path"}"#
+        )
+        #expect(statusV3 == .status(version: .v3, modelsDir: "/abs/path"))
+
+        let statusUltra = try ProtocolCodec.decodeRequest(
+            from: #"{"type":"status","version":"ultra","models_dir":"/abs/models"}"#
+        )
+        #expect(statusUltra == .status(version: .ultra, modelsDir: "/abs/models"))
 
         let transcribeDefault = try ProtocolCodec.decodeRequest(
             from: #"{"type":"transcribe","id":7,"wav_path":"/abs/file.wav"}"#
@@ -144,6 +192,26 @@ struct FluidHelperCoreTests {
         #expect(throws: ProtocolError.invalidField(field: "models_dir", reason: "must not be empty")) {
             _ = try ProtocolCodec.decodeRequest(
                 from: #"{"type":"load","version":"v3","models_dir":"   "}"#
+            )
+        }
+
+        #expect(throws: ProtocolError.unknownVersion("v2")) {
+            _ = try ProtocolCodec.decodeRequest(
+                from: #"{"type":"status","version":"v2","models_dir":"/abs/path"}"#
+            )
+        }
+
+        #expect(throws: ProtocolError.missingField("version")) {
+            _ = try ProtocolCodec.decodeRequest(from: #"{"type":"status","models_dir":"/abs/path"}"#)
+        }
+
+        #expect(throws: ProtocolError.missingField("models_dir")) {
+            _ = try ProtocolCodec.decodeRequest(from: #"{"type":"status","version":"v3"}"#)
+        }
+
+        #expect(throws: ProtocolError.invalidField(field: "models_dir", reason: "must not be empty")) {
+            _ = try ProtocolCodec.decodeRequest(
+                from: #"{"type":"status","version":"v3","models_dir":"   "}"#
             )
         }
 
@@ -214,6 +282,17 @@ struct FluidHelperCoreTests {
         #expect(loadedObj["type"] as? String == "loaded")
         #expect(loadedObj["version"] as? String == "v3")
         #expect(loadedObj["load_secs"] as? Double == 12.3)
+
+        // 2b. status
+        let statusJSON = try ProtocolCodec.encodeResponse(
+            .status(version: .v3, downloaded: true, path: "/abs/models/parakeet-tdt-0.6b-v3")
+        )
+        let statusObj = try parseJSONObject(statusJSON)
+        #expect(Set(statusObj.keys) == Set(["type", "version", "downloaded", "path"]))
+        #expect(statusObj["type"] as? String == "status")
+        #expect(statusObj["version"] as? String == "v3")
+        #expect(statusObj["downloaded"] as? Bool == true)
+        #expect(statusObj["path"] as? String == "/abs/models/parakeet-tdt-0.6b-v3")
 
         // 3. result (with tokens)
         let resultWithTokens = Response.result(
@@ -491,6 +570,88 @@ struct FluidHelperCoreTests {
             recordedLoadCalls == [
                 FakeTranscriber.LoadCall(version: .v3, modelsDir: "/tmp/models"),
                 FakeTranscriber.LoadCall(version: .v3, modelsDir: "/tmp/models"),
+            ]
+        )
+    }
+
+    @Test("Status works before any load, rejects unknown version with error, and keeps loop running")
+    func statusBeforeLoadAndUnknownVersion() async throws {
+        let fake = FakeTranscriber()
+        await fake.setDownloadedVersions([.ultra])
+        let session = ProtocolSession(transcriber: fake)
+
+        let inputLines = [
+            // 1. Status before any model is loaded (v3 not downloaded)
+            #"{"type":"status","version":"v3","models_dir":"/tmp/models"}"#,
+            // 2. Status before any model is loaded (ultra downloaded)
+            #"{"type":"status","version":"ultra","models_dir":"/tmp/models"}"#,
+            // 3. Status with an unknown version returns error and loop keeps running
+            #"{"type":"status","version":"v2","models_dir":"/tmp/models"}"#,
+            // 4. Transcribe still fails because status did not load any model
+            #"{"type":"transcribe","id":5,"wav_path":"/abs/clip.wav"}"#,
+            // 5. Load v3 marks v3 downloaded and loads it
+            #"{"type":"load","version":"v3","models_dir":"/tmp/models"}"#,
+            // 6. Status for v3 now reports downloaded: true
+            #"{"type":"status","version":"v3","models_dir":"/tmp/models"}"#,
+            // 7. Shutdown
+            #"{"type":"shutdown"}"#,
+        ]
+
+        let outputLines = await session.runLines(inputLines)
+        let decodedResponses = try outputLines.map { line -> Response in
+            try JSONDecoder().decode(Response.self, from: Data(line.utf8))
+        }
+
+        #expect(decodedResponses.count == 9)
+
+        // 1. status v3 (downloaded: false)
+        #expect(
+            decodedResponses[0]
+                == .status(version: .v3, downloaded: false, path: "/tmp/models/parakeet-tdt-0.6b-v3")
+        )
+
+        // 2. status ultra (downloaded: true)
+        #expect(
+            decodedResponses[1]
+                == .status(version: .ultra, downloaded: true, path: "/tmp/models/parakeet-ultra")
+        )
+
+        // 3. unknown version -> error with id: nil
+        if case .error(let id, let message) = decodedResponses[2] {
+            #expect(id == nil)
+            #expect(message.contains("v2"))
+        } else {
+            Issue.record("Expected error response for unknown status version")
+        }
+
+        // 4. transcribe still fails with modelNotLoaded (id 5)
+        if case .error(let id, let message) = decodedResponses[3] {
+            #expect(id == 5)
+            #expect(message.contains("load"))
+        } else {
+            Issue.record("Expected modelNotLoaded error after status without load")
+        }
+
+        // 5. load v3 -> 2 progress lines + loaded
+        #expect(decodedResponses[4] == .progress(stage: .download, fraction: 0.5))
+        #expect(decodedResponses[5] == .progress(stage: .compile, fraction: 1.0))
+        #expect(decodedResponses[6] == .loaded(version: .v3, loadSecs: 1.25))
+
+        // 6. status v3 after load (downloaded: true)
+        #expect(
+            decodedResponses[7]
+                == .status(version: .v3, downloaded: true, path: "/tmp/models/parakeet-tdt-0.6b-v3")
+        )
+
+        // 7. goodbye
+        #expect(decodedResponses[8] == .goodbye)
+
+        let recordedStatusCalls = await fake.statusCalls
+        #expect(
+            recordedStatusCalls == [
+                FakeTranscriber.StatusCall(version: .v3, modelsDir: "/tmp/models"),
+                FakeTranscriber.StatusCall(version: .ultra, modelsDir: "/tmp/models"),
+                FakeTranscriber.StatusCall(version: .v3, modelsDir: "/tmp/models"),
             ]
         )
     }

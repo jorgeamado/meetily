@@ -24,6 +24,7 @@ import { toast } from 'sonner';
 import { useConfig } from '@/contexts/ConfigContext';
 import { LANGUAGES } from '@/constants/languages';
 import { useTranscriptionModels, ModelOption } from '@/hooks/useTranscriptionModels';
+import { isAutoLanguageOnlyProvider } from '@/lib/transcription-model-readiness';
 import { configService } from '@/services/configService';
 import Analytics from '@/lib/analytics';
 
@@ -160,13 +161,13 @@ export function RetranscribeDialog({
     const name = selectedModelKey.slice(colonIndex + 1);
     return availableModels.find(m => m.provider === provider && m.name === name);
   }, [selectedModelKey, availableModels]);
-  const isParakeetModel = selectedModelDetails?.provider === 'parakeet';
+  const isAutoLanguageOnly = isAutoLanguageOnlyProvider(selectedModelDetails?.provider);
 
   useEffect(() => {
-    if (isParakeetModel && selectedLang !== 'auto') {
+    if (isAutoLanguageOnly && selectedLang !== 'auto') {
       setSelectedLang('auto');
     }
-  }, [isParakeetModel, selectedLang]);
+  }, [isAutoLanguageOnly, selectedLang]);
 
   // Reset state only when dialog transitions from closed to open
   // This prevents re-initialization when config changes while dialog is already open
@@ -279,7 +280,7 @@ export function RetranscribeDialog({
     setCurrentStage(null);
 
     try {
-      const languageToSend = isParakeetModel ? null : selectedLang === 'auto' ? null : selectedLang;
+      const languageToSend = isAutoLanguageOnly ? null : selectedLang === 'auto' ? null : selectedLang;
       const parsedNumSpeakers = numSpeakers.trim() === '' ? null : parseInt(numSpeakers, 10);
       const diarize: DiarizeOptions = {
         enabled: diarizeEnabled,
@@ -290,7 +291,7 @@ export function RetranscribeDialog({
       };
 
       await Analytics.track('enhance_transcript_started', {
-        language: isParakeetModel ? 'auto' : (selectedLang === 'auto' ? 'auto' : selectedLang),
+        language: isAutoLanguageOnly ? 'auto' : (selectedLang === 'auto' ? 'auto' : selectedLang),
         model_provider: selectedModelDetails?.provider || '',
         model_name: selectedModelDetails?.name || '',
         diarize_enabled: diarizeEnabled.toString(),
@@ -303,7 +304,7 @@ export function RetranscribeDialog({
         model: selectedModelDetails?.name || null,
         provider: selectedModelDetails?.provider || null,
         diarize,
-        repair: isParakeetModel ? null : llmRepair,
+        repair: isAutoLanguageOnly ? null : llmRepair,
       });
 
       // Progress and the streaming transcript are shown inline by the
@@ -400,7 +401,7 @@ export function RetranscribeDialog({
 
         <div className="space-y-4 py-4">
           {!isProcessing && !error && (
-            !isParakeetModel ? (
+            !isAutoLanguageOnly ? (
               <div className="space-y-3">
                 <div className="flex items-center gap-2">
                   <Globe className="h-4 w-4 text-muted-foreground" />
@@ -459,7 +460,7 @@ export function RetranscribeDialog({
             </div>
           )}
 
-          {!isProcessing && !error && !isParakeetModel && (
+          {!isProcessing && !error && !isAutoLanguageOnly && (
             <div className="flex items-center justify-between gap-2">
               <div className="space-y-0.5">
                 <span className="text-sm font-medium">AI wording check</span>

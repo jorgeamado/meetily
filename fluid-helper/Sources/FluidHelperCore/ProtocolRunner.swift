@@ -27,6 +27,17 @@ public struct TranscriptionOutput: Sendable, Equatable {
     }
 }
 
+/// Status information returned by a `Transcriber` for a model version.
+public struct ModelStatusOutput: Sendable, Equatable {
+    public let downloaded: Bool
+    public let path: String
+
+    public init(downloaded: Bool, path: String) {
+        self.downloaded = downloaded
+        self.path = path
+    }
+}
+
 /// Abstraction over the speech-to-text backend so the JSON protocol loop can be tested without CoreML/FluidAudio.
 public protocol Transcriber: Sendable {
     /// Download (if missing) and load the specified model version from `<modelsDir>/<repo.folderName>`.
@@ -36,6 +47,13 @@ public protocol Transcriber: Sendable {
         modelsDir: String,
         onProgress: @escaping @Sendable (ProgressStage, Double) -> Void
     ) async throws -> Double
+
+    /// Check whether the specified model version is downloaded and load-ready at `<modelsDir>/<repo.folderName>`
+    /// without downloading or loading any models.
+    func modelStatus(
+        version: ModelVersion,
+        modelsDir: String
+    ) async throws -> ModelStatusOutput
 
     /// Transcribe the WAV file at `wavPath`.
     func transcribe(
@@ -263,6 +281,10 @@ public actor ProtocolSession {
             await handleLoad(version: version, modelsDir: modelsDir, emit: emit)
             return true
 
+        case .status(let version, let modelsDir):
+            await handleStatus(version: version, modelsDir: modelsDir, emit: emit)
+            return true
+
         case .transcribe(let id, let wavPath, let includeTokens):
             await handleTranscribe(id: id, wavPath: wavPath, includeTokens: includeTokens, emit: emit)
             return true
@@ -283,6 +305,19 @@ public actor ProtocolSession {
         }
 
         return outputLines.withLock { $0 }
+    }
+
+    private func handleStatus(
+        version: ModelVersion,
+        modelsDir: String,
+        emit: @Sendable (Response) -> Void
+    ) async {
+        do {
+            let status = try await transcriber.modelStatus(version: version, modelsDir: modelsDir)
+            emit(.status(version: version, downloaded: status.downloaded, path: status.path))
+        } catch {
+            emit(.error(id: nil, message: ProtocolCodec.describeError(error)))
+        }
     }
 
     private func handleLoad(

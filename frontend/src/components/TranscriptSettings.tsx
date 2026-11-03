@@ -9,6 +9,7 @@ import { Switch } from './ui/switch';
 import { Eye, EyeOff, Lock, Unlock } from 'lucide-react';
 import { ModelManager } from './WhisperModelManager';
 import { ParakeetModelManager } from './ParakeetModelManager';
+import { FluidAudioModelManager } from './FluidAudioModelManager';
 import { configService } from '@/services/configService';
 
 type SensitivityOption = 'merge' | 'balanced' | 'split';
@@ -230,6 +231,23 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
     const [numSpeakers, setNumSpeakers] = useState('');
     const [sensitivity, setSensitivity] = useState<SensitivityOption>('balanced');
     const [embeddingModel, setEmbeddingModel] = useState<EmbeddingModelOption>('campplus');
+    const [fluidAvailable, setFluidAvailable] = useState(false);
+
+    useEffect(() => {
+        let cancelled = false;
+        invoke<boolean>('fluid_is_available')
+            .then((available) => {
+                if (!cancelled) {
+                    setFluidAvailable(Boolean(available));
+                }
+            })
+            .catch(() => {
+                if (!cancelled) {
+                    setFluidAvailable(false);
+                }
+            });
+        return () => { cancelled = true; };
+    }, []);
 
     // Load saved speaker identification defaults on mount
     useEffect(() => {
@@ -465,6 +483,18 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                     </Button>
                                 </div>
                             </div>
+                        </div>
+                    )}
+
+                    {fluidAvailable && (
+                        <div className="pt-4 border-t border-gray-200">
+                            <h3 className="text-lg font-semibold text-gray-900">
+                                Neural Engine transcription (macOS)
+                            </h3>
+                            <p className="text-xs text-gray-500 mt-1 mb-4">
+                                Parakeet on the Apple Neural Engine, used when you retranscribe a meeting or import audio. Live recording support is coming.
+                            </p>
+                            <FluidAudioModelManager />
                         </div>
                     )}
 

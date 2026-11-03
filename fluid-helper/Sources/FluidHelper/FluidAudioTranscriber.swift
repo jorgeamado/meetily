@@ -42,6 +42,30 @@ actor FluidAudioTranscriber: Transcriber {
 
     init() {}
 
+    private static func resolveModelDirectory(version: ModelVersion, modelsDir: String) -> URL {
+        let expandedBaseDir = (modelsDir as NSString).expandingTildeInPath
+        let baseDirURL = URL(fileURLWithPath: expandedBaseDir, isDirectory: true)
+        return baseDirURL.appendingPathComponent(
+            version.fluidAudioRepo.folderName,
+            isDirectory: true
+        )
+    }
+
+    func modelStatus(
+        version: ModelVersion,
+        modelsDir: String
+    ) async throws -> ModelStatusOutput {
+        let modelDirURL = Self.resolveModelDirectory(version: version, modelsDir: modelsDir)
+        let downloaded = AsrModels.modelsExist(
+            at: modelDirURL,
+            version: version.fluidAudioVersion
+        )
+        return ModelStatusOutput(
+            downloaded: downloaded,
+            path: modelDirURL.path
+        )
+    }
+
     func load(
         version: ModelVersion,
         modelsDir: String,
@@ -58,12 +82,7 @@ actor FluidAudioTranscriber: Transcriber {
         }
 
         let startTime = Date()
-        let expandedBaseDir = (modelsDir as NSString).expandingTildeInPath
-        let baseDirURL = URL(fileURLWithPath: expandedBaseDir, isDirectory: true)
-        let modelDirURL = baseDirURL.appendingPathComponent(
-            version.fluidAudioRepo.folderName,
-            isDirectory: true
-        )
+        let modelDirURL = Self.resolveModelDirectory(version: version, modelsDir: modelsDir)
 
         let asrVersion = version.fluidAudioVersion
         let bridge = LoadProgressBridge(onProgress: onProgress)

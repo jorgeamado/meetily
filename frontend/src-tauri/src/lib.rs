@@ -638,6 +638,11 @@ pub fn run() {
             parakeet_engine::commands::parakeet_cancel_download,
             parakeet_engine::commands::parakeet_delete_corrupted_model,
             parakeet_engine::commands::open_parakeet_models_folder,
+            // FluidAudio (Apple Neural Engine) commands
+            fluid_engine::commands::fluid_is_available,
+            fluid_engine::commands::fluid_get_available_models,
+            fluid_engine::commands::fluid_download_model,
+            fluid_engine::commands::fluid_delete_model,
             // Parallel processing commands
             whisper_engine::parallel_commands::initialize_parallel_processor,
             whisper_engine::parallel_commands::start_parallel_processing,

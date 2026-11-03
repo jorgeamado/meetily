@@ -105,6 +105,7 @@ public enum ProtocolError: Error, LocalizedError, Sendable, Equatable {
 /// Inbound protocol request read from a single JSON line on `stdin`.
 public enum Request: Sendable, Equatable, Codable {
     case load(version: ModelVersion, modelsDir: String)
+    case status(version: ModelVersion, modelsDir: String)
     case transcribe(id: Int, wavPath: String, tokens: Bool)
     case ping
     case shutdown
@@ -140,6 +141,17 @@ public enum Request: Sendable, Equatable, Codable {
             }
             self = .load(version: version, modelsDir: modelsDir)
 
+        case "status":
+            let rawVersion = try Self.decodeRequired(String.self, forKey: .version, in: container)
+            guard let version = ModelVersion(rawValue: rawVersion) else {
+                throw ProtocolError.unknownVersion(rawVersion)
+            }
+            let modelsDir = try Self.decodeRequired(String.self, forKey: .modelsDir, in: container)
+            guard !modelsDir.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw ProtocolError.invalidField(field: "models_dir", reason: "must not be empty")
+            }
+            self = .status(version: version, modelsDir: modelsDir)
+
         case "transcribe":
             let id = try Self.decodeRequired(Int.self, forKey: .id, in: container)
             let wavPath = try Self.decodeRequired(String.self, forKey: .wavPath, in: container)
@@ -165,6 +177,10 @@ public enum Request: Sendable, Equatable, Codable {
         switch self {
         case .load(let version, let modelsDir):
             try container.encode("load", forKey: .type)
+            try container.encode(version, forKey: .version)
+            try container.encode(modelsDir, forKey: .modelsDir)
+        case .status(let version, let modelsDir):
+            try container.encode("status", forKey: .type)
             try container.encode(version, forKey: .version)
             try container.encode(modelsDir, forKey: .modelsDir)
         case .transcribe(let id, let wavPath, let tokens):
@@ -218,6 +234,7 @@ public enum Request: Sendable, Equatable, Codable {
 public enum Response: Sendable, Equatable, Codable {
     case progress(stage: ProgressStage, fraction: Double)
     case loaded(version: ModelVersion, loadSecs: Double)
+    case status(version: ModelVersion, downloaded: Bool, path: String)
     case result(ResultPayload)
     case pong
     case goodbye
@@ -229,6 +246,8 @@ public enum Response: Sendable, Equatable, Codable {
         case fraction
         case version
         case loadSecs = "load_secs"
+        case downloaded
+        case path
         case id
         case text
         case confidence
@@ -251,6 +270,12 @@ public enum Response: Sendable, Equatable, Codable {
             try container.encode("loaded", forKey: .type)
             try container.encode(version, forKey: .version)
             try container.encode(loadSecs, forKey: .loadSecs)
+
+        case .status(let version, let downloaded, let path):
+            try container.encode("status", forKey: .type)
+            try container.encode(version, forKey: .version)
+            try container.encode(downloaded, forKey: .downloaded)
+            try container.encode(path, forKey: .path)
 
         case .result(let payload):
             try container.encode("result", forKey: .type)
@@ -293,6 +318,12 @@ public enum Response: Sendable, Equatable, Codable {
             let version = try container.decode(ModelVersion.self, forKey: .version)
             let loadSecs = try container.decode(Double.self, forKey: .loadSecs)
             self = .loaded(version: version, loadSecs: loadSecs)
+
+        case "status":
+            let version = try container.decode(ModelVersion.self, forKey: .version)
+            let downloaded = try container.decode(Bool.self, forKey: .downloaded)
+            let path = try container.decode(String.self, forKey: .path)
+            self = .status(version: version, downloaded: downloaded, path: path)
 
         case "result":
             let id = try container.decode(Int.self, forKey: .id)

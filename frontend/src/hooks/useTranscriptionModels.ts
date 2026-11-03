@@ -8,10 +8,20 @@ export interface RawModelInfo {
 }
 
 export interface ModelOption {
-  provider: 'whisper' | 'parakeet';
+  provider: 'whisper' | 'parakeet' | 'fluidAudio';
   name: string;
   displayName: string;
   size_mb: number;
+}
+
+function getFluidDisplayName(modelName: string): string {
+  if (modelName === 'fluid-parakeet-v3') {
+    return '🍎 Parakeet (Neural Engine): v3';
+  }
+  if (modelName === 'fluid-parakeet-ultra') {
+    return '🍎 Parakeet (Neural Engine): Ultra';
+  }
+  return `🍎 Parakeet (Neural Engine): ${modelName}`;
 }
 
 interface TranscriptModelConfig {
@@ -77,6 +87,25 @@ export function useTranscriptionModels(transcriptModelConfig: TranscriptModelCon
       console.error('Failed to fetch Parakeet models:', err);
     }
 
+    // Fetch FluidAudio (Apple Neural Engine) models when available on macOS
+    try {
+      const fluidAvailable = await invoke<boolean>('fluid_is_available');
+      if (fluidAvailable) {
+        const fluidModels = await invoke<RawModelInfo[]>('fluid_get_available_models');
+        const availableFluid = fluidModels
+          .filter((m) => m.status === 'Available')
+          .map((m) => ({
+            provider: 'fluidAudio' as const,
+            name: m.name,
+            displayName: getFluidDisplayName(m.name),
+            size_mb: m.size_mb,
+          }));
+        allModels.push(...availableFluid);
+      }
+    } catch (err) {
+      console.error('Failed to fetch FluidAudio models:', err);
+    }
+
     setAvailableModels(allModels);
 
     // Set default model based on user's saved configuration
@@ -88,17 +117,22 @@ export function useTranscriptionModels(transcriptModelConfig: TranscriptModelCon
     const configuredMatch = allModels.find(
       (m) =>
         (configuredProvider === 'localWhisper' && m.provider === 'whisper' && m.name === configuredModel) ||
-        (configuredProvider === 'parakeet' && m.provider === 'parakeet' && m.name === configuredModel)
+        (configuredProvider === 'parakeet' && m.provider === 'parakeet' && m.name === configuredModel) ||
+        (configuredProvider === 'fluidAudio' && m.provider === 'fluidAudio' && m.name === configuredModel)
     );
 
-    // Only set default model if user hasn't manually selected one
+    // Only set default model if user hasn't manually selected one.
+    // FluidAudio models never become the auto-selected fallback default unless explicitly configured.
     if (!userSelectedRef.current) {
       if (configuredMatch) {
         // Use the configured model if available
         setSelectedModelKey(`${configuredMatch.provider}:${configuredMatch.name}`);
-      } else if (allModels.length > 0) {
-        // Fall back to first available model
-        setSelectedModelKey(`${allModels[0].provider}:${allModels[0].name}`);
+      } else {
+        const defaultModel = allModels.find((m) => m.provider !== 'fluidAudio');
+        if (defaultModel) {
+          // Fall back to first available non-FluidAudio model
+          setSelectedModelKey(`${defaultModel.provider}:${defaultModel.name}`);
+        }
       }
     }
 

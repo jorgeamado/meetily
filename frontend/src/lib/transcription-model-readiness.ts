@@ -31,3 +31,7 @@ export function hasDownloadingModel(models: ModelWithStatus[]): boolean {
     || (status !== null && typeof status === 'object' && 'Downloading' in status)
   ));
 }
+
+export function isAutoLanguageOnlyProvider(provider?: string | null): boolean {
+  return provider === 'parakeet' || provider === 'fluidAudio';
+}
