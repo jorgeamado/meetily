@@ -58,7 +58,7 @@ impl Drop for RetranscriptionGuard {
 /// (500ms) because the entire file is processed at once by VAD with no
 /// latency requirement, and short redemption fragments speech at every
 /// natural sentence/topic pause (500ms-2s)
-const VAD_REDEMPTION_TIME_MS: u32 = 2000;
+pub const VAD_REDEMPTION_TIME_MS: u32 = 2000;
 
 /// Progress update emitted during retranscription
 #[derive(Debug, Clone, Serialize, Deserialize)]
