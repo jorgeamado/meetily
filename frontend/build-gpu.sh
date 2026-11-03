@@ -149,14 +149,47 @@ if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "win32" ]]; then
 fi
 
 # The binary is in the workspace target directory, which is one level up from frontend
-# if we are in frontend dir.
+# if we are in frontend dir. Resolve Cargo's effective target directory once so custom
+# target-dir settings (e.g. target.noindex in .cargo/config.toml) and CARGO_TARGET_DIR work.
 WORKSPACE_ROOT="$FRONTEND_DIR/.."
-SRC_PATH="$WORKSPACE_ROOT/target/release/$BASE_BINARY"
+TARGET_DIR=$(
+    cd "$HELPER_DIR" &&
+    cargo metadata --format-version 1 --no-deps 2>/dev/null |
+    node -e 'let d="";process.stdin.setEncoding("utf8");process.stdin.on("data",c=>d+=c);process.stdin.on("end",()=>{try{let p=JSON.parse(d).target_directory||"";if(process.platform==="win32")p=p.replace(/\\/g,"/");process.stdout.write(p)}catch(e){}})' ||
+    true
+)
+if [ -z "$TARGET_DIR" ]; then
+    TARGET_DIR="${CARGO_TARGET_DIR:-}"
+    if [ -z "$TARGET_DIR" ]; then
+        for CFG_FILE in "$WORKSPACE_ROOT/.cargo/config.toml" "../.cargo/config.toml" ".cargo/config.toml"; do
+            if [ -f "$CFG_FILE" ]; then
+                TARGET_DIR=$(sed -n 's/^[[:space:]]*target-dir[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' "$CFG_FILE" | head -n 1)
+                if [ -n "$TARGET_DIR" ]; then
+                    break
+                fi
+            fi
+        done
+    fi
+    TARGET_DIR="${TARGET_DIR:-target}"
+fi
+
+case "$TARGET_DIR" in
+    /*|[A-Za-z]:*)
+        PRIMARY_TARGET_DIR="$TARGET_DIR"
+        FALLBACK_TARGET_DIR="$TARGET_DIR"
+        ;;
+    *)
+        PRIMARY_TARGET_DIR="$WORKSPACE_ROOT/$TARGET_DIR"
+        FALLBACK_TARGET_DIR="$TARGET_DIR"
+        ;;
+esac
+
+SRC_PATH="$PRIMARY_TARGET_DIR/release/$BASE_BINARY"
 DEST_PATH="$BINARIES_DIR/$SIDECAR_BINARY"
 
 if [ ! -f "$SRC_PATH" ]; then
     # Fallback: check if we are running from root and target is in root
-    SRC_PATH="target/release/$BASE_BINARY"
+    SRC_PATH="$FALLBACK_TARGET_DIR/release/$BASE_BINARY"
 fi
 
 if [ -f "$SRC_PATH" ]; then
@@ -164,9 +197,9 @@ if [ -f "$SRC_PATH" ]; then
     echo -e "${GREEN}✅ Copied binary to $DEST_PATH${NC}"
 else
     echo -e "${RED}❌ Binary not found at $SRC_PATH${NC}"
-    # List contents of target/release to help debugging
-    echo -e "${YELLOW}Contents of target/release:${NC}"
-    ls -la "$WORKSPACE_ROOT/target/release/" || ls -la "target/release/"
+    # List contents of release target directory to help debugging
+    echo -e "${YELLOW}Contents of $PRIMARY_TARGET_DIR/release:${NC}"
+    ls -la "$PRIMARY_TARGET_DIR/release/" || ls -la "$FALLBACK_TARGET_DIR/release/"
     exit 1
 fi
 
@@ -204,11 +237,11 @@ if [[ "$OSTYPE" == "msys" || "$OSTYPE" == "win32" ]]; then
     DIARIZE_SIDECAR_BINARY="diarize-helper-$TARGET_TRIPLE.exe"
 fi
 
-DIARIZE_SRC_PATH="$WORKSPACE_ROOT/target/release/$DIARIZE_BASE_BINARY"
+DIARIZE_SRC_PATH="$PRIMARY_TARGET_DIR/release/$DIARIZE_BASE_BINARY"
 DIARIZE_DEST_PATH="$BINARIES_DIR/$DIARIZE_SIDECAR_BINARY"
 
 if [ ! -f "$DIARIZE_SRC_PATH" ]; then
-    DIARIZE_SRC_PATH="target/release/$DIARIZE_BASE_BINARY"
+    DIARIZE_SRC_PATH="$FALLBACK_TARGET_DIR/release/$DIARIZE_BASE_BINARY"
 fi
 
 if [ -f "$DIARIZE_SRC_PATH" ]; then
