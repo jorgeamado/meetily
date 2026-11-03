@@ -59,6 +59,13 @@ pub fn start_transcription_task<R: Runtime>(
         let transcription_engine = match super::engine::get_or_init_transcription_engine(&app).await {
             Ok(engine) => engine,
             Err(e) => {
+                if !super::super::pipeline::is_live_transcription_enabled() {
+                    warn!(
+                        "Live transcription disabled after validation failure; skipping transcription worker: {}",
+                        e
+                    );
+                    return;
+                }
                 error!("Failed to initialize transcription engine: {}", e);
                 let _ = app.emit("transcription-error", serde_json::json!({
                     "error": e,

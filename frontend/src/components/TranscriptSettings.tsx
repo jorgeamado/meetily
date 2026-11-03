@@ -210,7 +210,7 @@ function DiarizationModelDownloads() {
 
 
 export interface TranscriptModelProps {
-    provider: 'localWhisper' | 'parakeet' | 'deepgram' | 'elevenLabs' | 'groq' | 'openai';
+    provider: 'localWhisper' | 'parakeet' | 'fluidAudio' | 'deepgram' | 'elevenLabs' | 'groq' | 'openai';
     model: string;
     apiKey?: string | null;
 }
@@ -300,7 +300,11 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
     }, [transcriptModelConfig.provider]);
 
     useEffect(() => {
-        if (transcriptModelConfig.provider === 'localWhisper' || transcriptModelConfig.provider === 'parakeet') {
+        if (
+            transcriptModelConfig.provider === 'localWhisper' ||
+            transcriptModelConfig.provider === 'parakeet' ||
+            transcriptModelConfig.provider === 'fluidAudio'
+        ) {
             setApiKey(null);
         }
     }, [transcriptModelConfig.provider]);
@@ -319,6 +323,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
     const modelOptions = {
         localWhisper: [], // Model selection handled by ModelManager component
         parakeet: [], // Model selection handled by ParakeetModelManager component
+        fluidAudio: [], // Model selection handled by FluidAudioModelManager component
         deepgram: ['nova-2-phonecall'],
         elevenLabs: ['eleven_multilingual_v2'],
         groq: ['llama-3.3-70b-versatile'],
@@ -361,6 +366,17 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
         }
     };
 
+    const handleFluidModelSelect = (modelName: string) => {
+        setTranscriptModelConfig({
+            ...transcriptModelConfig,
+            provider: 'fluidAudio',
+            model: modelName
+        });
+        if (onModelSelect) {
+            onModelSelect();
+        }
+    };
+
     return (
         <div>
             <div>
@@ -378,7 +394,11 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                 onValueChange={(value) => {
                                     const provider = value as TranscriptModelProps['provider'];
                                     setUiProvider(provider);
-                                    if (provider !== 'localWhisper' && provider !== 'parakeet') {
+                                    if (
+                                        provider !== 'localWhisper' &&
+                                        provider !== 'parakeet' &&
+                                        provider !== 'fluidAudio'
+                                    ) {
                                         fetchApiKey(provider);
                                     }
                                 }}
@@ -388,6 +408,9 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                 </SelectTrigger>
                                 <SelectContent>
                                     <SelectItem value="parakeet">⚡ Parakeet (Recommended - Real-time / Accurate)</SelectItem>
+                                    {fluidAvailable && (
+                                        <SelectItem value="fluidAudio">🍎 Parakeet on Neural Engine (macOS, fastest)</SelectItem>
+                                    )}
                                     <SelectItem value="localWhisper">🏠 Local Whisper (High Accuracy)</SelectItem>
                                     {/* <SelectItem value="deepgram">☁️ Deepgram (Backup)</SelectItem>
                                     <SelectItem value="elevenLabs">☁️ ElevenLabs</SelectItem>
@@ -396,7 +419,7 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                                 </SelectContent>
                             </Select>
 
-                            {uiProvider !== 'localWhisper' && uiProvider !== 'parakeet' && (
+                            {uiProvider !== 'localWhisper' && uiProvider !== 'parakeet' && uiProvider !== 'fluidAudio' && (
                                 <Select
                                     value={transcriptModelConfig.model}
                                     onValueChange={(value) => {
@@ -433,6 +456,16 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                             <ParakeetModelManager
                                 selectedModel={transcriptModelConfig.provider === 'parakeet' ? transcriptModelConfig.model : undefined}
                                 onModelSelect={handleParakeetModelSelect}
+                                autoSave={true}
+                            />
+                        </div>
+                    )}
+
+                    {uiProvider === 'fluidAudio' && (
+                        <div className="mt-6">
+                            <FluidAudioModelManager
+                                selectedModel={transcriptModelConfig.provider === 'fluidAudio' ? transcriptModelConfig.model : undefined}
+                                onModelSelect={handleFluidModelSelect}
                                 autoSave={true}
                             />
                         </div>
@@ -486,13 +519,13 @@ export function TranscriptSettings({ transcriptModelConfig, setTranscriptModelCo
                         </div>
                     )}
 
-                    {fluidAvailable && (
+                    {fluidAvailable && uiProvider !== 'fluidAudio' && (
                         <div className="pt-4 border-t border-gray-200">
                             <h3 className="text-lg font-semibold text-gray-900">
                                 Neural Engine transcription (macOS)
                             </h3>
                             <p className="text-xs text-gray-500 mt-1 mb-4">
-                                Parakeet on the Apple Neural Engine, used when you retranscribe a meeting or import audio. Live recording support is coming.
+                                Parakeet on the Apple Neural Engine, used when you retranscribe a meeting, import audio, or select it as your Transcript Model above.
                             </p>
                             <FluidAudioModelManager />
                         </div>

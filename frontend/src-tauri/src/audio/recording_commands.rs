@@ -346,9 +346,17 @@ pub async fn start_recording_with_meeting_name<R: Runtime>(
                 validation_error
             );
             super::pipeline::set_live_transcription_enabled(false);
+            let user_message = if transcription::engine::is_fluid_validation_error(&validation_error) {
+                format!(
+                    "{} Recording audio only — use Enhance after the meeting to transcribe.",
+                    validation_error
+                )
+            } else {
+                "No transcription model available — recording audio only. Use Enhance after the meeting to transcribe.".to_string()
+            };
             let _ = app.emit("transcription-error", serde_json::json!({
                 "error": validation_error,
-                "userMessage": "No transcription model available — recording audio only. Use Enhance after the meeting to transcribe.",
+                "userMessage": user_message,
                 "actionable": false
             }));
         }
@@ -543,9 +551,17 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
                 validation_error
             );
             super::pipeline::set_live_transcription_enabled(false);
+            let user_message = if transcription::engine::is_fluid_validation_error(&validation_error) {
+                format!(
+                    "{} Recording audio only — use Enhance after the meeting to transcribe.",
+                    validation_error
+                )
+            } else {
+                "No transcription model available — recording audio only. Use Enhance after the meeting to transcribe.".to_string()
+            };
             let _ = app.emit("transcription-error", serde_json::json!({
                 "error": validation_error,
-                "userMessage": "No transcription model available — recording audio only. Use Enhance after the meeting to transcribe.",
+                "userMessage": user_message,
                 "actionable": false
             }));
         }
@@ -774,7 +790,7 @@ pub async fn stop_recording<R: Runtime>(
         global_task.take()
     };
 
-    if let Some(task_handle) = transcription_task {
+    if let Some(mut task_handle) = transcription_task {
         info!("⏳ Waiting for ALL transcription chunks to be processed (no timeout - preserving every chunk)");
 
         // Enhanced progress monitoring during shutdown
@@ -803,7 +819,7 @@ pub async fn stop_recording<R: Runtime>(
         // Wait up to 10 minutes for transcription completion to prevent indefinite hangs
         match tokio::time::timeout(
             tokio::time::Duration::from_secs(600), // 10 minutes max
-            task_handle
+            &mut task_handle,
         ).await {
             Ok(Ok(())) => {
                 info!("✅ ALL transcription chunks processed successfully - no data lost");
@@ -815,6 +831,10 @@ pub async fn stop_recording<R: Runtime>(
             Err(_) => {
                 warn!("⏱️ Transcription timeout (10 minutes) reached, continuing shutdown to prevent indefinite hang");
                 // Continue shutdown even on timeout - better to lose some chunks than hang forever
+                tokio::spawn(async move {
+                    let _ = task_handle.await;
+                    crate::fluid_engine::FLUID_ENGINE.unload_if_idle().await;
+                });
             }
         }
 
@@ -886,30 +906,7 @@ pub async fn stop_recording<R: Runtime>(
             }
         }
         Some("fluidAudio") => {
-            // Live recording falls back to Whisper when fluidAudio is configured
-            info!("🎤 Unloading Whisper model...");
-            let engine_clone = {
-                let engine_guard = crate::whisper_engine::commands::WHISPER_ENGINE
-                    .lock()
-                    .unwrap();
-                engine_guard.as_ref().cloned()
-            };
-
-            if let Some(engine) = engine_clone {
-                let current_model = engine
-                    .get_current_model()
-                    .await
-                    .unwrap_or_else(|| "unknown".to_string());
-                info!("Current Whisper model before unload: '{}'", current_model);
-
-                if engine.unload_model().await {
-                    info!("✅ Whisper model '{}' unloaded successfully", current_model);
-                } else {
-                    warn!("⚠️ Failed to unload Whisper model '{}'", current_model);
-                }
-            } else {
-                warn!("⚠️ No Whisper engine found to unload model");
-            }
+            info!("🍎 Unloading FluidAudio model if idle...");
         }
         _ => {
             // Default to Whisper
@@ -938,6 +935,8 @@ pub async fn stop_recording<R: Runtime>(
             }
         }
     }
+
+    crate::fluid_engine::FLUID_ENGINE.unload_if_idle().await;
 
     // Step 3.5: Track meeting ended analytics with privacy-safe metadata
     // Extract all data from manager BEFORE any async operations to avoid Send issues

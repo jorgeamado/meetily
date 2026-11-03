@@ -51,7 +51,58 @@ impl TranscriptionEngine {
 // MODEL VALIDATION AND INITIALIZATION
 // ============================================================================
 
-/// Validate that transcription models (Whisper or Parakeet) are ready before starting recording
+pub(crate) const FLUID_UNAVAILABLE_ERR: &str =
+    "FluidAudio requires macOS with the fluid-helper sidecar";
+pub(crate) const DEFAULT_FLUID_MODEL_ID: &str = "fluid-parakeet-v3";
+
+pub(crate) fn validate_fluid_available(available: bool) -> Result<(), String> {
+    if available {
+        Ok(())
+    } else {
+        Err(FLUID_UNAVAILABLE_ERR.to_string())
+    }
+}
+
+pub(crate) fn resolve_fluid_model(
+    configured_model: &str,
+) -> Result<crate::fluid_engine::FluidModel, String> {
+    let trimmed = configured_model.trim();
+    let model_id = if trimmed.is_empty() {
+        DEFAULT_FLUID_MODEL_ID
+    } else {
+        trimmed
+    };
+    crate::fluid_engine::FluidModel::from_model_id(model_id)
+        .ok_or_else(|| format!("Unknown FluidAudio model: '{}'", model_id))
+}
+
+pub(crate) fn fluid_model_not_downloaded_message(
+    model: crate::fluid_engine::FluidModel,
+) -> String {
+    format!(
+        "Parakeet (Neural Engine) model '{}' is not downloaded. Download it in Settings → Transcript.",
+        model.display_name()
+    )
+}
+
+pub(crate) fn validate_fluid_model_downloaded(
+    model: crate::fluid_engine::FluidModel,
+    downloaded: bool,
+) -> Result<(), String> {
+    if downloaded {
+        Ok(())
+    } else {
+        Err(fluid_model_not_downloaded_message(model))
+    }
+}
+
+pub(crate) fn is_fluid_validation_error(err: &str) -> bool {
+    err == FLUID_UNAVAILABLE_ERR
+        || err.starts_with("Parakeet (Neural Engine)")
+        || err.starts_with("Unknown FluidAudio model")
+}
+
+/// Validate that transcription models (Whisper, Parakeet, or FluidAudio) are ready before starting recording
 pub async fn validate_transcription_model_ready<R: Runtime>(app: &AppHandle<R>) -> Result<(), String> {
     // Check transcript configuration to determine which engine to validate
     let config = match crate::api::api::api_get_transcript_config(
@@ -112,28 +163,20 @@ pub async fn validate_transcription_model_ready<R: Runtime>(app: &AppHandle<R>) 
             }
         }
         "fluidAudio" => {
-            warn!("FluidAudio live transcription is not supported yet; using Whisper");
-            info!("🔍 Validating Whisper model...");
-            // Ensure whisper engine is initialized first
-            if let Err(init_error) = crate::whisper_engine::commands::whisper_init().await {
-                warn!("❌ Failed to initialize Whisper engine: {}", init_error);
-                return Err(format!(
-                    "Failed to initialize speech recognition: {}",
-                    init_error
-                ));
-            }
-
-            // Call the whisper validation command with config support
-            match crate::whisper_engine::commands::whisper_validate_model_ready_with_config(app).await {
-                Ok(model_name) => {
-                    info!("✅ Whisper model validation successful: {} is ready", model_name);
-                    Ok(())
-                }
-                Err(e) => {
-                    warn!("❌ Whisper model validation failed: {}", e);
-                    Err(e)
-                }
-            }
+            info!("🔍 Validating FluidAudio model...");
+            validate_fluid_available(crate::fluid_engine::is_available())?;
+            let model = resolve_fluid_model(&config.model)?;
+            let models_dir = crate::fluid_engine::models_dir(app).map_err(|e| e.to_string())?;
+            let status = crate::fluid_engine::FLUID_ENGINE
+                .model_status(model, &models_dir)
+                .await
+                .map_err(|e| format!("Failed to check FluidAudio model status: {}", e))?;
+            validate_fluid_model_downloaded(model, status.downloaded)?;
+            info!(
+                "✅ FluidAudio model validation successful: {} is ready",
+                model.model_id()
+            );
+            Ok(())
         }
         "parakeet" => {
             info!("🔍 Validating Parakeet model...");
@@ -162,7 +205,7 @@ pub async fn validate_transcription_model_ready<R: Runtime>(app: &AppHandle<R>) 
         other => {
             warn!("❌ Unsupported transcription provider for local recording: {}", other);
             Err(format!(
-                "Provider '{}' is not supported for local transcription. Please select 'localWhisper' or 'parakeet'.",
+                "Provider '{}' is not supported for local transcription. Please select 'localWhisper', 'parakeet', or 'fluidAudio'.",
                 other
             ))
         }
@@ -242,10 +285,24 @@ pub async fn get_or_init_transcription_engine<R: Runtime>(
             Ok(TranscriptionEngine::Whisper(whisper_engine))
         }
         "fluidAudio" => {
-            warn!("FluidAudio live transcription is not supported yet; using Whisper");
-            info!("🎤 Initializing Whisper transcription engine");
-            let whisper_engine = get_or_init_whisper(app).await?;
-            Ok(TranscriptionEngine::Whisper(whisper_engine))
+            info!("🍎 Initializing FluidAudio Parakeet transcription engine");
+            validate_fluid_available(crate::fluid_engine::is_available())?;
+            let model = resolve_fluid_model(&config.model)?;
+            let models_dir = crate::fluid_engine::models_dir(app).map_err(|e| e.to_string())?;
+            let status = crate::fluid_engine::FLUID_ENGINE
+                .model_status(model, &models_dir)
+                .await
+                .map_err(|e| format!("Failed to check FluidAudio model status: {}", e))?;
+            validate_fluid_model_downloaded(model, status.downloaded)?;
+
+            let provider = crate::fluid_engine::FluidLiveProvider::begin(model, &models_dir)
+                .await
+                .map_err(|e| format!("Failed to initialize FluidAudio Parakeet: {}", e))?;
+            info!(
+                "✅ FluidAudio model '{}' ready for live transcription",
+                model.model_id()
+            );
+            Ok(TranscriptionEngine::Provider(Arc::new(provider)))
         }
         other => {
             warn!(
@@ -479,4 +536,78 @@ pub async fn get_or_init_whisper<R: Runtime>(
     }
 
     Ok(engine)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fluid_engine::FluidModel;
+
+    #[test]
+    fn resolve_fluid_model_defaults_empty_to_v3() {
+        assert_eq!(resolve_fluid_model("").unwrap(), FluidModel::V3);
+        assert_eq!(resolve_fluid_model("   ").unwrap(), FluidModel::V3);
+    }
+
+    #[test]
+    fn resolve_fluid_model_parses_known_ids_and_rejects_unknown() {
+        assert_eq!(
+            resolve_fluid_model("fluid-parakeet-v3").unwrap(),
+            FluidModel::V3
+        );
+        assert_eq!(
+            resolve_fluid_model("fluid-parakeet-ultra").unwrap(),
+            FluidModel::Ultra
+        );
+
+        let err = resolve_fluid_model("fluid-parakeet-v99").unwrap_err();
+        assert!(
+            err.contains("Unknown FluidAudio model") && err.contains("fluid-parakeet-v99"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn fluid_model_not_downloaded_message_matches_spec() {
+        assert_eq!(
+            fluid_model_not_downloaded_message(FluidModel::V3),
+            "Parakeet (Neural Engine) model 'Parakeet v3' is not downloaded. Download it in Settings → Transcript."
+        );
+        assert_eq!(
+            fluid_model_not_downloaded_message(FluidModel::Ultra),
+            "Parakeet (Neural Engine) model 'Parakeet Ultra' is not downloaded. Download it in Settings → Transcript."
+        );
+        assert!(validate_fluid_model_downloaded(FluidModel::V3, true).is_ok());
+        assert_eq!(
+            validate_fluid_model_downloaded(FluidModel::V3, false).unwrap_err(),
+            "Parakeet (Neural Engine) model 'Parakeet v3' is not downloaded. Download it in Settings → Transcript."
+        );
+    }
+
+    #[test]
+    fn validate_fluid_available_returns_expected_error() {
+        assert!(validate_fluid_available(true).is_ok());
+        assert_eq!(
+            validate_fluid_available(false).unwrap_err(),
+            "FluidAudio requires macOS with the fluid-helper sidecar"
+        );
+    }
+
+    #[test]
+    fn is_fluid_validation_error_matches_fluid_errors_only() {
+        assert!(is_fluid_validation_error(FLUID_UNAVAILABLE_ERR));
+        assert!(is_fluid_validation_error(
+            &fluid_model_not_downloaded_message(FluidModel::V3)
+        ));
+        assert!(is_fluid_validation_error(
+            &resolve_fluid_model("fluid-parakeet-v99").unwrap_err()
+        ));
+        assert!(!is_fluid_validation_error(
+            "Model 'small' is not downloaded. Please download it first from the settings."
+        ));
+        assert!(!is_fluid_validation_error(
+            "Parakeet model 'parakeet-tdt-0.6b-v3-int8' is not ready"
+        ));
+    }
 }

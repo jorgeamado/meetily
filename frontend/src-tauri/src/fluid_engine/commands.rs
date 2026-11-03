@@ -283,6 +283,43 @@ pub fn fluid_is_available() -> bool {
     is_available()
 }
 
+/// Initialize FluidAudio readiness check for the frontend (mirrors `parakeet_init`).
+/// Returns `Ok(())` when `fluid-helper` is available on macOS, or an error otherwise.
+#[tauri::command]
+pub async fn fluid_init() -> Result<(), String> {
+    if is_available() {
+        Ok(())
+    } else {
+        Err("FluidAudio requires macOS with the fluid-helper sidecar".to_string())
+    }
+}
+
+/// Check whether at least one FluidAudio model is downloaded on disk.
+/// Returns `Ok(false)` when FluidAudio is not available on this platform.
+#[tauri::command]
+pub async fn fluid_has_available_models<R: Runtime>(app: AppHandle<R>) -> Result<bool, String> {
+    if !is_available() {
+        return Ok(false);
+    }
+
+    let dir = models_dir(&app).map_err(|e| e.to_string())?;
+    for model in [FluidModel::V3, FluidModel::Ultra] {
+        match FLUID_ENGINE.model_status(model, &dir).await {
+            Ok(st) if st.downloaded => return Ok(true),
+            Ok(_) => {}
+            Err(e) => {
+                warn!(
+                    "Failed to query status for FluidAudio model '{}': {}",
+                    model.model_id(),
+                    e
+                );
+            }
+        }
+    }
+
+    Ok(false)
+}
+
 /// List all supported FluidAudio models and their current availability status.
 /// Returns an empty list (not an error) when FluidAudio is not available on this platform.
 #[tauri::command]

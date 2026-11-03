@@ -496,12 +496,18 @@ impl FluidJobBookkeeping {
 /// Holds an `Arc<FluidAudioEngine>`, exposes `transcribe`, and decrements the active-job count on drop.
 pub struct FluidJobGuard {
     engine: Arc<FluidAudioEngine>,
+    model: FluidModel,
+    models_dir: PathBuf,
 }
 
 impl FluidJobGuard {
     /// Transcribe 16 kHz mono f32 audio samples using the guarded FluidAudio job.
+    /// If the helper was killed after a timeout or crash (which clears the loaded
+    /// model), the job's model is reloaded first so one failure doesn't end the job.
     pub async fn transcribe(&self, samples: &[f32]) -> Result<FluidTranscript> {
-        self.engine.transcribe(samples).await
+        self.engine
+            .transcribe_inner(samples, Some((self.model, self.models_dir.as_path())))
+            .await
     }
 
     /// Access the underlying `FluidAudioEngine`.
@@ -894,6 +900,8 @@ impl FluidAudioEngine {
 
         Ok(FluidJobGuard {
             engine: self.as_arc(),
+            model,
+            models_dir: models_dir.to_path_buf(),
         })
     }
 
@@ -1265,11 +1273,32 @@ impl FluidAudioEngine {
     /// Transcribe 16 kHz mono f32 audio samples using the currently loaded FluidAudio model.
     /// Word timestamps in the returned `FluidTranscript` are in milliseconds relative to the start of `samples`.
     pub async fn transcribe(&self, samples: &[f32]) -> Result<FluidTranscript> {
+        self.transcribe_inner(samples, None).await
+    }
+
+    /// `reload`: the active job's model, reloaded under the same process lock when the
+    /// helper was killed (timeout/crash clears the loaded model).
+    async fn transcribe_inner(
+        &self,
+        samples: &[f32],
+        reload: Option<(FluidModel, &Path)>,
+    ) -> Result<FluidTranscript> {
         if !cfg!(target_os = "macos") {
             return Err(anyhow!(MACOS_ONLY_ERR));
         }
 
         let mut proc_guard = self.inner.process.lock().await;
+
+        if let Some((job_model, job_dir)) = reload {
+            if self.inner.loaded_model.lock().await.is_none() {
+                info!(
+                    "FluidAudio model '{}' not loaded for active job; reloading",
+                    job_model.model_id()
+                );
+                self.load_model_locked(&mut proc_guard, job_model, job_dir, &|_| {})
+                    .await?;
+            }
+        }
 
         let model = (*self.inner.loaded_model.lock().await)
             .ok_or_else(|| anyhow!("No FluidAudio model is loaded; call load_model first"))?;
@@ -1454,6 +1483,84 @@ impl FluidAudioEngine {
     }
 }
 
+/// Map a `FluidTranscript` from `fluid-helper` into a `TranscriptResult` for `TranscriptionProvider`.
+/// Word timestamps remain relative to the audio chunk start as returned by `fluid-helper`.
+pub fn fluid_transcript_to_result(
+    transcript: FluidTranscript,
+) -> crate::audio::transcription::provider::TranscriptResult {
+    crate::audio::transcription::provider::TranscriptResult {
+        text: transcript.text,
+        confidence: Some(transcript.confidence),
+        is_partial: false,
+        words: Some(transcript.words),
+    }
+}
+
+/// Live recording `TranscriptionProvider` backed by a `FluidJobGuard`.
+/// Holding the guard for the lifetime of a live recording prevents concurrent batch jobs
+/// from switching to a different model and ensures `fluid-helper` is not unloaded mid-recording.
+pub struct FluidLiveProvider {
+    guard: FluidJobGuard,
+    model: FluidModel,
+}
+
+impl FluidLiveProvider {
+    pub fn new(guard: FluidJobGuard, model: FluidModel) -> Self {
+        Self { guard, model }
+    }
+
+    /// Acquire a `FluidJobGuard` for `model` via `FLUID_ENGINE.begin_job` and wrap it as a live provider.
+    pub async fn begin(model: FluidModel, models_dir: &Path) -> Result<Self> {
+        let guard = FLUID_ENGINE.begin_job(model, models_dir, |_| {}).await?;
+        Ok(Self::new(guard, model))
+    }
+
+    pub fn model(&self) -> FluidModel {
+        self.model
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::audio::transcription::provider::TranscriptionProvider for FluidLiveProvider {
+    async fn transcribe(
+        &self,
+        audio: Vec<f32>,
+        language: Option<String>,
+    ) -> std::result::Result<
+        crate::audio::transcription::provider::TranscriptResult,
+        crate::audio::transcription::provider::TranscriptionError,
+    > {
+        use crate::audio::transcription::provider::TranscriptionError;
+
+        debug!(
+            "FluidAudio Parakeet uses automatic language detection; ignoring language hint {:?}",
+            language
+        );
+
+        let transcript = self
+            .guard
+            .transcribe(&audio)
+            .await
+            .map_err(|e| TranscriptionError::EngineFailed(e.to_string()))?;
+
+        Ok(fluid_transcript_to_result(transcript))
+    }
+
+    async fn is_model_loaded(&self) -> bool {
+        // The held job guard reloads the model on demand after a helper crash or
+        // timeout, so the live worker must keep sending chunks.
+        true
+    }
+
+    async fn get_current_model(&self) -> Option<String> {
+        Some(self.model.model_id().to_string())
+    }
+
+    fn provider_name(&self) -> &'static str {
+        "FluidAudio Parakeet"
+    }
+}
+
 #[async_trait::async_trait]
 impl crate::audio::transcription::provider::TranscriptionProvider for FluidAudioEngine {
     async fn transcribe(
@@ -1464,7 +1571,7 @@ impl crate::audio::transcription::provider::TranscriptionProvider for FluidAudio
         crate::audio::transcription::provider::TranscriptResult,
         crate::audio::transcription::provider::TranscriptionError,
     > {
-        use crate::audio::transcription::provider::{TranscriptResult, TranscriptionError};
+        use crate::audio::transcription::provider::TranscriptionError;
 
         if !self.is_model_loaded().await {
             return Err(TranscriptionError::ModelNotLoaded);
@@ -1474,12 +1581,7 @@ impl crate::audio::transcription::provider::TranscriptionProvider for FluidAudio
             .await
             .map_err(|e| TranscriptionError::EngineFailed(e.to_string()))?;
 
-        Ok(TranscriptResult {
-            text: transcript.text,
-            confidence: Some(transcript.confidence),
-            is_partial: false,
-            words: Some(transcript.words),
-        })
+        Ok(fluid_transcript_to_result(transcript))
     }
 
     async fn is_model_loaded(&self) -> bool {
@@ -1958,9 +2060,13 @@ mod tests {
 
         let guard1 = FluidJobGuard {
             engine: Arc::clone(&engine),
+            model: FluidModel::V3,
+            models_dir: PathBuf::from("/tmp/fluid-test"),
         };
         let guard2 = FluidJobGuard {
             engine: Arc::clone(&engine),
+            model: FluidModel::V3,
+            models_dir: PathBuf::from("/tmp/fluid-test"),
         };
 
         drop(guard1);
@@ -2125,5 +2231,43 @@ mod tests {
 
         engine.unload_model().await;
         assert!(!engine.is_model_loaded().await);
+    }
+
+    #[test]
+    fn fluid_transcript_to_result_maps_fields_and_preserves_word_times() {
+        let words = vec![
+            WordSpan {
+                text: "Hello".to_string(),
+                start_ms: 120.0,
+                end_ms: 480.0,
+                prob: 0.91,
+            },
+            WordSpan {
+                text: " world".to_string(),
+                start_ms: 500.0,
+                end_ms: 920.0,
+                prob: 0.91,
+            },
+        ];
+        let transcript = FluidTranscript {
+            text: "Hello world".to_string(),
+            confidence: 0.91,
+            words,
+        };
+
+        let result = fluid_transcript_to_result(transcript);
+        assert_eq!(result.text, "Hello world");
+        assert_eq!(result.confidence, Some(0.91));
+        assert!(!result.is_partial);
+
+        let result_words = result.words.expect("words should be Some");
+        assert_eq!(result_words.len(), 2);
+        assert_eq!(result_words[0].text, "Hello");
+        assert_eq!(result_words[0].start_ms, 120.0);
+        assert_eq!(result_words[0].end_ms, 480.0);
+        assert!((result_words[0].prob - 0.91).abs() < 1e-6);
+        assert_eq!(result_words[1].text, " world");
+        assert_eq!(result_words[1].start_ms, 500.0);
+        assert_eq!(result_words[1].end_ms, 920.0);
     }
 }

@@ -19,6 +19,11 @@ const PROVIDER_COMMANDS: Record<string, ProviderCommands> = {
     hasAvailableModels: 'parakeet_has_available_models',
     getAvailableModels: 'parakeet_get_available_models',
   },
+  fluidAudio: {
+    initialize: 'fluid_init',
+    hasAvailableModels: 'fluid_has_available_models',
+    getAvailableModels: 'fluid_get_available_models',
+  },
 };
 
 export function getProviderCommands(provider: string): ProviderCommands | null {

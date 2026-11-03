@@ -23,10 +23,18 @@ interface FluidDownloadProgressEvent {
 }
 
 interface FluidAudioModelManagerProps {
+  selectedModel?: string;
+  onModelSelect?: (modelName: string) => void;
   className?: string;
+  autoSave?: boolean;
 }
 
-export function FluidAudioModelManager({ className = '' }: FluidAudioModelManagerProps) {
+export function FluidAudioModelManager({
+  selectedModel,
+  onModelSelect,
+  className = '',
+  autoSave = false
+}: FluidAudioModelManagerProps) {
   const [models, setModels] = useState<FluidModelInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -38,13 +46,32 @@ export function FluidAudioModelManager({ className = '' }: FluidAudioModelManage
   const [modelPendingDelete, setModelPendingDelete] = useState<FluidModelInfo | null>(null);
   const [stageByModel, setStageByModel] = useState<Record<string, FluidLoadStage>>({});
 
+  const onModelSelectRef = useRef(onModelSelect);
+  const autoSaveRef = useRef(autoSave);
   const latestStatusByModelRef = useRef<Map<string, ModelStatus>>(new Map());
   const latestStageByModelRef = useRef<Map<string, FluidLoadStage>>(new Map());
   const modelsRef = useRef<FluidModelInfo[]>([]);
 
   useEffect(() => {
+    onModelSelectRef.current = onModelSelect;
+    autoSaveRef.current = autoSave;
+  }, [onModelSelect, autoSave]);
+
+  useEffect(() => {
     modelsRef.current = models;
   }, [models]);
+
+  const saveModelSelection = useCallback(async (modelName: string) => {
+    try {
+      await invoke('api_save_transcript_config', {
+        provider: 'fluidAudio',
+        model: modelName,
+        apiKey: null
+      });
+    } catch (err) {
+      console.error('Failed to save FluidAudio model selection:', err);
+    }
+  }, []);
 
   const getDisplayName = useCallback((modelName: string): string => {
     const found = modelsRef.current.find(m => m.name === modelName);
@@ -153,6 +180,13 @@ export function FluidAudioModelManager({ className = '' }: FluidAudioModelManage
               description: 'Model downloaded and prepared for the Apple Neural Engine',
               duration: 4000
             });
+
+            if (onModelSelectRef.current) {
+              onModelSelectRef.current(modelName);
+              if (autoSaveRef.current) {
+                void saveModelSelection(modelName);
+              }
+            }
           }
         ),
         listen<{ modelName: string; error: string }>(
@@ -215,7 +249,7 @@ export function FluidAudioModelManager({ className = '' }: FluidAudioModelManage
       disposed = true;
       registeredUnlisteners.forEach(unlisten => unlisten());
     };
-  }, [getDisplayName, clearLocalDownloadingState, listenerRetryCount]);
+  }, [getDisplayName, clearLocalDownloadingState, saveModelSelection, listenerRetryCount]);
 
   // Fetch models once listeners are ready
   useEffect(() => {
@@ -309,6 +343,21 @@ export function FluidAudioModelManager({ className = '' }: FluidAudioModelManage
     }
   };
 
+  const selectModel = async (modelName: string) => {
+    if (onModelSelect) {
+      onModelSelect(modelName);
+    }
+
+    if (autoSave) {
+      await saveModelSelection(modelName);
+    }
+
+    const displayName = getDisplayName(modelName);
+    toast.success(`Switched to ${displayName}`, {
+      duration: 3000
+    });
+  };
+
   const deleteModel = async (modelName: string) => {
     if (deletingModels.has(modelName)) return;
     const displayName = getDisplayName(modelName);
@@ -369,15 +418,24 @@ export function FluidAudioModelManager({ className = '' }: FluidAudioModelManage
     );
   }
 
+  const canSelect = Boolean(onModelSelect);
+
   return (
     <div className={`space-y-3 ${className}`}>
       {models.map(model => (
         <FluidModelCard
           key={model.name}
           model={model}
+          isSelected={canSelect && selectedModel === model.name}
+          canSelect={canSelect}
           isRecommended={model.name === 'fluid-parakeet-v3'}
           downloadStage={stageByModel[model.name] ?? latestStageByModelRef.current.get(model.name) ?? 'download'}
           isDeleting={deletingModels.has(model.name)}
+          onSelect={() => {
+            if (canSelect && model.status === 'Available') {
+              void selectModel(model.name);
+            }
+          }}
           onDownload={() => downloadModel(model.name)}
           onDelete={() => {
             if (!deletingModels.has(model.name)) {
@@ -386,6 +444,16 @@ export function FluidAudioModelManager({ className = '' }: FluidAudioModelManage
           }}
         />
       ))}
+
+      {canSelect && selectedModel && (
+        <motion.div
+          initial={{ opacity: 0, y: -5 }}
+          animate={{ opacity: 1, y: 0 }}
+          className="text-xs text-gray-500 text-center pt-2"
+        >
+          Using {getDisplayName(selectedModel)} for transcription
+        </motion.div>
+      )}
 
       <ConfirmationModal
         isOpen={modelPendingDelete !== null}
@@ -409,18 +477,24 @@ export function FluidAudioModelManager({ className = '' }: FluidAudioModelManage
 
 interface FluidModelCardProps {
   model: FluidModelInfo;
+  isSelected: boolean;
+  canSelect: boolean;
   isRecommended: boolean;
   downloadStage: FluidLoadStage;
   isDeleting: boolean;
+  onSelect: () => void;
   onDownload: () => void;
   onDelete: () => void;
 }
 
 function FluidModelCard({
   model,
+  isSelected,
+  canSelect,
   isRecommended,
   downloadStage,
   isDeleting,
+  onSelect,
   onDownload,
   onDelete
 }: FluidModelCardProps) {
@@ -449,11 +523,19 @@ function FluidModelCard({
       transition={{ duration: 0.2 }}
       className={`
         relative rounded-lg border-2 transition-all
-        ${isAvailable
-          ? 'border-gray-200 bg-white'
-          : 'border-gray-200 bg-gray-50'
+        ${isSelected && isAvailable
+          ? 'border-blue-500 bg-blue-50'
+          : isAvailable
+            ? `border-gray-200 bg-white ${canSelect ? 'hover:border-gray-300' : ''}`
+            : 'border-gray-200 bg-gray-50'
         }
+        ${canSelect && isAvailable ? 'cursor-pointer' : 'cursor-default'}
       `}
+      onClick={() => {
+        if (canSelect && isAvailable) {
+          onSelect();
+        }
+      }}
     >
       {isRecommended && (
         <div className="absolute -top-2 -right-2 bg-blue-600 text-white text-xs px-2 py-0.5 rounded-full font-medium">
@@ -470,6 +552,15 @@ function FluidModelCard({
               <span className="text-xs text-gray-500 font-medium bg-gray-100 px-2 py-0.5 rounded">
                 {formatFileSize(model.size_mb)}
               </span>
+              {isSelected && isAvailable && (
+                <motion.span
+                  initial={{ scale: 0 }}
+                  animate={{ scale: 1 }}
+                  className="bg-blue-600 text-white px-2 py-0.5 rounded-full text-xs font-medium flex items-center gap-1"
+                >
+                  ✓
+                </motion.span>
+              )}
             </div>
 
             <p className="text-sm text-gray-600 ml-9">{model.description}</p>
@@ -486,6 +577,17 @@ function FluidModelCard({
                   <div className="w-2 h-2 bg-green-500 rounded-full"></div>
                   <span className="text-xs font-medium">Ready</span>
                 </div>
+                {canSelect && !isSelected && (
+                  <button
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onSelect();
+                    }}
+                    className="text-xs font-medium text-blue-600 hover:text-blue-700 bg-blue-50 hover:bg-blue-100 px-2.5 py-1 rounded-md transition-colors"
+                  >
+                    Use for transcription
+                  </button>
+                )}
                 <button
                   onClick={(e) => {
                     e.stopPropagation();

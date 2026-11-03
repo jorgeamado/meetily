@@ -114,11 +114,12 @@ export function useTranscriptionModels(transcriptModelConfig: TranscriptModelCon
 
     // Try to match the configured model
     // Note: 'localWhisper' in config maps to 'whisper' provider in model list
+    const effectiveFluidModel = configuredModel || 'fluid-parakeet-v3';
     const configuredMatch = allModels.find(
       (m) =>
         (configuredProvider === 'localWhisper' && m.provider === 'whisper' && m.name === configuredModel) ||
         (configuredProvider === 'parakeet' && m.provider === 'parakeet' && m.name === configuredModel) ||
-        (configuredProvider === 'fluidAudio' && m.provider === 'fluidAudio' && m.name === configuredModel)
+        (configuredProvider === 'fluidAudio' && m.provider === 'fluidAudio' && m.name === effectiveFluidModel)
     );
 
     // Only set default model if user hasn't manually selected one.

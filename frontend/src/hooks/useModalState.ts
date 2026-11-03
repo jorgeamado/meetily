@@ -166,9 +166,10 @@ export function useModalState(transcriptModelConfig?: TranscriptModelProps): Use
 
   // Listen for model download completion to auto-close modal
   useEffect(() => {
-    const setupDownloadListeners = async () => {
-      const unlisteners: (() => void)[] = [];
+    let disposed = false;
+    const unlisteners: (() => void)[] = [];
 
+    const setupDownloadListeners = async () => {
       // Listen for Whisper model download complete
       const unlistenWhisper = await listen<{ modelName: string }>('model-download-complete', (event) => {
         const { modelName } = event.payload;
@@ -180,14 +181,36 @@ export function useModalState(transcriptModelConfig?: TranscriptModelProps): Use
           setTimeout(() => hideModal('modelSelector'), 1500);
         }
       });
-      unlisteners.push(unlistenWhisper);
 
-      return () => {
-        unlisteners.forEach(unsub => unsub());
-      };
+      // Listen for FluidAudio model download complete
+      const unlistenFluid = await listen<{ modelName: string }>('fluid-model-download-complete', (event) => {
+        const { modelName } = event.payload;
+        console.log('[useModalState] FluidAudio model download complete:', modelName);
+
+        if (
+          transcriptModelConfig?.provider === 'fluidAudio' &&
+          (!transcriptModelConfig?.model || transcriptModelConfig?.model === modelName)
+        ) {
+          toast.success('Model ready! Closing window...', { duration: 1500 });
+          setTimeout(() => hideModal('modelSelector'), 1500);
+        }
+      });
+
+      if (disposed) {
+        unlistenWhisper();
+        unlistenFluid();
+        return;
+      }
+
+      unlisteners.push(unlistenWhisper, unlistenFluid);
     };
 
     setupDownloadListeners();
+
+    return () => {
+      disposed = true;
+      unlisteners.forEach(unsub => unsub());
+    };
   }, [transcriptModelConfig, hideModal]);
 
   return {

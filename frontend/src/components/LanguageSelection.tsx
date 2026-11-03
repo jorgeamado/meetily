@@ -3,6 +3,7 @@ import { Globe } from 'lucide-react';
 import Analytics from '@/lib/analytics';
 import { toast } from 'sonner';
 import { useConfig } from '@/contexts/ConfigContext';
+import { isAutoLanguageOnlyProvider } from '@/lib/transcription-model-readiness';
 
 export interface Language {
   code: string;
@@ -118,7 +119,7 @@ interface LanguageSelectionProps {
   selectedLanguage: string;
   onLanguageChange: (language: string) => void;
   disabled?: boolean;
-  provider?: 'localWhisper' | 'parakeet' | 'deepgram' | 'elevenLabs' | 'groq' | 'openai';
+  provider?: 'localWhisper' | 'parakeet' | 'fluidAudio' | 'deepgram' | 'elevenLabs' | 'groq' | 'openai';
 }
 
 export function LanguageSelection({
@@ -130,9 +131,9 @@ export function LanguageSelection({
   const [saving, setSaving] = useState(false);
   const { setSelectedLanguage } = useConfig();
 
-  // Parakeet only supports auto-detection (doesn't support manual language selection)
-  const isParakeet = provider === 'parakeet';
-  const availableLanguages = isParakeet
+  // Parakeet and FluidAudio only support auto-detection (manual language selection is not supported)
+  const isAutoLanguageOnly = isAutoLanguageOnlyProvider(provider);
+  const availableLanguages = isAutoLanguageOnly
     ? LANGUAGES.filter(lang => lang.code === 'auto' || lang.code === 'auto-translate')
     : LANGUAGES;
 
@@ -197,8 +198,8 @@ export function LanguageSelection({
           ))}
         </select>
 
-        {/* Parakeet language limitation warning */}
-        {isParakeet && (
+        {/* Parakeet / FluidAudio language limitation warning */}
+        {isAutoLanguageOnly && (
           <div className="p-2 bg-amber-50 border border-amber-200 rounded text-amber-800">
             <p className="font-medium">ℹ️ Parakeet Language Support</p>
             <p className="mt-1 text-xs">Parakeet currently only supports automatic language detection. Manual language selection is not available. Use Whisper if you need to specify a particular language.</p>

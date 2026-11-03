@@ -641,6 +641,8 @@ pub fn run() {
             parakeet_engine::commands::open_parakeet_models_folder,
             // FluidAudio (Apple Neural Engine) commands
             fluid_engine::commands::fluid_is_available,
+            fluid_engine::commands::fluid_init,
+            fluid_engine::commands::fluid_has_available_models,
             fluid_engine::commands::fluid_get_available_models,
             fluid_engine::commands::fluid_download_model,
             fluid_engine::commands::fluid_delete_model,
