@@ -3,7 +3,6 @@
 use crate::api::TranscriptSegment;
 use crate::audio::decoder::{decode_audio_file, decode_audio_file_with_progress};
 use crate::audio::vad::get_speech_chunks_with_progress;
-use crate::config::{DEFAULT_WHISPER_MODEL, DEFAULT_PARAKEET_MODEL};
 use crate::parakeet_engine::ParakeetEngine;
 use crate::state::AppState;
 use crate::whisper_engine::WhisperEngine;
@@ -18,7 +17,10 @@ use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
 
 use super::audio_processing::create_meeting_folder;
-use super::common::{create_transcript_segments, split_segment_at_silence, write_transcripts_json};
+use super::common::{
+    create_transcript_segments, split_segment_at_silence, write_transcripts_json, BatchEngine,
+    LoadedBatchEngine,
+};
 use super::constants::AUDIO_EXTENSIONS;
 use super::recording_preferences::get_default_recordings_folder;
 
@@ -266,7 +268,7 @@ pub async fn start_import<R: Runtime>(
     // Reset cancellation flag
     IMPORT_CANCELLED.store(false, Ordering::SeqCst);
 
-    let use_parakeet = provider.as_deref() == Some("parakeet");
+    let batch_engine = BatchEngine::from_provider(provider.as_deref());
     let result = run_import(
         app.clone(),
         source_path,
@@ -278,7 +280,7 @@ pub async fn start_import<R: Runtime>(
     .await;
 
     // Unload the engine after the batch job (success, failure, or cancellation)
-    super::common::unload_engine_after_batch(use_parakeet).await;
+    super::common::unload_engine_after_batch(batch_engine).await;
 
     // Guard will automatically clear flag on drop
     // No need for manual: IMPORT_IN_PROGRESS.store(false, Ordering::SeqCst);
@@ -421,8 +423,8 @@ async fn run_import<R: Runtime>(
         title, source_path, language, model, provider
     );
 
-    // Determine which provider to use (default to whisper)
-    let use_parakeet = provider.as_deref() == Some("parakeet");
+    // Determine which batch engine to use (default to Whisper)
+    let batch_engine = BatchEngine::from_provider(provider.as_deref());
 
     emit_progress(&app, "copying", 5, "Creating meeting folder...");
 
@@ -627,13 +629,15 @@ async fn run_import<R: Runtime>(
     emit_progress(&app, "transcribing", 30, "Loading transcription engine...");
 
     // Initialize the appropriate engine
-    let whisper_engine = if !use_parakeet && total_segments > 0 {
-        Some(get_or_init_whisper(&app, model.as_deref()).await?)
-    } else {
-        None
-    };
-    let parakeet_engine = if use_parakeet && total_segments > 0 {
-        Some(get_or_init_parakeet(&app, model.as_deref()).await?)
+    let loaded_engine = if total_segments > 0 {
+        Some(match batch_engine {
+            BatchEngine::Whisper => LoadedBatchEngine::Whisper(
+                get_or_init_whisper(&app, model.as_deref()).await?,
+            ),
+            BatchEngine::Parakeet => LoadedBatchEngine::Parakeet(
+                get_or_init_parakeet(&app, model.as_deref()).await?,
+            ),
+        })
     } else {
         None
     };
@@ -651,15 +655,15 @@ async fn run_import<R: Runtime>(
         }
     }
     #[cfg(target_os = "macos")]
-    let mut ane_marker: Option<PathBuf> = match whisper_engine.as_ref() {
-        Some(engine) => {
-            let name = model.as_deref().unwrap_or(DEFAULT_WHISPER_MODEL);
+    let mut ane_marker: Option<PathBuf> = match loaded_engine.as_ref() {
+        Some(LoadedBatchEngine::Whisper(engine)) => {
+            let name = model.as_deref().unwrap_or(batch_engine.default_model());
             match engine.model_path(name).await {
                 Some(p) => crate::whisper_engine::coreml::first_use_pending(&p),
                 None => None,
             }
         }
-        None => None,
+        Some(LoadedBatchEngine::Parakeet(_)) | None => None,
     };
     #[cfg(not(target_os = "macos"))]
     let mut ane_marker: Option<PathBuf> = None;
@@ -744,20 +748,24 @@ async fn run_import<R: Runtime>(
         }
 
         // Transcribe
-        let (text, conf) = if use_parakeet {
-            let engine = parakeet_engine.as_ref().unwrap();
-            let text = engine
-                .transcribe_audio(segment.samples.clone())
-                .await
-                .map_err(|e| anyhow!("Parakeet transcription failed on segment {}: {}", i, e))?;
-            (text, 0.9f32)
-        } else {
-            let engine = whisper_engine.as_ref().unwrap();
-            let (text, conf, _) = engine
-                .transcribe_audio_with_confidence(segment.samples.clone(), language.clone())
-                .await
-                .map_err(|e| anyhow!("Whisper transcription failed on segment {}: {}", i, e))?;
-            (text, conf)
+        let (text, conf) = match loaded_engine
+            .as_ref()
+            .expect("transcription engine initialized when segments are present")
+        {
+            LoadedBatchEngine::Parakeet(engine) => {
+                let text = engine
+                    .transcribe_audio(segment.samples.clone())
+                    .await
+                    .map_err(|e| anyhow!("Parakeet transcription failed on segment {}: {}", i, e))?;
+                (text, 0.9f32)
+            }
+            LoadedBatchEngine::Whisper(engine) => {
+                let (text, conf, _) = engine
+                    .transcribe_audio_with_confidence(segment.samples.clone(), language.clone())
+                    .await
+                    .map_err(|e| anyhow!("Whisper transcription failed on segment {}: {}", i, e))?;
+                (text, conf)
+            }
         };
 
         // First transcription returned: the ANE compile (if any) is done —
@@ -937,7 +945,7 @@ async fn get_or_init_whisper<R: Runtime>(
         Some(e) => {
             let target_model = match requested_model {
                 Some(model) => model.to_string(),
-                None => get_configured_model(app, "whisper").await?,
+                None => get_configured_model(app, BatchEngine::Whisper).await?,
             };
 
             let current_model = e.get_current_model().await;
@@ -983,7 +991,7 @@ async fn get_or_init_parakeet<R: Runtime>(
         Some(e) => {
             let target_model = match requested_model {
                 Some(model) => model.to_string(),
-                None => get_configured_model(app, "parakeet").await?,
+                None => get_configured_model(app, BatchEngine::Parakeet).await?,
             };
 
             let current_model = e.get_current_model().await;
@@ -1014,7 +1022,10 @@ async fn get_or_init_parakeet<R: Runtime>(
 }
 
 /// Get the configured model from database
-async fn get_configured_model<R: Runtime>(app: &AppHandle<R>, provider_type: &str) -> Result<String> {
+async fn get_configured_model<R: Runtime>(
+    app: &AppHandle<R>,
+    engine: BatchEngine,
+) -> Result<String> {
     let app_state = app
         .try_state::<AppState>()
         .ok_or_else(|| anyhow!("App state not available"))?;
@@ -1027,25 +1038,8 @@ async fn get_configured_model<R: Runtime>(app: &AppHandle<R>, provider_type: &st
     .map_err(|e| anyhow!("Failed to query config: {}", e))?;
 
     match result {
-        Some((provider, model)) => {
-            if (provider_type == "whisper" && (provider == "localWhisper" || provider == "whisper"))
-                || (provider_type == "parakeet" && provider == "parakeet")
-            {
-                Ok(model)
-            } else {
-                // Return default model for the requested type
-                Ok(if provider_type == "parakeet" {
-                    DEFAULT_PARAKEET_MODEL.to_string()
-                } else {
-                    DEFAULT_WHISPER_MODEL.to_string()
-                })
-            }
-        }
-        None => Ok(if provider_type == "parakeet" {
-            DEFAULT_PARAKEET_MODEL.to_string()
-        } else {
-            DEFAULT_WHISPER_MODEL.to_string()
-        }),
+        Some((provider, model)) if engine.matches_provider_config(&provider) => Ok(model),
+        Some(_) | None => Ok(engine.default_model().to_string()),
     }
 }
 

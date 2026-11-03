@@ -7,9 +7,11 @@ use crate::audio::glossary;
 use crate::audio::stereo;
 use crate::audio::transcript_repair;
 use crate::audio::vad::get_speech_chunks_with_progress;
-use super::common::{create_transcript_segments, split_segment_at_silence, write_transcripts_json};
+use super::common::{
+    create_transcript_segments, split_segment_at_silence, write_transcripts_json, BatchEngine,
+    LoadedBatchEngine,
+};
 use super::constants::AUDIO_EXTENSIONS;
-use crate::config::{DEFAULT_WHISPER_MODEL, DEFAULT_PARAKEET_MODEL};
 use crate::parakeet_engine::ParakeetEngine;
 use crate::state::AppState;
 use crate::whisper_engine::WhisperEngine;
@@ -115,7 +117,7 @@ pub async fn start_retranscription<R: Runtime>(
     // Reset cancellation flag
     RETRANSCRIPTION_CANCELLED.store(false, Ordering::SeqCst);
 
-    let use_parakeet = provider.as_deref() == Some("parakeet");
+    let batch_engine = BatchEngine::from_provider(provider.as_deref());
     let result = run_retranscription(app.clone(), meeting_id.clone(), meeting_folder_path, language, model, provider, diarize, repair).await;
 
     // The glossary prompt must never outlive the batch run: live
@@ -132,7 +134,7 @@ pub async fn start_retranscription<R: Runtime>(
     }
 
     // Unload the engine after the batch job (success, failure, or cancellation)
-    super::common::unload_engine_after_batch(use_parakeet).await;
+    super::common::unload_engine_after_batch(batch_engine).await;
 
     // Guard will automatically clear flag on drop
     // No need for manual: RETRANSCRIPTION_IN_PROGRESS.store(false, Ordering::SeqCst);
@@ -209,8 +211,8 @@ async fn run_retranscription<R: Runtime>(
     let folder_path = PathBuf::from(&meeting_folder_path);
     let audio_path = find_audio_file(&folder_path)?;
 
-    // Determine which provider to use (default to whisper)
-    let use_parakeet = provider.as_deref() == Some("parakeet");
+    // Determine which batch engine to use (default to Whisper)
+    let batch_engine = BatchEngine::from_provider(provider.as_deref());
     let diarize_opts = diarize.unwrap_or_default();
 
     info!(
@@ -439,15 +441,13 @@ async fn run_retranscription<R: Runtime>(
     emit_progress(&app, &meeting_id, "transcribing", 0, "Loading transcription engine...");
 
     // Initialize the appropriate engine once (not per-segment)
-    let whisper_engine = if !use_parakeet {
-        Some(get_or_init_whisper(&app, model.as_deref()).await?)
-    } else {
-        None
-    };
-    let parakeet_engine = if use_parakeet {
-        Some(get_or_init_parakeet(&app, model.as_deref()).await?)
-    } else {
-        None
+    let loaded_engine = match batch_engine {
+        BatchEngine::Whisper => LoadedBatchEngine::Whisper(
+            get_or_init_whisper(&app, model.as_deref()).await?,
+        ),
+        BatchEngine::Parakeet => LoadedBatchEngine::Parakeet(
+            get_or_init_parakeet(&app, model.as_deref()).await?,
+        ),
     };
 
     // Glossary biasing uses APPROVED terms only and is gated on the
@@ -455,10 +455,15 @@ async fn run_retranscription<R: Runtime>(
     // suggestions never reach whisper: unvetted injection hallucinated
     // prompt continuations at unclear segment starts ("Geroen Gürtel-",
     // 2026-07-28).
-    if let Some(engine) = whisper_engine.as_ref() {
-        if let Some(prompt) = glossary::initial_prompt(&app) {
-            info!("Applying approved glossary as whisper initial_prompt: {}", prompt);
-            engine.set_initial_prompt(Some(prompt)).await;
+    if batch_engine.supports_initial_prompt() {
+        match &loaded_engine {
+            LoadedBatchEngine::Whisper(engine) => {
+                if let Some(prompt) = glossary::initial_prompt(&app) {
+                    info!("Applying approved glossary as whisper initial_prompt: {}", prompt);
+                    engine.set_initial_prompt(Some(prompt)).await;
+                }
+            }
+            LoadedBatchEngine::Parakeet(_) => {}
         }
     }
 
@@ -501,15 +506,15 @@ async fn run_retranscription<R: Runtime>(
         }
     }
     #[cfg(target_os = "macos")]
-    let mut ane_marker: Option<PathBuf> = match whisper_engine.as_ref() {
-        Some(engine) => {
-            let name = model.as_deref().unwrap_or(DEFAULT_WHISPER_MODEL);
+    let mut ane_marker: Option<PathBuf> = match &loaded_engine {
+        LoadedBatchEngine::Whisper(engine) => {
+            let name = model.as_deref().unwrap_or(batch_engine.default_model());
             match engine.model_path(name).await {
                 Some(p) => crate::whisper_engine::coreml::first_use_pending(&p),
                 None => None,
             }
         }
-        None => None,
+        LoadedBatchEngine::Parakeet(_) => None,
     };
     #[cfg(not(target_os = "macos"))]
     let mut ane_marker: Option<PathBuf> = None;
@@ -573,30 +578,31 @@ async fn run_retranscription<R: Runtime>(
         }
 
         // Transcribe this segment
-        let (text, conf, words) = if use_parakeet {
-            let engine = parakeet_engine.as_ref().unwrap();
-            let text = engine
-                .transcribe_audio(segment.samples.clone())
-                .await
-                .map_err(|e| anyhow!("Parakeet transcription failed on segment {}: {}", i, e))?;
-            (text, 0.9f32, Vec::new())
-        } else {
-            let engine = whisper_engine.as_ref().unwrap();
-            let (text, conf, words) = engine
-                .transcribe_audio_with_words(segment.samples.clone(), language.clone())
-                .await
-                .map_err(|e| anyhow!("Whisper transcription failed on segment {}: {}", i, e))?;
-            // Token times are chunk-relative; shift onto the recording timeline
-            let words = words
-                .into_iter()
-                .map(|w| diarization::WordSpan {
-                    text: w.text,
-                    start_ms: w.start_ms + segment.start_timestamp_ms,
-                    end_ms: w.end_ms + segment.start_timestamp_ms,
-                    prob: w.prob,
-                })
-                .collect();
-            (text, conf, words)
+        let (text, conf, words) = match &loaded_engine {
+            LoadedBatchEngine::Parakeet(engine) => {
+                let text = engine
+                    .transcribe_audio(segment.samples.clone())
+                    .await
+                    .map_err(|e| anyhow!("Parakeet transcription failed on segment {}: {}", i, e))?;
+                (text, 0.9f32, Vec::new())
+            }
+            LoadedBatchEngine::Whisper(engine) => {
+                let (text, conf, words) = engine
+                    .transcribe_audio_with_words(segment.samples.clone(), language.clone())
+                    .await
+                    .map_err(|e| anyhow!("Whisper transcription failed on segment {}: {}", i, e))?;
+                // Token times are chunk-relative; shift onto the recording timeline
+                let words = words
+                    .into_iter()
+                    .map(|w| diarization::WordSpan {
+                        text: w.text,
+                        start_ms: w.start_ms + segment.start_timestamp_ms,
+                        end_ms: w.end_ms + segment.start_timestamp_ms,
+                        prob: w.prob,
+                    })
+                    .collect();
+                (text, conf, words)
+            }
         };
 
         // First transcription returned: the ANE compile (if any) is done —
@@ -762,7 +768,7 @@ async fn run_retranscription<R: Runtime>(
     // Confidence-gated wording repair: sentences whose tokens decoded with
     // low probability get one constrained LLM patch each (at most 2 words
     // may change; anything bigger is rejected). Timings are untouched.
-    if repair.unwrap_or(true) && !use_parakeet {
+    if repair.unwrap_or(true) && batch_engine.supports_transcript_repair() {
         emit_progress(&app, &meeting_id, "saving", 86, "Checking low-confidence wording...");
         let app_for_repair = app.clone();
         let meeting_id_for_repair = meeting_id.clone();
@@ -800,7 +806,7 @@ async fn run_retranscription<R: Runtime>(
 
     // Learn vocabulary from this meeting in the background (names, terms)
     // so the NEXT retranscription can bias whisper toward it
-    if !use_parakeet {
+    if batch_engine.supports_glossary_learning() {
         let row_texts: Vec<String> = labeled_blocks.iter().map(|(t, _, _, _)| t.clone()).collect();
         let sample = glossary::sample_rows(&row_texts);
         tauri::async_runtime::spawn(glossary::update_from_transcript(app.clone(), sample));
@@ -1125,7 +1131,7 @@ async fn get_or_init_whisper<R: Runtime>(
             // Determine which model to use
             let target_model = match requested_model {
                 Some(model) => model.to_string(),
-                None => get_configured_whisper_model(app).await?,
+                None => get_configured_model(app, BatchEngine::Whisper).await?,
             };
 
             // Retranscription wants DTW token timestamps for speaker splitting,
@@ -1167,9 +1173,15 @@ async fn get_or_init_whisper<R: Runtime>(
     }
 }
 
-/// Get the configured Whisper model name from the database
-async fn get_configured_whisper_model<R: Runtime>(app: &AppHandle<R>) -> Result<String> {
-    debug!("Getting configured Whisper model from database...");
+/// Get the configured model name for `engine` from the database
+async fn get_configured_model<R: Runtime>(
+    app: &AppHandle<R>,
+    engine: BatchEngine,
+) -> Result<String> {
+    debug!(
+        "Getting configured {} model from database...",
+        engine.display_name()
+    );
 
     let app_state = app
         .try_state::<AppState>()
@@ -1195,19 +1207,36 @@ async fn get_configured_whisper_model<R: Runtime>(app: &AppHandle<R>) -> Result<
         Some((provider, model)) => {
             info!("Found transcript config: provider={}, model={}", provider, model);
 
-            // Check if provider is Whisper-based
-            if provider == "localWhisper" || provider == "whisper" {
+            if engine.matches_provider_config(&provider) {
                 Ok(model)
             } else {
-                error!("Retranscription requires Whisper provider, but configured provider is: {}", provider);
-                Err(anyhow!("Retranscription requires Whisper. Current provider '{}' does not support retranscription with language selection.", provider))
+                // Historical asymmetry preserved: Whisper errors when the saved
+                // provider is non-Whisper, whereas Parakeet falls back to its default.
+                match engine {
+                    BatchEngine::Whisper => {
+                        error!("Retranscription requires Whisper provider, but configured provider is: {}", provider);
+                        Err(anyhow!("Retranscription requires Whisper. Current provider '{}' does not support retranscription with language selection.", provider))
+                    }
+                    BatchEngine::Parakeet => {
+                        warn!("Configured provider is not Parakeet, using default model");
+                        Ok(engine.default_model().to_string())
+                    }
+                }
+            }
+        }
+        None => match engine {
+            BatchEngine::Whisper => {
+                warn!(
+                    "No transcript config found, using default model '{}'",
+                    engine.default_model()
+                );
+                Ok(engine.default_model().to_string())
+            }
+            BatchEngine::Parakeet => {
+                warn!("No transcript config found, using default Parakeet model");
+                Ok(engine.default_model().to_string())
             }
         },
-        None => {
-            // Default to configured Whisper model if no config exists
-            warn!("No transcript config found, using default model '{}'", DEFAULT_WHISPER_MODEL);
-            Ok(DEFAULT_WHISPER_MODEL.to_string())
-        }
     }
 }
 
@@ -1228,7 +1257,7 @@ async fn get_or_init_parakeet<R: Runtime>(
             // Determine which model to use
             let target_model = match requested_model {
                 Some(model) => model.to_string(),
-                None => get_configured_parakeet_model(app).await?,
+                None => get_configured_model(app, BatchEngine::Parakeet).await?,
             };
 
             // Check if the correct model is already loaded
@@ -1266,48 +1295,6 @@ async fn get_or_init_parakeet<R: Runtime>(
             }
         }
         None => Err(anyhow!("Parakeet engine not initialized")),
-    }
-}
-
-/// Get the configured Parakeet model name from the database
-async fn get_configured_parakeet_model<R: Runtime>(app: &AppHandle<R>) -> Result<String> {
-    debug!("Getting configured Parakeet model from database...");
-
-    let app_state = app
-        .try_state::<AppState>()
-        .ok_or_else(|| {
-            error!("App state not available");
-            anyhow!("App state not available")
-        })?;
-
-    // Query the transcript settings from the database
-    let result: Option<(String, String)> = sqlx::query_as(
-        "SELECT provider, model FROM transcript_settings WHERE id = '1'"
-    )
-    .fetch_optional(app_state.db_manager.pool())
-    .await
-    .map_err(|e| {
-        error!("Failed to query transcript config: {}", e);
-        anyhow!("Failed to query transcript config: {}", e)
-    })?;
-
-    match result {
-        Some((provider, model)) => {
-            info!("Found transcript config: provider={}, model={}", provider, model);
-
-            if provider == "parakeet" {
-                Ok(model)
-            } else {
-                // Default to configured Parakeet model
-                warn!("Configured provider is not Parakeet, using default model");
-                Ok(DEFAULT_PARAKEET_MODEL.to_string())
-            }
-        },
-        None => {
-            // Default to configured Parakeet model if no config exists
-            warn!("No transcript config found, using default Parakeet model");
-            Ok(DEFAULT_PARAKEET_MODEL.to_string())
-        }
     }
 }
 

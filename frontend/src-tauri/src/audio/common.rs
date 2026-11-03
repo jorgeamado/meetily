@@ -14,10 +14,91 @@ pub(crate) async fn acquire_engine_lifecycle_lock() -> OwnedMutexGuard<()> {
     ENGINE_LIFECYCLE_LOCK.clone().lock_owned().await
 }
 
+/// Batch transcription engine used by audio import and retranscription.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BatchEngine {
+    Whisper,
+    Parakeet,
+}
+
+impl BatchEngine {
+    /// Resolve the batch engine from an optional provider identifier.
+    /// Reproduces the historical mapping: `Some("parakeet")` selects `Parakeet`,
+    /// and `None` or any other value defaults to `Whisper`.
+    pub fn from_provider(provider: Option<&str>) -> Self {
+        match provider {
+            Some("parakeet") => Self::Parakeet,
+            _ => Self::Whisper,
+        }
+    }
+
+    /// Human-readable engine name for log messages.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Whisper => "Whisper",
+            Self::Parakeet => "Parakeet",
+        }
+    }
+
+    /// Default model identifier when no model is explicitly requested or configured.
+    pub fn default_model(self) -> &'static str {
+        match self {
+            Self::Whisper => crate::config::DEFAULT_WHISPER_MODEL,
+            Self::Parakeet => crate::config::DEFAULT_PARAKEET_MODEL,
+        }
+    }
+
+    /// Whether a `transcript_settings.provider` value stored in the database
+    /// belongs to this batch engine.
+    pub fn matches_provider_config(self, configured_provider: &str) -> bool {
+        match self {
+            Self::Whisper => {
+                configured_provider == "localWhisper" || configured_provider == "whisper"
+            }
+            Self::Parakeet => configured_provider == "parakeet",
+        }
+    }
+
+    /// Whether the engine accepts an approved-glossary `initial_prompt` bias before decoding.
+    /// Only Whisper supports prompt conditioning; Parakeet has no prompt input.
+    pub fn supports_initial_prompt(self) -> bool {
+        match self {
+            Self::Whisper => true,
+            Self::Parakeet => false,
+        }
+    }
+
+    /// Whether confidence-gated LLM wording repair (`transcript_repair`) should run.
+    /// Repair inspects per-token decoder probabilities on `SpeakerTurn::words`,
+    /// which Whisper populates (via DTW/token output) and Parakeet leaves empty.
+    pub fn supports_transcript_repair(self) -> bool {
+        match self {
+            Self::Whisper => true,
+            Self::Parakeet => false,
+        }
+    }
+
+    /// Whether finished transcripts should feed background glossary extraction.
+    /// Learned vocabulary populates the glossary used by Whisper's `initial_prompt`
+    /// (Parakeet currently has no vocabulary-biasing consumer).
+    pub fn supports_glossary_learning(self) -> bool {
+        match self {
+            Self::Whisper => true,
+            Self::Parakeet => false,
+        }
+    }
+}
+
+/// Initialized batch engine handle matching `BatchEngine` variants 1:1.
+pub(crate) enum LoadedBatchEngine {
+    Whisper(Arc<crate::whisper_engine::WhisperEngine>),
+    Parakeet(Arc<crate::parakeet_engine::ParakeetEngine>),
+}
+
 /// Unload the transcription engine after a batch job (import or retranscription).
 /// Skips unloading if a live recording is currently in progress, since recording
 /// uses the same global engine instances.
-pub(crate) async fn unload_engine_after_batch(use_parakeet: bool) {
+pub(crate) async fn unload_engine_after_batch(engine: BatchEngine) {
     let _engine_lifecycle_guard = acquire_engine_lifecycle_lock().await;
 
     if crate::audio::recording_commands::is_recording().await {
@@ -25,23 +106,26 @@ pub(crate) async fn unload_engine_after_batch(use_parakeet: bool) {
         return;
     }
 
-    if use_parakeet {
-        use crate::parakeet_engine::commands::PARAKEET_ENGINE;
-        let engine = {
-            let guard = PARAKEET_ENGINE.lock().unwrap_or_else(|e| e.into_inner());
-            guard.as_ref().cloned()
-        };
-        if let Some(e) = engine {
-            e.unload_model().await;
+    match engine {
+        BatchEngine::Parakeet => {
+            use crate::parakeet_engine::commands::PARAKEET_ENGINE;
+            let engine = {
+                let guard = PARAKEET_ENGINE.lock().unwrap_or_else(|e| e.into_inner());
+                guard.as_ref().cloned()
+            };
+            if let Some(e) = engine {
+                e.unload_model().await;
+            }
         }
-    } else {
-        use crate::whisper_engine::commands::WHISPER_ENGINE;
-        let engine = {
-            let guard = WHISPER_ENGINE.lock().unwrap_or_else(|e| e.into_inner());
-            guard.as_ref().cloned()
-        };
-        if let Some(e) = engine {
-            e.unload_model().await;
+        BatchEngine::Whisper => {
+            use crate::whisper_engine::commands::WHISPER_ENGINE;
+            let engine = {
+                let guard = WHISPER_ENGINE.lock().unwrap_or_else(|e| e.into_inner());
+                guard.as_ref().cloned()
+            };
+            if let Some(e) = engine {
+                e.unload_model().await;
+            }
         }
     }
 }
@@ -232,5 +316,64 @@ mod tests {
 
         acquired_rx.await.unwrap();
         waiter.await.unwrap();
+    }
+
+    #[test]
+    fn test_batch_engine_from_provider() {
+        assert_eq!(BatchEngine::from_provider(None), BatchEngine::Whisper);
+        assert_eq!(
+            BatchEngine::from_provider(Some("parakeet")),
+            BatchEngine::Parakeet
+        );
+        assert_eq!(
+            BatchEngine::from_provider(Some("localWhisper")),
+            BatchEngine::Whisper
+        );
+        assert_eq!(
+            BatchEngine::from_provider(Some("whisper")),
+            BatchEngine::Whisper
+        );
+        assert_eq!(
+            BatchEngine::from_provider(Some("unknown-provider")),
+            BatchEngine::Whisper
+        );
+        assert_eq!(BatchEngine::from_provider(Some("")), BatchEngine::Whisper);
+    }
+
+    #[test]
+    fn test_batch_engine_capability_helpers() {
+        assert!(BatchEngine::Whisper.supports_initial_prompt());
+        assert!(!BatchEngine::Parakeet.supports_initial_prompt());
+
+        assert!(BatchEngine::Whisper.supports_transcript_repair());
+        assert!(!BatchEngine::Parakeet.supports_transcript_repair());
+
+        assert!(BatchEngine::Whisper.supports_glossary_learning());
+        assert!(!BatchEngine::Parakeet.supports_glossary_learning());
+    }
+
+    #[test]
+    fn test_batch_engine_config_helpers() {
+        assert!(BatchEngine::Whisper.matches_provider_config("localWhisper"));
+        assert!(BatchEngine::Whisper.matches_provider_config("whisper"));
+        assert!(!BatchEngine::Whisper.matches_provider_config("parakeet"));
+        assert!(!BatchEngine::Whisper.matches_provider_config("other"));
+
+        assert!(BatchEngine::Parakeet.matches_provider_config("parakeet"));
+        assert!(!BatchEngine::Parakeet.matches_provider_config("localWhisper"));
+        assert!(!BatchEngine::Parakeet.matches_provider_config("whisper"));
+        assert!(!BatchEngine::Parakeet.matches_provider_config("other"));
+
+        assert_eq!(
+            BatchEngine::Whisper.default_model(),
+            crate::config::DEFAULT_WHISPER_MODEL
+        );
+        assert_eq!(
+            BatchEngine::Parakeet.default_model(),
+            crate::config::DEFAULT_PARAKEET_MODEL
+        );
+
+        assert_eq!(BatchEngine::Whisper.display_name(), "Whisper");
+        assert_eq!(BatchEngine::Parakeet.display_name(), "Parakeet");
     }
 }
