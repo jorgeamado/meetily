@@ -1331,21 +1331,52 @@ pub async fn debug_backend_connection<R: Runtime>(app: AppHandle<R>) -> Result<S
     }
 }
 
+fn validate_external_url(raw: &str) -> Result<url::Url, String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err("URL cannot be empty".to_string());
+    }
+    if trimmed.chars().any(|c| c.is_control()) {
+        return Err("URL contains invalid control characters".to_string());
+    }
+
+    let parsed = url::Url::parse(trimmed).map_err(|e| format!("Invalid URL: {}", e))?;
+    match parsed.scheme() {
+        "http" | "https" if parsed.has_host() => Ok(parsed),
+        "http" | "https" => Err("URL must include a host".to_string()),
+        scheme => Err(format!(
+            "Unsupported URL scheme '{}': only http and https are allowed",
+            scheme
+        )),
+    }
+}
+
 #[tauri::command]
 pub async fn open_external_url(url: String) -> Result<(), String> {
     use std::process::Command;
 
+    let validated = validate_external_url(&url)?;
+    let url_str = validated.as_str();
+
     let result = if cfg!(target_os = "windows") {
-        Command::new("cmd").args(&["/C", "start", &url]).output()
+        Command::new("rundll32")
+            .arg("url.dll,FileProtocolHandler")
+            .arg(url_str)
+            .output()
     } else if cfg!(target_os = "macos") {
-        Command::new("open").arg(&url).output()
+        Command::new("open").arg(url_str).output()
     } else {
         // Linux and other Unix-like systems
-        Command::new("xdg-open").arg(&url).output()
+        Command::new("xdg-open").arg(url_str).output()
     };
 
     match result {
-        Ok(_) => Ok(()),
+        Ok(output) if output.status.success() => Ok(()),
+        Ok(output) => Err(format!(
+            "Failed to open URL: launcher exited with {}: {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )),
         Err(e) => Err(format!("Failed to open URL: {}", e)),
     }
 }
@@ -1565,5 +1596,35 @@ pub async fn api_test_custom_openai_connection<R: Runtime>(
                 Err(format!("Connection failed: {}", e))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::validate_external_url;
+
+    #[test]
+    fn validate_external_url_allows_https_and_http() {
+        let https = validate_external_url("https://meetily.zackriya.com/#about").unwrap();
+        assert_eq!(https.as_str(), "https://meetily.zackriya.com/#about");
+
+        let http = validate_external_url("http://localhost:5167/docs").unwrap();
+        assert_eq!(http.as_str(), "http://localhost:5167/docs");
+    }
+
+    #[test]
+    fn validate_external_url_rejects_disallowed_schemes_and_bare_paths() {
+        assert!(validate_external_url("file:///etc/passwd").is_err());
+        assert!(validate_external_url("javascript:alert(1)").is_err());
+        assert!(validate_external_url("/etc/passwd").is_err());
+        assert!(validate_external_url("relative/path/index.html").is_err());
+        assert!(validate_external_url(r"C:\Windows\System32\calc.exe").is_err());
+    }
+
+    #[test]
+    fn validate_external_url_accepts_query_string_with_ampersand() {
+        let raw = "https://example.com/search?q=meetily&lang=en&page=2";
+        let validated = validate_external_url(raw).unwrap();
+        assert_eq!(validated.as_str(), raw);
     }
 }

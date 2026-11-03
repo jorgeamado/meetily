@@ -116,6 +116,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const [serverAddress, setServerAddress] = useState('');
   const [transcriptServerAddress, setTranscriptServerAddress] = useState('');
   const summaryPollsRef = React.useRef(new Map<string, SummaryPoll>());
+  const searchRequestRef = React.useRef(0);
 
   // Use recording state from RecordingStateContext (single source of truth)
   const { isRecording } = useRecordingState();
@@ -366,22 +367,29 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
 
   // Function to search through meeting transcripts
   const searchTranscripts = async (query: string) => {
+    // Searches fire per keystroke: each call supersedes any pending or in-flight
+    // one, and only the latest may update results
+    const requestId = ++searchRequestRef.current;
+
     if (!query.trim()) {
       setSearchResults([]);
+      setIsSearching(false);
       return;
     }
 
+    setIsSearching(true);
+    // Debounce: a newer call made during the wait supersedes this one
+    await new Promise(resolve => setTimeout(resolve, 250));
+    if (requestId !== searchRequestRef.current) return;
+
     try {
-      setIsSearching(true);
-
-
       const results = await invoke('api_search_transcripts', { query }) as TranscriptSearchResult[];
-      setSearchResults(results);
+      if (requestId === searchRequestRef.current) setSearchResults(results);
     } catch (error) {
       console.error('Error searching transcripts:', error);
-      setSearchResults([]);
+      if (requestId === searchRequestRef.current) setSearchResults([]);
     } finally {
-      setIsSearching(false);
+      if (requestId === searchRequestRef.current) setIsSearching(false);
     }
   };
 

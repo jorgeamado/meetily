@@ -321,11 +321,10 @@ const Sidebar: React.FC = () => {
   const handleSearchChange = useCallback(async (value: string) => {
     setSearchQuery(value);
 
-    // If search query is empty, just return to normal view
-    if (!value.trim()) return;
-
-    // Search through transcripts
+    // Search through transcripts (debounced). Empty queries go through too so a
+    // pending search is dropped before returning to the normal view
     await searchTranscripts(value);
+    if (!value.trim()) return;
 
     // Make sure the meetings folder is expanded when searching
     if (!expandedFolders.has('meetings')) {
