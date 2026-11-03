@@ -2,10 +2,11 @@
 // Follows the same pattern as whisper_engine/whisper_engine.rs for consistency
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 use anyhow::{anyhow, Result};
+use once_cell::sync::Lazy;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use std::time::Duration;
@@ -14,7 +15,44 @@ use tokio::io::{AsyncWriteExt, BufWriter};
 use tokio::sync::RwLock;
 use tokio::time::timeout;
 
-use super::models::{get_available_models, get_model_by_name};
+use super::models::{get_available_models, get_model_by_name, ModelDef};
+
+static LOGGED_LEGACY_MODELS: Lazy<Mutex<HashSet<PathBuf>>> =
+    Lazy::new(|| Mutex::new(HashSet::new()));
+
+/// Remove any superseded GGUF files for `model_def` from `models_dir`.
+/// Missing files are ignored; other removal errors are logged and returned.
+/// Download paths ignore the result so cleanup never fails a completed
+/// download; an explicit delete reports it.
+fn remove_legacy_files(models_dir: &Path, model_def: &ModelDef) -> Vec<String> {
+    let mut failures = Vec::new();
+    for legacy_file in &model_def.legacy_gguf_files {
+        if legacy_file == &model_def.gguf_file {
+            continue;
+        }
+        let legacy_path = models_dir.join(legacy_file);
+        match std::fs::remove_file(&legacy_path) {
+            Ok(()) => {
+                log::info!(
+                    "Removed legacy model file for '{}': {}",
+                    model_def.name,
+                    legacy_path.display()
+                );
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                log::warn!(
+                    "Failed to remove legacy model file '{}' for '{}': {}",
+                    legacy_path.display(),
+                    model_def.name,
+                    e
+                );
+                failures.push(format!("{}: {}", legacy_path.display(), e));
+            }
+        }
+    }
+    failures
+}
 
 // ============================================================================
 // Model Status Types
@@ -265,7 +303,26 @@ impl ModelManager {
                     }
                 }
             } else {
-                log::debug!("Model '{}': NOT FOUND", model_def.name);
+                if let Some(legacy_file) = model_def
+                    .legacy_gguf_files
+                    .iter()
+                    .find(|f| self.models_dir.join(f.as_str()).exists())
+                {
+                    let should_log = LOGGED_LEGACY_MODELS
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .insert(model_path.clone());
+                    if should_log {
+                        log::warn!(
+                            "Model '{}' was updated (legacy '{}' on disk, current is '{}') and needs a re-download",
+                            model_def.name,
+                            legacy_file,
+                            model_def.gguf_file
+                        );
+                    }
+                } else {
+                    log::debug!("Model '{}': NOT FOUND", model_def.name);
+                }
                 ModelStatus::NotDownloaded
             };
 
@@ -422,6 +479,10 @@ impl ModelManager {
                     if let Some(ref callback) = progress_callback {
                         let total = metadata.len();
                         callback(DownloadProgress::new(total, total, 0.0));
+                    }
+
+                    if self.validate_gguf_file(&file_path).await.is_ok() {
+                        let _ = remove_legacy_files(&self.models_dir, &model_def);
                     }
 
                     return Ok(());
@@ -766,6 +827,8 @@ impl ModelManager {
             active.remove(model_name);
         }
 
+        let _ = remove_legacy_files(&self.models_dir, &model_def);
+
         Ok(())
     }
 
@@ -833,6 +896,8 @@ impl ModelManager {
             log::info!("Deleted model file: {}", file_path.display());
         }
 
+        let legacy_failures = remove_legacy_files(&self.models_dir, &model_def);
+
         // Update status
         {
             let mut models = self.available_models.write().await;
@@ -841,11 +906,111 @@ impl ModelManager {
             }
         }
 
+        if !legacy_failures.is_empty() {
+            return Err(anyhow!(
+                "Deleted {} but could not remove old model file(s): {}",
+                model_name,
+                legacy_failures.join("; ")
+            ));
+        }
         Ok(())
     }
 
     /// Get models directory path
     pub fn get_models_directory(&self) -> PathBuf {
         self.models_dir.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::summary::summary_engine::models::SamplingParams;
+
+    fn sample_model_def() -> ModelDef {
+        ModelDef {
+            name: "qwen3.5:2b".to_string(),
+            display_name: "Qwen 3.5 2B (Balanced)".to_string(),
+            gguf_file: "Qwen3.5-2B-UD-Q4_K_XL.gguf".to_string(),
+            legacy_gguf_files: vec!["Qwen3.5-2B-Q4_K_M.gguf".to_string()],
+            template: "qwen3.5_nonthinking".to_string(),
+            download_url: "https://example.com/Qwen3.5-2B-UD-Q4_K_XL.gguf".to_string(),
+            size_mb: 1278,
+            context_size: 32768,
+            layer_count: 24,
+            sampling: SamplingParams::qwen35_summary(vec!["<|im_end|>".to_string()]),
+            description: "Test model".to_string(),
+        }
+    }
+
+    #[test]
+    fn remove_legacy_files_deletes_legacy_and_keeps_current_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_def = sample_model_def();
+
+        let current_path = dir.path().join(&model_def.gguf_file);
+        let legacy_path = dir.path().join("Qwen3.5-2B-Q4_K_M.gguf");
+        let other_path = dir.path().join("Qwen3.5-4B-Q4_K_M.gguf");
+
+        std::fs::write(&current_path, b"GGUF-new").unwrap();
+        std::fs::write(&legacy_path, b"GGUF-old").unwrap();
+        std::fs::write(&other_path, b"GGUF-other").unwrap();
+
+        assert!(remove_legacy_files(dir.path(), &model_def).is_empty());
+
+        assert!(!legacy_path.exists(), "legacy GGUF should be removed");
+        assert!(current_path.exists(), "current GGUF must remain untouched");
+        assert_eq!(std::fs::read(&current_path).unwrap(), b"GGUF-new");
+        assert!(other_path.exists(), "unrelated GGUF must remain untouched");
+    }
+
+    #[test]
+    fn remove_legacy_files_reports_failures() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_def = sample_model_def();
+        // A non-empty directory where the legacy file should be cannot be
+        // removed with remove_file, standing in for a locked/mapped file
+        let blocker = dir.path().join("Qwen3.5-2B-Q4_K_M.gguf");
+        std::fs::create_dir(&blocker).unwrap();
+        std::fs::write(blocker.join("x"), b"x").unwrap();
+
+        let failures = remove_legacy_files(dir.path(), &model_def);
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("Qwen3.5-2B-Q4_K_M.gguf"));
+    }
+
+    #[test]
+    fn remove_legacy_files_ignores_missing_legacy_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let model_def = get_model_by_name("qwen3.5:2b").expect("qwen3.5:2b should be defined");
+
+        let current_path = dir.path().join(&model_def.gguf_file);
+        std::fs::write(&current_path, b"GGUF-new").unwrap();
+
+        remove_legacy_files(dir.path(), &model_def);
+        assert!(current_path.exists());
+
+        let empty_dir = tempfile::tempdir().unwrap();
+        remove_legacy_files(empty_dir.path(), &model_def);
+    }
+
+    #[tokio::test]
+    async fn scan_keeps_legacy_only_model_not_downloaded_and_delete_cleans_it_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy_path = dir.path().join("Qwen3.5-2B-Q4_K_M.gguf");
+        std::fs::write(&legacy_path, b"GGUF-old").unwrap();
+
+        let manager = ModelManager::new_with_models_dir(Some(dir.path().to_path_buf())).unwrap();
+        manager.scan_models().await.unwrap();
+
+        let info = manager
+            .get_model_info("qwen3.5:2b")
+            .await
+            .expect("qwen3.5:2b info");
+        assert_eq!(info.status, ModelStatus::NotDownloaded);
+        assert!(legacy_path.exists(), "scan_models must not delete files");
+
+        manager.delete_model("qwen3.5:2b").await.unwrap();
+        assert!(!legacy_path.exists(), "delete_model should remove legacy file");
     }
 }

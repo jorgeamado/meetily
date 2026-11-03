@@ -504,14 +504,36 @@ pub fn pick_model(app_data_dir: &PathBuf) -> Option<models::ModelDef> {
             .map(|p| p.exists())
             .unwrap_or(false)
     };
+    let mut picked = None;
     for name in preferred {
         if let Some(m) = available.iter().find(|m| m.name == name) {
             if downloaded(m) {
-                return Some(m.clone());
+                picked = Some(m.clone());
+                break;
             }
         }
     }
-    available.into_iter().find(|m| downloaded(m))
+    if picked.is_none() {
+        picked = available.iter().find(|m| downloaded(m)).cloned();
+    }
+    if let Some(ref chosen) = picked {
+        if chosen.name != preferred[0] {
+            if let Some(pref) = available.iter().find(|m| m.name == preferred[0]) {
+                let models_dir = models::get_models_directory(app_data_dir);
+                if let Some(legacy) = pref
+                    .legacy_gguf_files
+                    .iter()
+                    .find(|f| models_dir.join(f.as_str()).exists())
+                {
+                    info!(
+                        "Micro-query model: preferred '{}' ({}) missing while legacy '{}' exists; falling back to '{}' (re-download '{}' to restore)",
+                        pref.name, pref.gguf_file, legacy, chosen.name, pref.name
+                    );
+                }
+            }
+        }
+    }
+    picked
 }
 
 /// Shared budget/failure tracking across both query passes.
@@ -1254,5 +1276,24 @@ mod tests {
         apply_shift(&mut left, &mut right, -1);
         assert_eq!(left.text.trim(), "okay");
         assert_eq!(right.text.trim(), "hello next");
+    }
+
+    #[test]
+    fn pick_model_does_not_alias_legacy_qwen_2b_and_falls_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let app_data_dir = dir.path().to_path_buf();
+        let models_dir = models::get_models_directory(&app_data_dir);
+        std::fs::create_dir_all(&models_dir).unwrap();
+
+        std::fs::write(models_dir.join("Qwen3.5-2B-Q4_K_M.gguf"), b"GGUF").unwrap();
+        assert!(pick_model(&app_data_dir).is_none());
+
+        std::fs::write(models_dir.join("Qwen3.5-4B-Q4_K_M.gguf"), b"GGUF").unwrap();
+        let picked = pick_model(&app_data_dir).expect("fallback model");
+        assert_eq!(picked.name, "qwen3.5:4b");
+
+        std::fs::write(models_dir.join("Qwen3.5-2B-UD-Q4_K_XL.gguf"), b"GGUF").unwrap();
+        let picked = pick_model(&app_data_dir).expect("preferred model");
+        assert_eq!(picked.name, "qwen3.5:2b");
     }
 }

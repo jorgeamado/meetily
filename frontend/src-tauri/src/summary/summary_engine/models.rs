@@ -136,6 +136,10 @@ pub struct ModelDef {
     /// GGUF filename on disk (e.g., "gemma-3-1b-it-q4_0.gguf")
     pub gguf_file: String,
 
+    /// Superseded GGUF filenames from prior releases, cleaned up on re-download or delete
+    #[serde(default)]
+    pub legacy_gguf_files: Vec<String>,
+
     /// Template name for prompt formatting (e.g., "gemma3")
     pub template: String,
 
@@ -167,10 +171,11 @@ pub fn get_available_models() -> Vec<ModelDef> {
         ModelDef {
             name: "qwen3.5:2b".to_string(),
             display_name: "Qwen 3.5 2B (Balanced)".to_string(),
-            gguf_file: "Qwen3.5-2B-Q4_K_M.gguf".to_string(),
+            gguf_file: "Qwen3.5-2B-UD-Q4_K_XL.gguf".to_string(),
+            legacy_gguf_files: vec!["Qwen3.5-2B-Q4_K_M.gguf".to_string()],
             template: "qwen3.5_nonthinking".to_string(),
-            download_url: "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q4_K_M.gguf".to_string(),
-            size_mb: 1221,
+            download_url: "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-UD-Q4_K_XL.gguf".to_string(),
+            size_mb: 1278,
             context_size: 32768,
             layer_count: 24,
             sampling: SamplingParams::qwen35_summary(vec!["<|im_end|>".to_string()]),
@@ -181,6 +186,7 @@ pub fn get_available_models() -> Vec<ModelDef> {
             name: "qwen3.5:4b".to_string(),
             display_name: "Qwen 3.5 4B (High Quality)".to_string(),
             gguf_file: "Qwen3.5-4B-Q4_K_M.gguf".to_string(),
+            legacy_gguf_files: Vec::new(),
             template: "qwen3.5_nonthinking".to_string(),
             download_url: "https://huggingface.co/unsloth/Qwen3.5-4B-GGUF/resolve/main/Qwen3.5-4B-Q4_K_M.gguf".to_string(),
             size_mb: 2614,
@@ -194,6 +200,7 @@ pub fn get_available_models() -> Vec<ModelDef> {
             name: "gemma3:4b".to_string(),
             display_name: "Gemma 3 4B (Balanced)".to_string(),
             gguf_file: "gemma-3-4b-it-Q4_K_M.gguf".to_string(),
+            legacy_gguf_files: Vec::new(),
             template: "gemma3".to_string(),
             download_url: "https://huggingface.co/bartowski/google_gemma-3-4b-it-GGUF/resolve/main/google_gemma-3-4b-it-Q4_K_M.gguf".to_string(),
             size_mb: 2374,
@@ -207,6 +214,7 @@ pub fn get_available_models() -> Vec<ModelDef> {
             name: "gemma3:1b".to_string(),
             display_name: "Gemma 3 1B (Fast)".to_string(),
             gguf_file: "gemma-3-1b-it-Q8_0.gguf".to_string(),
+            legacy_gguf_files: Vec::new(),
             template: "gemma3".to_string(),
             download_url: "https://huggingface.co/bartowski/google_gemma-3-1b-it-GGUF/resolve/main/google_gemma-3-1b-it-Q8_0.gguf".to_string(),
             size_mb: 1019,
@@ -335,13 +343,17 @@ mod tests {
     fn qwen35_models_are_registered_with_expected_metadata() {
         let qwen_2b = get_model_by_name("qwen3.5:2b").expect("qwen 2b model should exist");
         assert_eq!(qwen_2b.display_name, "Qwen 3.5 2B (Balanced)");
-        assert_eq!(qwen_2b.gguf_file, "Qwen3.5-2B-Q4_K_M.gguf");
+        assert_eq!(qwen_2b.gguf_file, "Qwen3.5-2B-UD-Q4_K_XL.gguf");
+        assert_eq!(
+            qwen_2b.legacy_gguf_files,
+            vec!["Qwen3.5-2B-Q4_K_M.gguf".to_string()]
+        );
         assert_eq!(qwen_2b.template, "qwen3.5_nonthinking");
         assert_eq!(
             qwen_2b.download_url,
-            "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-Q4_K_M.gguf"
+            "https://huggingface.co/unsloth/Qwen3.5-2B-GGUF/resolve/main/Qwen3.5-2B-UD-Q4_K_XL.gguf"
         );
-        assert_eq!(qwen_2b.size_mb, 1221);
+        assert_eq!(qwen_2b.size_mb, 1278);
         assert_eq!(qwen_2b.context_size, 32768);
         assert_eq!(qwen_2b.layer_count, 24);
         assert_eq!(qwen_2b.sampling, SamplingParams::qwen35_summary(vec!["<|im_end|>".to_string()]));
@@ -349,6 +361,7 @@ mod tests {
         let qwen_4b = get_model_by_name("qwen3.5:4b").expect("qwen 4b model should exist");
         assert_eq!(qwen_4b.display_name, "Qwen 3.5 4B (High Quality)");
         assert_eq!(qwen_4b.gguf_file, "Qwen3.5-4B-Q4_K_M.gguf");
+        assert!(qwen_4b.legacy_gguf_files.is_empty());
         assert_eq!(qwen_4b.template, "qwen3.5_nonthinking");
         assert_eq!(
             qwen_4b.download_url,
@@ -364,6 +377,7 @@ mod tests {
     fn gemma_models_use_huggingface_urls_and_gemma3_instruct_sampling() {
         let gemma_1b = get_model_by_name("gemma3:1b").expect("gemma 1b model should exist");
         assert_eq!(gemma_1b.gguf_file, "gemma-3-1b-it-Q8_0.gguf");
+        assert!(gemma_1b.legacy_gguf_files.is_empty());
         assert_eq!(
             gemma_1b.download_url,
             "https://huggingface.co/bartowski/google_gemma-3-1b-it-GGUF/resolve/main/google_gemma-3-1b-it-Q8_0.gguf"
@@ -378,6 +392,7 @@ mod tests {
         assert_eq!(gemma_1b.sampling.penalty_last_n, 0);
 
         let gemma_4b = get_model_by_name("gemma3:4b").expect("gemma 4b model should exist");
+        assert!(gemma_4b.legacy_gguf_files.is_empty());
         assert_eq!(
             gemma_4b.download_url,
             "https://huggingface.co/bartowski/google_gemma-3-4b-it-GGUF/resolve/main/google_gemma-3-4b-it-Q4_K_M.gguf"
