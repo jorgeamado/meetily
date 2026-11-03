@@ -428,7 +428,14 @@ pub(crate) async fn generate_summary(
 
     // Agent CLIs: subprocess, no HTTP API
     if matches!(provider, LLMProvider::ClaudeCli | LLMProvider::CodexCli) {
-        return generate_with_cli(provider, model_name, system_prompt, user_prompt, cancellation_token).await;
+        // The agent CLIs return plain visible text — they have no separate
+        // reasoning channel to strip (upstream #694 applies to the HTTP APIs).
+        return generate_with_cli(provider, model_name, system_prompt, user_prompt, cancellation_token)
+            .await
+            .map(|content| LlmCompletion {
+                content,
+                reasoning_stripped: false,
+            });
     }
 
     // Handle BuiltInAI provider separately (uses local sidecar, no HTTP API)

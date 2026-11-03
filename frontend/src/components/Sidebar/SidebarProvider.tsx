@@ -217,6 +217,12 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
     let cancelled = false;
 
     const setup = async () => {
+      // These are Tauri runtime events: outside the app shell (SSR, and the
+      // non-DOM test environment) there is nothing to listen to, and calling
+      // listen() would throw on the missing __TAURI_INTERNALS__ bridge.
+      if (typeof window === 'undefined' || !('__TAURI_INTERNALS__' in window)) {
+        return;
+      }
       const { listen } = await import('@tauri-apps/api/event');
 
       const finish = (meetingId: string, ok: boolean) => {

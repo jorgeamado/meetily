@@ -26,6 +26,7 @@ pub fn set_live_transcription_enabled(enabled: bool) {
 pub fn is_live_transcription_enabled() -> bool {
     LIVE_TRANSCRIPTION_ENABLED.load(Ordering::SeqCst)
 }
+
 /// How long a silence must last before the VAD closes a speech segment, and
 /// therefore how long the audio clips handed to the ASR engine are.
 ///
