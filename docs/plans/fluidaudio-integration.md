@@ -161,3 +161,34 @@ Implemented across `frontend/src-tauri/src/` and `frontend/src/`:
 - Live transcription provider (`frontend/src-tauri/src/fluid_engine/mod.rs`, `frontend/src-tauri/src/audio/transcription/engine.rs`, `frontend/src-tauri/src/audio/recording_commands.rs`): `FluidLiveProvider` wraps a `FluidJobGuard` acquired via `FLUID_ENGINE.begin_job` for the duration of a live recording (preventing concurrent model switches or mid-recording helper unload), maps `FluidTranscript` to `TranscriptResult` via `fluid_transcript_to_result`, and ignores language hints with a debug log. `validate_transcription_model_ready` and `get_or_init_transcription_engine` validate sidecar availability, resolve the configured model (defaulting empty to `fluid-parakeet-v3`), and verify `model_status(...).downloaded` without downloading during validation. `stop_recording` awaits transcription task completion (dropping `Arc<FluidLiveProvider>` and its `FluidJobGuard`) and calls `FLUID_ENGINE.unload_if_idle()`.
 - Readiness commands & settings persistence (`frontend/src-tauri/src/fluid_engine/commands.rs`, `frontend/src-tauri/src/lib.rs`, `frontend/src-tauri/src/database/repositories/setting.rs`): added `fluid_init` and `fluid_has_available_models`, registered them in `lib.rs`, and updated `save_transcript_api_key` / `get_transcript_api_key` to treat `fluidAudio` as a keyless local provider alongside `parakeet`.
 - Frontend provider selection & readiness (`frontend/src/lib/transcription-model-readiness.ts`, `frontend/src/constants/modelDefaults.ts`, `frontend/src/components/TranscriptSettings.tsx`, `frontend/src/components/FluidAudioModelManager.tsx`, `frontend/src/components/LanguageSelection.tsx`, `frontend/src/hooks/useModalState.ts`, `frontend/src/hooks/useTranscriptionModels.ts`): wired `fluidAudio` into `PROVIDER_COMMANDS` and `MODEL_DEFAULTS`, added `🍎 Parakeet on Neural Engine (macOS, fastest)` to the Transcript Model selector when `fluid_is_available` is true, added model selection (`selectedModel`, `onModelSelect`, `"Use for transcription"`, auto-save) to `FluidAudioModelManager`, hid the standalone Neural Engine section when `fluidAudio` is the active provider, and updated `LanguageSelection` to use `isAutoLanguageOnlyProvider`.
+- Review fixes: stop always runs the FluidAudio idle unload (provider switched mid-recording, timed-out stop); `FluidJobGuard::transcribe` reloads the job's model under the process lock after a helper timeout/crash, so one failure no longer silences the rest of a live recording; FluidAudio validation errors are shown to the user and the worker no longer emits a second "Recording failed" when recording continues audio-only. Known, not fixed: `stop_recording` returns early if the final stream flush fails (pre-existing for all engines); a delete between validation and `begin_job` re-downloads the model.
+
+## Acceptance results (2026-11-03)
+
+Measured on four real meetings (34–69 min, Russian/English, 2–6 speakers) with `boundary-eval`'s `batchbench`, on an M-series Mac. Raw outputs stay in the gitignored `eval/private/bench/`.
+
+- **WER**: Parakeet v3 22.0% vs current engine 21.8% (phase 0), within 1 point. Met.
+- **Speed**: transcription alone is 11–13x faster end to end (Whisper large-v3-turbo 3–6x real time, Parakeet v3 50–98x). With the current sherpa-onnx diarization (CPU, 155–449 s per meeting) running in parallel, end to end is only **1.8–2.9x faster**: diarization is now the critical path. **Not met** with the current diarizer.
+- **Boundary eval**: speaker-change scores are identical for Whisper and Parakeet turn text on all four meetings (ok-hit 13/24, wrong-rejected 37/44 for both). Met.
+- **Windows/Linux**: `fluid_engine` reports unavailable off macOS and the UI hides it; the helper build steps are macOS-only. CI is the check.
+- Fixed during the benchmark: FluidAudio rejects audio under 300 ms, which failed whole retranscriptions; short clips are now padded with trailing silence.
+
+### Diarization benchmark (phase 6 item)
+
+FluidAudio's offline diarizer (pyannote community-1 segmentation + WeSpeaker embeddings + VBx on the ANE), via `fluidaudiocli process --mode offline` on a 16 kHz mono mixdown:
+
+| | current (sherpa-onnx, CPU) | FluidAudio offline (ANE) |
+|---|---|---|
+| time per meeting | 155–449 s | 9–24 s (~17x faster) |
+| speakers found | 2 / 3 / 6 / 4 | 2 / 3 / 6 / 4 (same) |
+| ok-hit (real changes found) | 13/24 | 15/24 |
+| wrong-rejected (spurious changes avoided) | 37/44 | 36/44 |
+
+With it, the end-to-end retranscription estimate is about 9–13x faster than today, which meets the 5x criterion. Notes: it must get a mono mixdown (on stereo input the CLI used one channel and found a single speaker); Sortformer was slower here (261 s on the 34-min meeting) and covered under half of the speech, so it is not a candidate.
+
+**Recommendation**: add a `diarize` request to `fluid-helper` using `OfflineDiarizerManager` and use it on macOS in place of the sherpa-onnx helper, keeping the stereo local-speaker overlay and the existing Windows/Linux path.
+
+### Other phase 6 items
+
+- Glossary → CTC custom vocabulary: not started. It needs FluidAudio's separate CTC model download and a vocabulary request in the helper; worth doing after the diarizer, since the glossary matters less now that Parakeet keeps English terms in Latin script.
+- Default switch: not yet. The plan's condition (phases 3–5 holding up in daily use) has not been met; revisit after a couple of weeks of real meetings on the FluidAudio provider.
