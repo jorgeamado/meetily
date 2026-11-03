@@ -3,6 +3,7 @@
 use crate::api::TranscriptSegment;
 use crate::audio::decoder::{decode_audio_file, decode_audio_file_with_progress};
 use crate::audio::vad::get_speech_chunks_with_progress;
+use crate::fluid_engine::{FluidJobGuard, FluidLoadStage, FluidModel, FLUID_ENGINE};
 use crate::parakeet_engine::ParakeetEngine;
 use crate::state::AppState;
 use crate::whisper_engine::WhisperEngine;
@@ -637,6 +638,9 @@ async fn run_import<R: Runtime>(
             BatchEngine::Parakeet => LoadedBatchEngine::Parakeet(
                 get_or_init_parakeet(&app, model.as_deref()).await?,
             ),
+            BatchEngine::FluidAudio => LoadedBatchEngine::FluidAudio(
+                get_or_init_fluid(&app, model.as_deref()).await?,
+            ),
         })
     } else {
         None
@@ -663,7 +667,9 @@ async fn run_import<R: Runtime>(
                 None => None,
             }
         }
-        Some(LoadedBatchEngine::Parakeet(_)) | None => None,
+        Some(LoadedBatchEngine::Parakeet(_))
+        | Some(LoadedBatchEngine::FluidAudio(_))
+        | None => None,
     };
     #[cfg(not(target_os = "macos"))]
     let mut ane_marker: Option<PathBuf> = None;
@@ -758,6 +764,15 @@ async fn run_import<R: Runtime>(
                     .await
                     .map_err(|e| anyhow!("Parakeet transcription failed on segment {}: {}", i, e))?;
                 (text, 0.9f32)
+            }
+            LoadedBatchEngine::FluidAudio(engine) => {
+                let transcript = engine
+                    .transcribe(&segment.samples)
+                    .await
+                    .map_err(|e| {
+                        anyhow!("FluidAudio transcription failed on segment {}: {}", i, e)
+                    })?;
+                (transcript.text, transcript.confidence)
             }
             LoadedBatchEngine::Whisper(engine) => {
                 let (text, conf, _) = engine
@@ -1021,6 +1036,40 @@ async fn get_or_init_parakeet<R: Runtime>(
     }
 }
 
+/// Get or initialize the FluidAudio engine
+async fn get_or_init_fluid<R: Runtime>(
+    app: &AppHandle<R>,
+    requested_model: Option<&str>,
+) -> Result<FluidJobGuard> {
+    let target_model = match requested_model {
+        Some(model) => model.to_string(),
+        None => get_configured_model(app, BatchEngine::FluidAudio).await?,
+    };
+
+    let fluid_model = FluidModel::from_model_id(&target_model).ok_or_else(|| {
+        anyhow!(
+            "Unknown FluidAudio model '{}'. Expected 'fluid-parakeet-v3' or 'fluid-parakeet-ultra'",
+            target_model
+        )
+    })?;
+
+    let models_dir = crate::fluid_engine::models_dir(app)?;
+    let app_for_progress = app.clone();
+
+    FLUID_ENGINE
+        .begin_job(fluid_model, &models_dir, move |progress| {
+            let pct = (progress.fraction.clamp(0.0, 1.0) * 100.0).round() as u32;
+            let message = match progress.stage {
+                FluidLoadStage::Download => format!("Downloading Parakeet model… {}%", pct),
+                FluidLoadStage::Compile => {
+                    format!("Preparing Parakeet for the Neural Engine… {}%", pct)
+                }
+            };
+            emit_progress(&app_for_progress, "transcribing", 30, &message);
+        })
+        .await
+}
+
 /// Get the configured model from database
 async fn get_configured_model<R: Runtime>(
     app: &AppHandle<R>,
@@ -1039,7 +1088,23 @@ async fn get_configured_model<R: Runtime>(
 
     match result {
         Some((provider, model)) if engine.matches_provider_config(&provider) => Ok(model),
-        Some(_) | None => Ok(engine.default_model().to_string()),
+        Some((provider, _)) => {
+            warn!(
+                "Configured provider '{}' does not match {}, using default model '{}'",
+                provider,
+                engine.display_name(),
+                engine.default_model()
+            );
+            Ok(engine.default_model().to_string())
+        }
+        None => {
+            warn!(
+                "No transcript config found, using default {} model '{}'",
+                engine.display_name(),
+                engine.default_model()
+            );
+            Ok(engine.default_model().to_string())
+        }
     }
 }
 

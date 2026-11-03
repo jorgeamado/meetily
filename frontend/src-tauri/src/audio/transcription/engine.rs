@@ -111,6 +111,30 @@ pub async fn validate_transcription_model_ready<R: Runtime>(app: &AppHandle<R>) 
                 }
             }
         }
+        "fluidAudio" => {
+            warn!("FluidAudio live transcription is not supported yet; using Whisper");
+            info!("🔍 Validating Whisper model...");
+            // Ensure whisper engine is initialized first
+            if let Err(init_error) = crate::whisper_engine::commands::whisper_init().await {
+                warn!("❌ Failed to initialize Whisper engine: {}", init_error);
+                return Err(format!(
+                    "Failed to initialize speech recognition: {}",
+                    init_error
+                ));
+            }
+
+            // Call the whisper validation command with config support
+            match crate::whisper_engine::commands::whisper_validate_model_ready_with_config(app).await {
+                Ok(model_name) => {
+                    info!("✅ Whisper model validation successful: {} is ready", model_name);
+                    Ok(())
+                }
+                Err(e) => {
+                    warn!("❌ Whisper model validation failed: {}", e);
+                    Err(e)
+                }
+            }
+        }
         "parakeet" => {
             info!("🔍 Validating Parakeet model...");
             // Ensure parakeet engine is initialized first
@@ -213,6 +237,12 @@ pub async fn get_or_init_transcription_engine<R: Runtime>(
             }
         }
         "localWhisper" | "whisper" => {
+            info!("🎤 Initializing Whisper transcription engine");
+            let whisper_engine = get_or_init_whisper(app).await?;
+            Ok(TranscriptionEngine::Whisper(whisper_engine))
+        }
+        "fluidAudio" => {
+            warn!("FluidAudio live transcription is not supported yet; using Whisper");
             info!("🎤 Initializing Whisper transcription engine");
             let whisper_engine = get_or_init_whisper(app).await?;
             Ok(TranscriptionEngine::Whisper(whisper_engine))

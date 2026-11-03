@@ -137,3 +137,11 @@ Tests: existing suite plus enum-dispatch unit tests. Ships alone.
 - FluidAudio API churn: pin the exact version; the helper isolates it from Rust.
 - First-run ANE compile time and about 1.1 GB of models: make download and compile explicit and visible.
 - A Swift toolchain in CI: GitHub macOS runners have Xcode; Windows/Linux jobs skip the helper.
+
+## Phase 3 status
+
+Implemented in `frontend/src-tauri/src`:
+
+- `fluid_engine` (`src/fluid_engine/mod.rs`): `FluidModel` (`V3` / `Ultra`), `FluidAudioEngine` (`FLUID_ENGINE` singleton), `fluid-helper` sidecar resolution and lifecycle management (`load_model` with 600 s inactivity timeout and download/compile progress callbacks, `transcribe` via temp 16 kHz mono WAV with crash/idle-exit respawn + reload retry, `unload_model` with 2 s graceful shutdown), `tokens_to_words` SentencePiece merger into `WordSpan`s, `TranscriptionProvider` implementation, unit tests, and an `#[ignore]` integration test (`FLUID_TEST_WAV`).
+- `BatchEngine::FluidAudio` and `LoadedBatchEngine::FluidAudio` in `src/audio/common.rs`, wired into batch retranscription (`src/audio/retranscription.rs`, including word timestamp shifting for speaker turn splitting) and audio import (`src/audio/import.rs`).
+- Live recording fallback arms for `"fluidAudio"` in `src/audio/transcription/engine.rs` and `src/audio/recording_commands.rs` (logs a warning and uses Whisper until phase 5).

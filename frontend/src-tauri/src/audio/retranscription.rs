@@ -12,6 +12,7 @@ use super::common::{
     LoadedBatchEngine,
 };
 use super::constants::AUDIO_EXTENSIONS;
+use crate::fluid_engine::{FluidJobGuard, FluidLoadStage, FluidModel, FLUID_ENGINE};
 use crate::parakeet_engine::ParakeetEngine;
 use crate::state::AppState;
 use crate::whisper_engine::WhisperEngine;
@@ -448,6 +449,9 @@ async fn run_retranscription<R: Runtime>(
         BatchEngine::Parakeet => LoadedBatchEngine::Parakeet(
             get_or_init_parakeet(&app, model.as_deref()).await?,
         ),
+        BatchEngine::FluidAudio => LoadedBatchEngine::FluidAudio(
+            get_or_init_fluid(&app, &meeting_id, model.as_deref()).await?,
+        ),
     };
 
     // Glossary biasing uses APPROVED terms only and is gated on the
@@ -463,7 +467,7 @@ async fn run_retranscription<R: Runtime>(
                     engine.set_initial_prompt(Some(prompt)).await;
                 }
             }
-            LoadedBatchEngine::Parakeet(_) => {}
+            LoadedBatchEngine::Parakeet(_) | LoadedBatchEngine::FluidAudio(_) => {}
         }
     }
 
@@ -514,7 +518,7 @@ async fn run_retranscription<R: Runtime>(
                 None => None,
             }
         }
-        LoadedBatchEngine::Parakeet(_) => None,
+        LoadedBatchEngine::Parakeet(_) | LoadedBatchEngine::FluidAudio(_) => None,
     };
     #[cfg(not(target_os = "macos"))]
     let mut ane_marker: Option<PathBuf> = None;
@@ -585,6 +589,26 @@ async fn run_retranscription<R: Runtime>(
                     .await
                     .map_err(|e| anyhow!("Parakeet transcription failed on segment {}: {}", i, e))?;
                 (text, 0.9f32, Vec::new())
+            }
+            LoadedBatchEngine::FluidAudio(engine) => {
+                let transcript = engine
+                    .transcribe(&segment.samples)
+                    .await
+                    .map_err(|e| {
+                        anyhow!("FluidAudio transcription failed on segment {}: {}", i, e)
+                    })?;
+                // Word times are chunk-relative; shift onto the recording timeline
+                let words = transcript
+                    .words
+                    .into_iter()
+                    .map(|w| diarization::WordSpan {
+                        text: w.text,
+                        start_ms: w.start_ms + segment.start_timestamp_ms,
+                        end_ms: w.end_ms + segment.start_timestamp_ms,
+                        prob: w.prob,
+                    })
+                    .collect();
+                (transcript.text, transcript.confidence, words)
             }
             LoadedBatchEngine::Whisper(engine) => {
                 let (text, conf, words) = engine
@@ -1211,7 +1235,7 @@ async fn get_configured_model<R: Runtime>(
                 Ok(model)
             } else {
                 // Historical asymmetry preserved: Whisper errors when the saved
-                // provider is non-Whisper, whereas Parakeet falls back to its default.
+                // provider is non-Whisper, whereas Parakeet and FluidAudio fall back to their defaults.
                 match engine {
                     BatchEngine::Whisper => {
                         error!("Retranscription requires Whisper provider, but configured provider is: {}", provider);
@@ -1219,6 +1243,10 @@ async fn get_configured_model<R: Runtime>(
                     }
                     BatchEngine::Parakeet => {
                         warn!("Configured provider is not Parakeet, using default model");
+                        Ok(engine.default_model().to_string())
+                    }
+                    BatchEngine::FluidAudio => {
+                        warn!("Configured provider is not FluidAudio, using default model");
                         Ok(engine.default_model().to_string())
                     }
                 }
@@ -1234,6 +1262,10 @@ async fn get_configured_model<R: Runtime>(
             }
             BatchEngine::Parakeet => {
                 warn!("No transcript config found, using default Parakeet model");
+                Ok(engine.default_model().to_string())
+            }
+            BatchEngine::FluidAudio => {
+                warn!("No transcript config found, using default FluidAudio model");
                 Ok(engine.default_model().to_string())
             }
         },
@@ -1296,6 +1328,48 @@ async fn get_or_init_parakeet<R: Runtime>(
         }
         None => Err(anyhow!("Parakeet engine not initialized")),
     }
+}
+
+/// Get or initialize the FluidAudio engine, auto-loading the model via `fluid-helper` if needed
+async fn get_or_init_fluid<R: Runtime>(
+    app: &AppHandle<R>,
+    meeting_id: &str,
+    requested_model: Option<&str>,
+) -> Result<FluidJobGuard> {
+    let target_model = match requested_model {
+        Some(model) => model.to_string(),
+        None => get_configured_model(app, BatchEngine::FluidAudio).await?,
+    };
+
+    let fluid_model = FluidModel::from_model_id(&target_model).ok_or_else(|| {
+        anyhow!(
+            "Unknown FluidAudio model '{}'. Expected 'fluid-parakeet-v3' or 'fluid-parakeet-ultra'",
+            target_model
+        )
+    })?;
+
+    let models_dir = crate::fluid_engine::models_dir(app)?;
+    let app_for_progress = app.clone();
+    let meeting_id_for_progress = meeting_id.to_string();
+
+    FLUID_ENGINE
+        .begin_job(fluid_model, &models_dir, move |progress| {
+            let pct = (progress.fraction.clamp(0.0, 1.0) * 100.0).round() as u32;
+            let message = match progress.stage {
+                FluidLoadStage::Download => format!("Downloading Parakeet model… {}%", pct),
+                FluidLoadStage::Compile => {
+                    format!("Preparing Parakeet for the Neural Engine… {}%", pct)
+                }
+            };
+            emit_progress(
+                &app_for_progress,
+                &meeting_id_for_progress,
+                "transcribing",
+                0,
+                &message,
+            );
+        })
+        .await
 }
 
 /// Write or update metadata.json for retranscription (preserves existing fields, adds retranscribed_at)

@@ -19,15 +19,17 @@ pub(crate) async fn acquire_engine_lifecycle_lock() -> OwnedMutexGuard<()> {
 pub enum BatchEngine {
     Whisper,
     Parakeet,
+    FluidAudio,
 }
 
 impl BatchEngine {
     /// Resolve the batch engine from an optional provider identifier.
-    /// Reproduces the historical mapping: `Some("parakeet")` selects `Parakeet`,
+    /// `Some("parakeet")` selects `Parakeet`, `Some("fluidAudio")` selects `FluidAudio`,
     /// and `None` or any other value defaults to `Whisper`.
     pub fn from_provider(provider: Option<&str>) -> Self {
         match provider {
             Some("parakeet") => Self::Parakeet,
+            Some("fluidAudio") => Self::FluidAudio,
             _ => Self::Whisper,
         }
     }
@@ -37,6 +39,7 @@ impl BatchEngine {
         match self {
             Self::Whisper => "Whisper",
             Self::Parakeet => "Parakeet",
+            Self::FluidAudio => "FluidAudio Parakeet",
         }
     }
 
@@ -45,6 +48,7 @@ impl BatchEngine {
         match self {
             Self::Whisper => crate::config::DEFAULT_WHISPER_MODEL,
             Self::Parakeet => crate::config::DEFAULT_PARAKEET_MODEL,
+            Self::FluidAudio => "fluid-parakeet-v3",
         }
     }
 
@@ -56,6 +60,7 @@ impl BatchEngine {
                 configured_provider == "localWhisper" || configured_provider == "whisper"
             }
             Self::Parakeet => configured_provider == "parakeet",
+            Self::FluidAudio => configured_provider == "fluidAudio",
         }
     }
 
@@ -64,17 +69,18 @@ impl BatchEngine {
     pub fn supports_initial_prompt(self) -> bool {
         match self {
             Self::Whisper => true,
-            Self::Parakeet => false,
+            Self::Parakeet | Self::FluidAudio => false,
         }
     }
 
     /// Whether confidence-gated LLM wording repair (`transcript_repair`) should run.
     /// Repair inspects per-token decoder probabilities on `SpeakerTurn::words`,
-    /// which Whisper populates (via DTW/token output) and Parakeet leaves empty.
+    /// which Whisper populates (via DTW/token output) and Parakeet leaves empty
+    /// (FluidAudio Parakeet confidences are not calibrated like Whisper's token probs).
     pub fn supports_transcript_repair(self) -> bool {
         match self {
             Self::Whisper => true,
-            Self::Parakeet => false,
+            Self::Parakeet | Self::FluidAudio => false,
         }
     }
 
@@ -84,7 +90,7 @@ impl BatchEngine {
     pub fn supports_glossary_learning(self) -> bool {
         match self {
             Self::Whisper => true,
-            Self::Parakeet => false,
+            Self::Parakeet | Self::FluidAudio => false,
         }
     }
 }
@@ -93,6 +99,7 @@ impl BatchEngine {
 pub(crate) enum LoadedBatchEngine {
     Whisper(Arc<crate::whisper_engine::WhisperEngine>),
     Parakeet(Arc<crate::parakeet_engine::ParakeetEngine>),
+    FluidAudio(crate::fluid_engine::FluidJobGuard),
 }
 
 /// Unload the transcription engine after a batch job (import or retranscription).
@@ -116,6 +123,9 @@ pub(crate) async fn unload_engine_after_batch(engine: BatchEngine) {
             if let Some(e) = engine {
                 e.unload_model().await;
             }
+        }
+        BatchEngine::FluidAudio => {
+            crate::fluid_engine::FLUID_ENGINE.unload_if_idle().await;
         }
         BatchEngine::Whisper => {
             use crate::whisper_engine::commands::WHISPER_ENGINE;
@@ -326,6 +336,10 @@ mod tests {
             BatchEngine::Parakeet
         );
         assert_eq!(
+            BatchEngine::from_provider(Some("fluidAudio")),
+            BatchEngine::FluidAudio
+        );
+        assert_eq!(
             BatchEngine::from_provider(Some("localWhisper")),
             BatchEngine::Whisper
         );
@@ -344,12 +358,15 @@ mod tests {
     fn test_batch_engine_capability_helpers() {
         assert!(BatchEngine::Whisper.supports_initial_prompt());
         assert!(!BatchEngine::Parakeet.supports_initial_prompt());
+        assert!(!BatchEngine::FluidAudio.supports_initial_prompt());
 
         assert!(BatchEngine::Whisper.supports_transcript_repair());
         assert!(!BatchEngine::Parakeet.supports_transcript_repair());
+        assert!(!BatchEngine::FluidAudio.supports_transcript_repair());
 
         assert!(BatchEngine::Whisper.supports_glossary_learning());
         assert!(!BatchEngine::Parakeet.supports_glossary_learning());
+        assert!(!BatchEngine::FluidAudio.supports_glossary_learning());
     }
 
     #[test]
@@ -357,12 +374,20 @@ mod tests {
         assert!(BatchEngine::Whisper.matches_provider_config("localWhisper"));
         assert!(BatchEngine::Whisper.matches_provider_config("whisper"));
         assert!(!BatchEngine::Whisper.matches_provider_config("parakeet"));
+        assert!(!BatchEngine::Whisper.matches_provider_config("fluidAudio"));
         assert!(!BatchEngine::Whisper.matches_provider_config("other"));
 
         assert!(BatchEngine::Parakeet.matches_provider_config("parakeet"));
         assert!(!BatchEngine::Parakeet.matches_provider_config("localWhisper"));
         assert!(!BatchEngine::Parakeet.matches_provider_config("whisper"));
+        assert!(!BatchEngine::Parakeet.matches_provider_config("fluidAudio"));
         assert!(!BatchEngine::Parakeet.matches_provider_config("other"));
+
+        assert!(BatchEngine::FluidAudio.matches_provider_config("fluidAudio"));
+        assert!(!BatchEngine::FluidAudio.matches_provider_config("localWhisper"));
+        assert!(!BatchEngine::FluidAudio.matches_provider_config("whisper"));
+        assert!(!BatchEngine::FluidAudio.matches_provider_config("parakeet"));
+        assert!(!BatchEngine::FluidAudio.matches_provider_config("other"));
 
         assert_eq!(
             BatchEngine::Whisper.default_model(),
@@ -372,8 +397,13 @@ mod tests {
             BatchEngine::Parakeet.default_model(),
             crate::config::DEFAULT_PARAKEET_MODEL
         );
+        assert_eq!(BatchEngine::FluidAudio.default_model(), "fluid-parakeet-v3");
 
         assert_eq!(BatchEngine::Whisper.display_name(), "Whisper");
         assert_eq!(BatchEngine::Parakeet.display_name(), "Parakeet");
+        assert_eq!(
+            BatchEngine::FluidAudio.display_name(),
+            "FluidAudio Parakeet"
+        );
     }
 }

@@ -885,6 +885,32 @@ pub async fn stop_recording<R: Runtime>(
                 warn!("⚠️ No Parakeet engine found to unload model");
             }
         }
+        Some("fluidAudio") => {
+            // Live recording falls back to Whisper when fluidAudio is configured
+            info!("🎤 Unloading Whisper model...");
+            let engine_clone = {
+                let engine_guard = crate::whisper_engine::commands::WHISPER_ENGINE
+                    .lock()
+                    .unwrap();
+                engine_guard.as_ref().cloned()
+            };
+
+            if let Some(engine) = engine_clone {
+                let current_model = engine
+                    .get_current_model()
+                    .await
+                    .unwrap_or_else(|| "unknown".to_string());
+                info!("Current Whisper model before unload: '{}'", current_model);
+
+                if engine.unload_model().await {
+                    info!("✅ Whisper model '{}' unloaded successfully", current_model);
+                } else {
+                    warn!("⚠️ Failed to unload Whisper model '{}'", current_model);
+                }
+            } else {
+                warn!("⚠️ No Whisper engine found to unload model");
+            }
+        }
         _ => {
             // Default to Whisper
             info!("🎤 Unloading Whisper model...");

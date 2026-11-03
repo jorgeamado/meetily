@@ -48,9 +48,9 @@ swift test --filter FluidHelperCoreTests
      Optional field `"tokens": false` omits the `"tokens"` array from the response (defaults to `true`).
    - Response:
      ```json
-     {"type":"result","id":7,"text":"...","confidence":0.93,"duration":120.1,"processing_secs":1.6,"words":[{"w":"forecast","start":12.34,"end":12.8}],"tokens":[{"t":"▁fore","start":12.34,"end":12.5,"conf":0.98}]}
+     {"type":"result","id":7,"text":"...","confidence":0.93,"duration":120.1,"processing_secs":1.6,"words":[{"w":"forecast","start":12.34,"end":12.8}],"tokens":[{"t":" fore","start":12.34,"end":12.5,"conf":0.98}]}
      ```
-      FluidAudio's `language` script filter is intentionally omitted so mixed Cyrillic/Latin speech is preserved.
+     Tokens are decoded text pieces where a leading space marks a word start. FluidAudio's `language` script filter is intentionally omitted so mixed Cyrillic/Latin speech is preserved.
 
 3. **Ping**
    - Request: `{"type":"ping"}`

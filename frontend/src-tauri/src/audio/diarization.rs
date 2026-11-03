@@ -644,7 +644,7 @@ async fn download_file_once(url: &str, dest: &Path, on_progress: &mut impl FnMut
     Ok(())
 }
 
-fn target_triple() -> String {
+pub(crate) fn target_triple() -> String {
     std::env::var("TARGET").unwrap_or_else(|_| {
         #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         {
@@ -909,7 +909,7 @@ async fn run_diarize_helper(
         .with_context(|| format!("Failed to parse diarize-helper output: {}", stdout_output.trim()))
 }
 
-fn build_wav_bytes(samples: &[f32]) -> Vec<u8> {
+pub(crate) fn build_wav_bytes(samples: &[f32]) -> Vec<u8> {
     let sample_rate: u32 = 16000;
     let channels: u16 = 1;
     let bits_per_sample: u16 = 16;
