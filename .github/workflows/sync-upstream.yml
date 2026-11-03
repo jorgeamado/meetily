@@ -1,4 +1,4 @@
-# Fork maintenance: track Zackriya-Solutions/meeting-minutes.
+# Fork maintenance: track Zackriya-Solutions/meetily.
 #
 # main is the fork's product branch (features merged in), so upstream is
 # integrated by MERGE, not rebase:
@@ -32,7 +32,7 @@ jobs:
 
       - name: Update upstream-main mirror
         run: |
-          git remote add upstream https://github.com/Zackriya-Solutions/meeting-minutes.git
+          git remote add upstream https://github.com/Zackriya-Solutions/meetily.git
           git fetch upstream main
           git push origin +refs/remotes/upstream/main:refs/heads/upstream-main
 
