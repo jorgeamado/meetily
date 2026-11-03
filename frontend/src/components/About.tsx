@@ -21,6 +21,14 @@ export function About() {
         }
     };
 
+    const handleOpenExternalUrl = async (url: string) => {
+        try {
+            await invoke('open_external_url', { url });
+        } catch (error) {
+            console.error('Failed to open link:', error);
+        }
+    };
+
     return (
         <div className="p-4 space-y-4 h-[80vh] overflow-y-auto">
             {/* Compact Header */}
@@ -83,6 +91,20 @@ export function About() {
                 >
                     Chat with the Zackriya team
                 </button>
+            </div>
+
+            {/* Open-source components - Compact */}
+            <div className="bg-gray-50 rounded p-3 text-xs text-gray-600 leading-relaxed">
+                <span className="font-semibold text-gray-700">Open-source components:</span>{" "}
+                Transcription on macOS uses{" "}
+                <button
+                    type="button"
+                    onClick={() => handleOpenExternalUrl('https://github.com/FluidInference/FluidAudio')}
+                    className="underline hover:text-gray-900"
+                >
+                    FluidAudio
+                </button>{" "}
+                (Apache-2.0) and NVIDIA Parakeet TDT CoreML models (CC-BY-4.0).
             </div>
 
             {/* Footer - Compact */}

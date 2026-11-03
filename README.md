@@ -62,7 +62,7 @@ A personal fork focused on **fully local speaker diarization and LLM-assisted tr
 
 **Branch layout:** `main` is the fork's product branch (all features merged); `upstream-main` is a pristine mirror of [upstream](https://github.com/Zackriya-Solutions/meetily). A weekly [sync workflow](.github/workflows/sync-upstream.yml) fast-forwards the mirror and auto-merges upstream into `main` (clean merges push automatically; conflicts fail loudly for manual resolution).
 
-**Build:** same as upstream (`pnpm tauri:build` in `frontend/`; sidecars build automatically). The diarization helper is a Rust workspace member (`diarize-helper/`); after changing it, copy the binary to `frontend/src-tauri/binaries/diarize-helper-<target-triple>` before bundling.
+**Build:** same as upstream (`pnpm tauri:build` in `frontend/`; sidecars build automatically). The diarization helper is a Rust workspace member (`diarize-helper/`); after changing it, copy the binary to `frontend/src-tauri/binaries/diarize-helper-<target-triple>` before bundling. On macOS the bundle also includes `fluid-helper/` (Swift, FluidAudio Parakeet on the Neural Engine; needs Xcode / Swift 6): the build scripts and macOS CI stage it via `frontend/scripts/build-fluid-helper.sh`; run that script once before a plain `pnpm tauri:build` or `cargo` build.
 
 ---
 

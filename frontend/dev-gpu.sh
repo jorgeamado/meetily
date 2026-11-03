@@ -244,6 +244,16 @@ else
     exit 1
 fi
 
+# Build fluid-helper (macOS only: FluidAudio Parakeet on the Neural Engine, Swift)
+if [[ "$OSTYPE" == "darwin"* ]]; then
+    echo ""
+    echo -e "${BLUE}🎙️  Building fluid-helper sidecar...${NC}"
+    if ! ./scripts/build-fluid-helper.sh "$TARGET_TRIPLE"; then
+        echo -e "${RED}❌ Failed to build fluid-helper${NC}"
+        exit 1
+    fi
+fi
+
 # Run tauri dev using npm scripts
 echo ""
 echo -e "${CYAN}Starting complete Tauri application...${NC}"

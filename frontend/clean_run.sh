@@ -39,6 +39,9 @@ pnpm run build
 # Set environment variables for the build
 echo "Setting up build environment..."
 
+# macOS: the bundle requires the fluid-helper sidecar
+./scripts/build-fluid-helper.sh
+
 echo "Building Tauri app..."
 pnpm run tauri dev
 sleep

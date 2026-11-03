@@ -1,0 +1,10 @@
+{
+  "bundle": {
+    "externalBin": [
+      "binaries/llama-helper",
+      "binaries/diarize-helper",
+      "binaries/ffmpeg",
+      "binaries/fluid-helper"
+    ]
+  }
+}
