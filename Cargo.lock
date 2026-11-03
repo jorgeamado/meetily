@@ -560,6 +560,7 @@ dependencies = [
  "meetily",
  "serde",
  "serde_json",
+ "whisper-rs",
 ]
 
 [[package]]

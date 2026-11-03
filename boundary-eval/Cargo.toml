@@ -7,3 +7,10 @@ edition = "2021"
 meetily = { path = "../frontend/src-tauri" }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# wbench (eval/build_boundary_cases.py helper); same acceleration as the app
+[target.'cfg(target_os = "macos")'.dependencies]
+whisper-rs = { version = "0.13.2", features = ["raw-api", "metal", "coreml"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+whisper-rs = { version = "0.13.2", features = ["raw-api"] }

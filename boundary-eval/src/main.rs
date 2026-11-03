@@ -7,7 +7,8 @@
 // replace the current one.
 //
 // Usage:
-//   boundary_eval --model <path.gguf> --helper <llama-helper> <cases.jsonl>...
+//   boundary_eval --model <path.gguf> --helper <llama-helper>
+//                 [--template qwen3.5_nonthinking|chatml|gemma4] <cases.jsonl>...
 
 use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
@@ -16,6 +17,26 @@ use std::process::{Child, Command, Stdio};
 use app_lib::audio::boundary_refine::{build_prompt, parse_cut};
 use app_lib::audio::diarization::{SpeakerTurn, WordSpan};
 use app_lib::summary::summary_engine::models::format_prompt;
+
+/// Chat formats for candidate models the app has no template for yet
+/// (eval-only): `(template, stop token)`. Qwen goes through the app's own
+/// template so production prompts stay byte-identical.
+fn render_prompt(template: &str, system: &str, user: &str) -> Option<(String, &'static str)> {
+    match template {
+        "qwen3.5_nonthinking" => Some((format_prompt(template, system, user).ok()?, "<|im_end|>")),
+        // LFM2.5 and other plain ChatML models (no <think> block)
+        "chatml" => Some((
+            format!("<|im_start|>system\n{system}<|im_end|>\n<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n"),
+            "<|im_end|>",
+        )),
+        // Gemma 4 (from the GGUF's embedded chat template, thinking disabled)
+        "gemma4" => Some((
+            format!("<|turn>system\n{system}<turn|>\n<|turn>user\n{user}<turn|>\n<|turn>model\n"),
+            "<turn|>",
+        )),
+        _ => None,
+    }
+}
 
 const SYSTEM_PROMPT: &str = "You correct speaker-change points in conversation transcripts. \
 Answer with JSON only, no explanation.";
@@ -34,10 +55,11 @@ struct Helper {
     child: Child,
     reader: BufReader<std::process::ChildStdout>,
     model_path: String,
+    template: String,
 }
 
 impl Helper {
-    fn spawn(helper_path: &str, model_path: &str) -> Self {
+    fn spawn(helper_path: &str, model_path: &str, template: &str) -> Self {
         let mut child = Command::new(helper_path)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
@@ -45,11 +67,11 @@ impl Helper {
             .spawn()
             .expect("spawn llama-helper");
         let reader = BufReader::new(child.stdout.take().expect("helper stdout"));
-        Helper { child, reader, model_path: model_path.to_string() }
+        Helper { child, reader, model_path: model_path.to_string(), template: template.to_string() }
     }
 
     fn generate(&mut self, prompt: &str) -> Option<String> {
-        let formatted = format_prompt("qwen3.5_nonthinking", SYSTEM_PROMPT, prompt).ok()?;
+        let (formatted, stop) = render_prompt(&self.template, SYSTEM_PROMPT, prompt)?;
         let req = serde_json::json!({
             "type": "generate",
             "prompt": formatted,
@@ -63,7 +85,7 @@ impl Helper {
             "frequency_penalty": 0.0,
             "repeat_penalty": 1.0,
             "penalty_last_n": 0,
-            "stop_tokens": ["<|im_end|>"],
+            "stop_tokens": [stop],
         });
         let stdin = self.child.stdin.as_mut()?;
         writeln!(stdin, "{}", req).ok()?;
@@ -107,6 +129,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let mut model = String::new();
     let mut helper = String::new();
+    let mut template = String::from("qwen3.5_nonthinking");
     let mut dump: Option<PathBuf> = None;
     let mut files: Vec<PathBuf> = Vec::new();
     let mut i = 1;
@@ -114,6 +137,7 @@ fn main() {
         match args[i].as_str() {
             "--model" => { model = args[i + 1].clone(); i += 2; }
             "--helper" => { helper = args[i + 1].clone(); i += 2; }
+            "--template" => { template = args[i + 1].clone(); i += 2; }
             "--dump" => { dump = Some(args[i + 1].clone().into()); i += 2; }
             f => { files.push(f.into()); i += 1; }
         }
@@ -123,7 +147,8 @@ fn main() {
         "usage: [--model m.gguf --helper llama-helper] [--dump DIR] cases.jsonl..."
     );
 
-    let mut h = if dump.is_none() { Some(Helper::spawn(&helper, &model)) } else { None };
+    assert!(render_prompt(&template, "", "").is_some(), "unknown --template {template}");
+    let mut h = if dump.is_none() { Some(Helper::spawn(&helper, &model, &template)) } else { None };
     if let Some(dir) = &dump {
         std::fs::create_dir_all(dir).expect("create dump dir");
     }
