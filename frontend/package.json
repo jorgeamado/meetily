@@ -1,6 +1,7 @@
 {
     "name": "meetily",
     "version": "0.4.1",
+    "packageManager": "pnpm@9.15.9",
     "private": true,
     "main": "electron/main.js",
     "scripts": {
