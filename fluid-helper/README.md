@@ -92,6 +92,24 @@ fluid-helper --transcribe <wav> [--version v3|ultra] [--models-dir <dir>]
 
 Loads the requested model, transcribes `<wav>`, prints a single `result` JSON object to `stdout`, and exits.
 
+## One-Shot Speaker Diarization (`diarize`)
+
+Runs FluidAudio's offline speaker diarizer (`OfflineDiarizerModels` + `OfflineDiarizerManager`) in a separate one-shot process so diarization never blocks the persistent JSON-lines transcription session:
+
+```bash
+fluid-helper diarize --audio <16k mono wav> --models-dir <dir> [--num-speakers N]
+```
+
+- `--audio`: path to a 16 kHz mono WAV file
+- `--models-dir`: directory into which FluidAudio downloads/loads the offline diarizer repository (`<dir>/speaker-diarization`)
+- `--num-speakers`: optional exact speaker count (`OfflineDiarizerConfig.default.withSpeakers(exactly: N)`)
+- **Progress (`stderr`)**: emits `diarize-helper`-compatible lines `PROGRESS <0-100>` (`0` at start, `30` when models are ready, `30..95` across segmentation/embedding chunks, `100` on completion) and `PROGRESS -1` as a heartbeat every ~2 seconds while diarizing. All other `stderr` lines are diagnostic logs.
+- **Output (`stdout`)**: prints a single JSON line in the `diarize-helper` output schema and exits `0` (or logs an error to `stderr` and exits non-zero):
+  ```json
+  {"segments":[{"start":0.5,"end":1.5,"speaker":0,"voice":false}],"num_speakers":1,"centroids":[{"speaker":0,"clean_secs":1.0,"embedding":[0.062,...]}]}
+  ```
+  FluidAudio `speakerId` strings are mapped to 0-based integer indices in order of first appearance (sorted by start time), and each speaker's centroid is the L2-normalised duration-weighted mean of its segment embeddings.
+
 ## Licences
 
 - **FluidAudio**: [Apache License 2.0](https://github.com/FluidInference/FluidAudio/blob/main/LICENSE) (`Apache-2.0`).

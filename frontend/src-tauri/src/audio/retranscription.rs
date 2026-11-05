@@ -378,6 +378,7 @@ async fn run_retranscription<R: Runtime>(
     type DiarizeTaskResult = (
         Vec<diarization::DiarizedSegment>,
         Vec<crate::audio::voiceprints::ClusterCentroid>,
+        String,
     );
     let mut diarize_handle: Option<tauri::async_runtime::JoinHandle<DiarizeTaskResult>> =
         if let Some(samples) = audio_samples_for_diarization {
@@ -402,11 +403,12 @@ async fn run_retranscription<R: Runtime>(
                 .await;
 
                 match diarize_result {
-                    Ok((segments, num_speakers, centroids)) => {
+                    Ok((segments, num_speakers, centroids, used_model_key)) => {
                         info!(
-                            "Speaker diarization found {} speaker(s) across {} segments",
+                            "Speaker diarization found {} speaker(s) across {} segments (model: {})",
                             num_speakers,
-                            segments.len()
+                            segments.len(),
+                            used_model_key
                         );
                         // Channel identity: overlay mic-channel speech as the
                         // local speaker on top of the remote-only diarization
@@ -418,9 +420,9 @@ async fn run_retranscription<R: Runtime>(
                                 segments.len(),
                                 overlaid.len()
                             );
-                            return (overlaid, centroids);
+                            return (overlaid, centroids, used_model_key);
                         }
-                        (segments, centroids)
+                        (segments, centroids, used_model_key)
                     }
                     Err(e) => {
                         warn!("Speaker diarization failed, continuing without speaker labels: {}", e);
@@ -431,7 +433,11 @@ async fn run_retranscription<R: Runtime>(
                             100,
                             "Speaker identification failed, continuing without speaker labels",
                         );
-                        (Vec::new(), Vec::new())
+                        (
+                            Vec::new(),
+                            Vec::new(),
+                            diarization::DEFAULT_EMBEDDING_MODEL.to_string(),
+                        )
                     }
                 }
             }))
@@ -688,37 +694,42 @@ async fn run_retranscription<R: Runtime>(
     // moving past the dual-progress phase; a failed or panicked task just means
     // no speaker labels. The spawned task keeps emitting "diarizing" progress
     // while we wait, so the UI stays live until it finishes.
-    let (diarized_segments, cluster_centroids): DiarizeTaskResult = if let Some(handle) = diarize_handle {
-        match handle.await {
-            Ok(result) => result,
-            Err(join_err) => {
-                warn!("Speaker diarization task panicked: {}", join_err);
-                emit_progress(
-                    &app,
-                    &meeting_id,
-                    "diarizing",
-                    100,
-                    "Speaker identification failed, continuing without speaker labels",
-                );
-                (Vec::new(), Vec::new())
+    let (diarized_segments, cluster_centroids, used_model_key): DiarizeTaskResult =
+        if let Some(handle) = diarize_handle {
+            match handle.await {
+                Ok(result) => result,
+                Err(join_err) => {
+                    warn!("Speaker diarization task panicked: {}", join_err);
+                    emit_progress(
+                        &app,
+                        &meeting_id,
+                        "diarizing",
+                        100,
+                        "Speaker identification failed, continuing without speaker labels",
+                    );
+                    (
+                        Vec::new(),
+                        Vec::new(),
+                        diarization::DEFAULT_EMBEDDING_MODEL.to_string(),
+                    )
+                }
             }
-        }
-    } else {
-        (Vec::new(), Vec::new())
-    };
+        } else {
+            (
+                Vec::new(),
+                Vec::new(),
+                diarization::DEFAULT_EMBEDDING_MODEL.to_string(),
+            )
+        };
 
     // Cross-meeting speaker naming: store this run's voice centroids and
     // match them against the library of remembered voices. Recognized
     // colleagues get their names applied to the rows saved below.
     let mut speaker_names = if !cluster_centroids.is_empty() {
-        let model_key = diarize_opts
-            .embedding_model
-            .clone()
-            .unwrap_or_else(|| diarization::DEFAULT_EMBEDDING_MODEL.to_string());
         crate::audio::voiceprints::recognize_and_store(
             &app,
             &folder_path,
-            &model_key,
+            &used_model_key,
             cluster_centroids,
         )
     } else {

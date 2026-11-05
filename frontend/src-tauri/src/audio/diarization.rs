@@ -53,6 +53,57 @@ const SEGMENTATION_MODEL_MIN_BYTES: u64 = 5_000_000;
 const EMBEDDING_MODEL_MIN_BYTES: u64 = 25_000_000;
 
 pub const DEFAULT_EMBEDDING_MODEL: &str = "campplus";
+pub const FLUID_AUDIO_MODEL_KEY: &str = "fluidAudio";
+pub const FLUID_AUDIO_DISPLAY_NAME: &str = "Speaker voices — Neural Engine (macOS, fastest)";
+const FLUID_AUDIO_SIZE_MB: u32 = 25;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DiarizerRoute {
+    FluidAudio,
+    Sherpa(&'static str),
+}
+
+fn select_diarizer_route(
+    embedding_model: Option<&str>,
+    fluid_available: bool,
+) -> DiarizerRoute {
+    if embedding_model == Some(FLUID_AUDIO_MODEL_KEY) {
+        if fluid_available {
+            return DiarizerRoute::FluidAudio;
+        }
+        warn!(
+            "FluidAudio speaker diarizer requested ('{}'), but FluidAudio is unavailable; falling back to '{}'",
+            FLUID_AUDIO_MODEL_KEY, DEFAULT_EMBEDDING_MODEL
+        );
+        return DiarizerRoute::Sherpa(DEFAULT_EMBEDDING_MODEL);
+    }
+    DiarizerRoute::Sherpa(resolve_embedding_model(embedding_model).key)
+}
+
+fn effective_voiceprint_model_key(
+    route: DiarizerRoute,
+    fluid_succeeded: bool,
+) -> &'static str {
+    match route {
+        DiarizerRoute::FluidAudio if fluid_succeeded => FLUID_AUDIO_MODEL_KEY,
+        DiarizerRoute::FluidAudio => DEFAULT_EMBEDDING_MODEL,
+        DiarizerRoute::Sherpa(key) => key,
+    }
+}
+
+fn append_fluid_diarization_model(
+    models: &mut Vec<DiarizationModelStatus>,
+    fluid_available: bool,
+) {
+    if fluid_available {
+        models.push(DiarizationModelStatus {
+            key: FLUID_AUDIO_MODEL_KEY.to_string(),
+            display_name: FLUID_AUDIO_DISPLAY_NAME.to_string(),
+            size_mb: FLUID_AUDIO_SIZE_MB,
+            downloaded: true,
+        });
+    }
+}
 
 struct EmbeddingModelSpec {
     key: &'static str,
@@ -118,6 +169,7 @@ pub async fn diarization_list_models<R: Runtime>(
             downloaded: is_valid_file(&dir.join(m.filename), EMBEDDING_MODEL_MIN_BYTES).await,
         });
     }
+    append_fluid_diarization_model(&mut out, crate::fluid_engine::is_available());
     Ok(out)
 }
 
@@ -129,6 +181,19 @@ pub async fn diarization_download_model<R: Runtime>(
     model: String,
 ) -> Result<(), String> {
     use tauri::Emitter;
+
+    let event_name = format!("diarization:{}", model);
+    if model == FLUID_AUDIO_MODEL_KEY {
+        if !crate::fluid_engine::is_available() {
+            return Err("FluidAudio diarization requires macOS with the fluid-helper sidecar".to_string());
+        }
+        // FluidAudio downloads and compiles its own models on first diarization run.
+        let _ = app.emit(
+            "model-download-complete",
+            serde_json::json!({ "modelName": event_name }),
+        );
+        return Ok(());
+    }
 
     let dir = models_dir(&app).map_err(|e| e.to_string())?;
     tokio::fs::create_dir_all(&dir).await.map_err(|e| e.to_string())?;
@@ -142,7 +207,6 @@ pub async fn diarization_download_model<R: Runtime>(
         let spec = resolve_embedding_model(Some(&model));
         (spec.url, dir.join(spec.filename), EMBEDDING_MODEL_MIN_BYTES)
     };
-    let event_name = format!("diarization:{}", model);
     if is_valid_file(&path, min_bytes).await {
         let _ = app.emit(
             "model-download-complete",
@@ -246,8 +310,9 @@ struct HelperOutput {
 }
 
 /// Run speaker diarization on 16kHz mono samples. Returns diarized segments, the
-/// number of speakers detected, and each final cluster's clean-speech voice
-/// centroid (for cross-meeting speaker naming). Reports 0-100 progress with a
+/// number of speakers detected, each final cluster's clean-speech voice
+/// centroid (for cross-meeting speaker naming), and the effective embedding model
+/// key used to produce those centroids. Reports 0-100 progress with a
 /// human-readable message via `on_progress` as models are downloaded and the
 /// helper runs.
 pub async fn diarize<R: Runtime>(
@@ -255,11 +320,16 @@ pub async fn diarize<R: Runtime>(
     opts: &DiarizeOptions,
     app: &AppHandle<R>,
     mut on_progress: impl FnMut(u32, &str) + Send,
-) -> Result<(Vec<DiarizedSegment>, u32, Vec<super::voiceprints::ClusterCentroid>)> {
-    on_progress(0, "Preparing speaker diarization models...");
-    let models = ensure_models(app, opts.embedding_model.as_deref(), |pct, msg| on_progress(pct / 2, msg)).await?;
-
-    on_progress(50, "Identifying speakers...");
+) -> Result<(
+    Vec<DiarizedSegment>,
+    u32,
+    Vec<super::voiceprints::ClusterCentroid>,
+    String,
+)> {
+    let route = select_diarizer_route(
+        opts.embedding_model.as_deref(),
+        crate::fluid_engine::is_available(),
+    );
 
     let wav_bytes = build_wav_bytes(samples_16k_mono);
     let temp_path = std::env::temp_dir().join(format!("meetily-diarize-{}.wav", Uuid::new_v4()));
@@ -268,10 +338,79 @@ pub async fn diarize<R: Runtime>(
         .with_context(|| format!("Failed to write temp diarization wav: {}", temp_path.display()))?;
 
     let audio_secs = samples_16k_mono.len() as f64 / 16000.0;
-    let result = run_diarize_helper(&temp_path, &models, opts, audio_secs, |pct, msg| {
-        on_progress(50 + pct / 2, msg);
-    })
-    .await;
+
+    let (result, used_model_key) = match route {
+        DiarizerRoute::FluidAudio => {
+            if let Some(threshold) = opts.threshold {
+                debug!(
+                    "Ignoring clustering threshold ({}) for FluidAudio speaker diarization",
+                    threshold
+                );
+            }
+            on_progress(0, "Preparing speaker diarization models...");
+            let fluid_attempt = async {
+                let fluid_models_dir = crate::fluid_engine::models_dir(app)?.join("diarization");
+                tokio::fs::create_dir_all(&fluid_models_dir)
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "Failed to create FluidAudio diarization models dir: {}",
+                            fluid_models_dir.display()
+                        )
+                    })?;
+                run_fluid_diarize_helper(
+                    &temp_path,
+                    &fluid_models_dir,
+                    opts,
+                    audio_secs,
+                    &mut on_progress,
+                )
+                .await
+            }
+            .await;
+
+            match fluid_attempt {
+                Ok(output) => (
+                    Ok(output),
+                    effective_voiceprint_model_key(route, true).to_string(),
+                ),
+                Err(err) if super::retranscription::is_cancellation_requested() => (
+                    Err(err),
+                    effective_voiceprint_model_key(route, false).to_string(),
+                ),
+                Err(err) => {
+                    warn!(
+                        "FluidAudio speaker diarization failed ({:#}); falling back to sherpa-onnx ('{}')",
+                        err, DEFAULT_EMBEDDING_MODEL
+                    );
+                    let fallback_key = effective_voiceprint_model_key(route, false);
+                    let fallback_result = run_sherpa_diarize_pipeline(
+                        app,
+                        &temp_path,
+                        Some(fallback_key),
+                        opts,
+                        audio_secs,
+                        &mut on_progress,
+                    )
+                    .await;
+                    (fallback_result, fallback_key.to_string())
+                }
+            }
+        }
+        DiarizerRoute::Sherpa(sherpa_key) => {
+            let sherpa_result = run_sherpa_diarize_pipeline(
+                app,
+                &temp_path,
+                Some(sherpa_key),
+                opts,
+                audio_secs,
+                &mut on_progress,
+            )
+            .await;
+            (sherpa_result, sherpa_key.to_string())
+        }
+    };
+
     let _ = tokio::fs::remove_file(&temp_path).await;
 
     let output = result?;
@@ -298,7 +437,33 @@ pub async fn diarize<R: Runtime>(
         })
         .collect();
 
-    Ok((segments, output.num_speakers.max(0) as u32, centroids))
+    Ok((
+        segments,
+        output.num_speakers.max(0) as u32,
+        centroids,
+        used_model_key,
+    ))
+}
+
+async fn run_sherpa_diarize_pipeline<R: Runtime>(
+    app: &AppHandle<R>,
+    temp_path: &Path,
+    embedding_model_key: Option<&str>,
+    opts: &DiarizeOptions,
+    audio_secs: f64,
+    on_progress: &mut (impl FnMut(u32, &str) + Send),
+) -> Result<HelperOutput> {
+    on_progress(0, "Preparing speaker diarization models...");
+    let models = ensure_models(app, embedding_model_key, |pct, msg| {
+        on_progress(pct / 2, msg);
+    })
+    .await?;
+
+    on_progress(50, "Identifying speakers...");
+    run_diarize_helper(temp_path, &models, opts, audio_secs, |pct, msg| {
+        on_progress(50 + pct / 2, msg);
+    })
+    .await
 }
 
 /// Given a transcript segment's [start, end] range (seconds), pick the diarized speaker
@@ -767,7 +932,7 @@ async fn run_diarize_helper(
     models: &ModelPaths,
     opts: &DiarizeOptions,
     audio_secs: f64,
-    mut on_progress: impl FnMut(u32, &str) + Send,
+    on_progress: impl FnMut(u32, &str) + Send,
 ) -> Result<HelperOutput> {
     let binary = resolve_diarize_helper_binary()?;
 
@@ -778,10 +943,7 @@ async fn run_diarize_helper(
         .arg("--segmentation-model")
         .arg(&models.segmentation)
         .arg("--embedding-model")
-        .arg(&models.embedding)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        .arg(&models.embedding);
 
     if let Some(num_speakers) = opts.num_speakers {
         command.arg("--num-speakers").arg(num_speakers.to_string());
@@ -790,14 +952,70 @@ async fn run_diarize_helper(
         command.arg("--threshold").arg(threshold.to_string());
     }
 
-    log::info!("Spawning diarize-helper: {}", binary.display());
+    spawn_and_collect_helper(command, "diarize-helper", &binary, audio_secs, false, on_progress).await
+}
+
+async fn run_fluid_diarize_helper(
+    wav_path: &Path,
+    models_dir: &Path,
+    opts: &DiarizeOptions,
+    audio_secs: f64,
+    on_progress: impl FnMut(u32, &str) + Send,
+) -> Result<HelperOutput> {
+    let binary = crate::fluid_engine::resolve_fluid_helper_binary()?;
+
+    let mut command = Command::new(&binary);
+    command
+        .arg("diarize")
+        .arg("--audio")
+        .arg(wav_path)
+        .arg("--models-dir")
+        .arg(models_dir);
+
+    if let Some(num_speakers) = opts.num_speakers {
+        command.arg("--num-speakers").arg(num_speakers.to_string());
+    }
+
+    spawn_and_collect_helper(
+        command,
+        "fluid-helper diarize",
+        &binary,
+        audio_secs,
+        true,
+        on_progress,
+    )
+    .await
+}
+
+async fn spawn_and_collect_helper(
+    mut command: Command,
+    helper_name: &str,
+    binary: &Path,
+    audio_secs: f64,
+    // fluid-helper reports failures on stderr; diarize-helper puts {"error"} on stdout.
+    stderr_error_fallback: bool,
+    mut on_progress: impl FnMut(u32, &str) + Send,
+) -> Result<HelperOutput> {
+    command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+
+    log::info!("Spawning {}: {}", helper_name, binary.display());
 
     let mut child = command
         .spawn()
-        .with_context(|| format!("Failed to spawn diarize-helper at {}", binary.display()))?;
+        .with_context(|| format!("Failed to spawn {} at {}", helper_name, binary.display()))?;
 
-    let mut stdout = child.stdout.take().ok_or_else(|| anyhow!("Failed to capture diarize-helper stdout"))?;
-    let stderr = child.stderr.take().ok_or_else(|| anyhow!("Failed to capture diarize-helper stderr"))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("Failed to capture {} stdout", helper_name))?;
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow!("Failed to capture {} stderr", helper_name))?;
 
     let stdout_task = tokio::spawn(async move {
         let mut buf = String::new();
@@ -806,6 +1024,7 @@ async fn run_diarize_helper(
 
     let progress_queue: Arc<Mutex<VecDeque<HelperProgress>>> = Arc::new(Mutex::new(VecDeque::new()));
     let progress_queue_for_task = progress_queue.clone();
+    let helper_name_for_stderr = helper_name.to_string();
     let stderr_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stderr).lines();
         let mut buf = String::new();
@@ -816,7 +1035,7 @@ async fn run_diarize_helper(
                     None => {
                         // cluster-repair decisions are worth having in the log
                         if line.starts_with("oversplit:") {
-                            info!("diarize-helper {}", line);
+                            info!("{} {}", helper_name_for_stderr, line);
                         }
                         buf.push_str(&line);
                         buf.push('\n');
@@ -839,12 +1058,13 @@ async fn run_diarize_helper(
     let status = loop {
         if start.elapsed() > hard_cap {
             let _ = child.kill().await;
-            return Err(anyhow!("diarize-helper exceeded hard cap of {:?}", hard_cap));
+            return Err(anyhow!("{} exceeded hard cap of {:?}", helper_name, hard_cap));
         }
         if last_event_at.elapsed() > DIARIZE_STALL_TIMEOUT {
             let _ = child.kill().await;
             return Err(anyhow!(
-                "diarize-helper made no progress for {:?} (last at {}%)",
+                "{} made no progress for {:?} (last at {}%)",
+                helper_name,
                 DIARIZE_STALL_TIMEOUT,
                 last_known_pct
             ));
@@ -880,33 +1100,47 @@ async fn run_diarize_helper(
         }
 
         match tokio::time::timeout(Duration::from_millis(300), child.wait()).await {
-            Ok(status_result) => break status_result.context("Failed to wait for diarize-helper")?,
+            Ok(status_result) => {
+                break status_result
+                    .with_context(|| format!("Failed to wait for {}", helper_name))?
+            }
             Err(_) => continue,
         }
     };
 
     let stdout_output = stdout_task
         .await
-        .context("diarize-helper stdout reader task panicked")?
-        .context("Failed reading diarize-helper stdout")?;
+        .with_context(|| format!("{} stdout reader task panicked", helper_name))?
+        .with_context(|| format!("Failed reading {} stdout", helper_name))?;
     let stderr_output = stderr_task
         .await
-        .context("diarize-helper stderr reader task panicked")?;
+        .with_context(|| format!("{} stderr reader task panicked", helper_name))?;
 
     if !stderr_output.trim().is_empty() {
-        debug!("diarize-helper stderr: {}", stderr_output.trim());
+        debug!("{} stderr: {}", helper_name, stderr_output.trim());
     }
 
     if !status.success() {
         let err_msg = serde_json::from_str::<serde_json::Value>(stdout_output.trim())
             .ok()
             .and_then(|v| v.get("error").and_then(|e| e.as_str()).map(|s| s.to_string()))
-            .unwrap_or_else(|| format!("diarize-helper exited with status {}", status));
+            .or_else(|| {
+                if !stderr_error_fallback {
+                    return None;
+                }
+                stderr_output
+                    .lines()
+                    .rev()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty())
+                    .map(|s| s.to_string())
+            })
+            .unwrap_or_else(|| format!("{} exited with status {}", helper_name, status));
         return Err(anyhow!(err_msg));
     }
 
     serde_json::from_str(stdout_output.trim())
-        .with_context(|| format!("Failed to parse diarize-helper output: {}", stdout_output.trim()))
+        .with_context(|| format!("Failed to parse {} output: {}", helper_name, stdout_output.trim()))
 }
 
 pub(crate) fn build_wav_bytes(samples: &[f32]) -> Vec<u8> {
@@ -1133,6 +1367,71 @@ mod tests {
         assert_eq!(resolve_embedding_model(Some("eres2net")).filename, "eres2net-base-sv-3dspeaker-16k.onnx");
         assert_eq!(resolve_embedding_model(Some("bogus")).filename, "campplus-zh-en-advanced-16k.onnx");
         assert_eq!(resolve_embedding_model(None).filename, "campplus-zh-en-advanced-16k.onnx");
+    }
+
+    #[test]
+    fn routes_fluid_audio_only_when_available_and_falls_back_to_campplus() {
+        assert_eq!(
+            select_diarizer_route(Some("fluidAudio"), true),
+            DiarizerRoute::FluidAudio
+        );
+        assert_eq!(
+            select_diarizer_route(Some("fluidAudio"), false),
+            DiarizerRoute::Sherpa("campplus")
+        );
+        assert_eq!(
+            select_diarizer_route(Some("campplus"), true),
+            DiarizerRoute::Sherpa("campplus")
+        );
+        assert_eq!(
+            select_diarizer_route(Some("eres2net"), true),
+            DiarizerRoute::Sherpa("eres2net")
+        );
+        assert_eq!(
+            select_diarizer_route(None, true),
+            DiarizerRoute::Sherpa("campplus")
+        );
+        assert_eq!(
+            select_diarizer_route(Some("unknown"), true),
+            DiarizerRoute::Sherpa("campplus")
+        );
+    }
+
+    #[test]
+    fn effective_voiceprint_key_matches_actual_diarizer_used() {
+        assert_eq!(
+            effective_voiceprint_model_key(DiarizerRoute::FluidAudio, true),
+            "fluidAudio"
+        );
+        assert_eq!(
+            effective_voiceprint_model_key(DiarizerRoute::FluidAudio, false),
+            "campplus"
+        );
+        assert_eq!(
+            effective_voiceprint_model_key(DiarizerRoute::Sherpa("campplus"), false),
+            "campplus"
+        );
+        assert_eq!(
+            effective_voiceprint_model_key(DiarizerRoute::Sherpa("eres2net"), false),
+            "eres2net"
+        );
+    }
+
+    #[test]
+    fn gates_fluid_audio_model_list_entry_on_availability() {
+        let mut unavailable_list = Vec::new();
+        append_fluid_diarization_model(&mut unavailable_list, false);
+        assert!(unavailable_list.is_empty());
+
+        let mut available_list = Vec::new();
+        append_fluid_diarization_model(&mut available_list, true);
+        assert_eq!(available_list.len(), 1);
+        assert_eq!(available_list[0].key, "fluidAudio");
+        assert_eq!(
+            available_list[0].display_name,
+            "Speaker voices — Neural Engine (macOS, fastest)"
+        );
+        assert!(available_list[0].downloaded);
     }
 
     #[test]

@@ -41,11 +41,13 @@ export interface RecordingPreferences {
   preferred_system_device: string | null;
 }
 
+export type EmbeddingModelOption = 'campplus' | 'eres2net' | 'fluidAudio';
+
 export interface DiarizationSettings {
   enabled: boolean;
   numSpeakers: number | null;
   sensitivity: 'merge' | 'balanced' | 'split';
-  embeddingModel: 'campplus' | 'eres2net';
+  embeddingModel: EmbeddingModelOption;
 }
 
 /**

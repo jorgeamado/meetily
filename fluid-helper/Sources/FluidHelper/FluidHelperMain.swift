@@ -39,11 +39,17 @@ private final class StdoutResponseWriter: Sendable {
             StderrLogger.log("Failed to encode response")
             return
         }
+        writeRawJSONLine(jsonLine)
+    }
+
+    /// Returns false if the line could not be fully written.
+    @discardableResult
+    func writeRawJSONLine(_ jsonLine: String) -> Bool {
         let payload = Data((jsonLine + "\n").utf8)
         let fd = fileDescriptor
-        lock.withLock {
+        return lock.withLock {
             payload.withUnsafeBytes { rawBuffer in
-                guard let baseAddress = rawBuffer.baseAddress else { return }
+                guard let baseAddress = rawBuffer.baseAddress else { return false }
                 var offset = 0
                 while offset < rawBuffer.count {
                     let written = Darwin.write(
@@ -59,6 +65,7 @@ private final class StdoutResponseWriter: Sendable {
                         break
                     }
                 }
+                return offset == rawBuffer.count
             }
         }
     }
@@ -70,6 +77,14 @@ private enum StderrLogger {
 
     static func log(_ message: String) {
         let payload = Data(("[fluid-helper] " + message + "\n").utf8)
+        lock.withLock {
+            try? FileHandle.standardError.write(contentsOf: payload)
+        }
+    }
+
+    /// Emit a `diarize-helper`-compatible `PROGRESS <pct>` or `PROGRESS -1` line on `stderr`.
+    static func writeProgress(_ percent: Int) {
+        let payload = Data(("PROGRESS \(percent)\n").utf8)
         lock.withLock {
             try? FileHandle.standardError.write(contentsOf: payload)
         }
@@ -108,8 +123,67 @@ struct FluidHelperMain {
                 writer: writer
             )
 
+        case .diarize(let audioPath, let modelsDir, let numSpeakers):
+            await runDiarize(
+                audioPath: audioPath,
+                modelsDir: modelsDir,
+                numSpeakers: numSpeakers,
+                writer: writer
+            )
+
         case .protocolLoop:
             await runProtocolLoop(writer: writer)
+        }
+    }
+
+    private static func runDiarize(
+        audioPath: String,
+        modelsDir: String,
+        numSpeakers: Int?,
+        writer: StdoutResponseWriter
+    ) async {
+        StderrLogger.writeProgress(0)
+        let lastPercent = OSAllocatedUnfairLock(initialState: 0)
+        let reportMonotonicProgress: @Sendable (Int) -> Void = { candidate in
+            let clamped = min(99, max(0, candidate))
+            let shouldWrite = lastPercent.withLock { current -> Bool in
+                guard clamped > current else { return false }
+                current = clamped
+                return true
+            }
+            if shouldWrite {
+                StderrLogger.writeProgress(clamped)
+            }
+        }
+
+        let heartbeatTask = Task.detached {
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .seconds(2))
+                guard !Task.isCancelled else { return }
+                StderrLogger.writeProgress(-1)
+            }
+        }
+
+        do {
+            let output = try await FluidAudioDiarizer.diarize(
+                audioPath: audioPath,
+                modelsDir: modelsDir,
+                numSpeakers: numSpeakers,
+                onProgressPercent: reportMonotonicProgress
+            )
+            heartbeatTask.cancel()
+
+            let jsonLine = try ProtocolCodec.encodeDiarizeOutput(output)
+            StderrLogger.writeProgress(100)
+            guard writer.writeRawJSONLine(jsonLine) else {
+                StderrLogger.log("Diarization failed: could not write result to stdout")
+                Darwin.exit(1)
+            }
+            Darwin.exit(0)
+        } catch {
+            heartbeatTask.cancel()
+            StderrLogger.log("Diarization failed: \(ProtocolCodec.describeError(error))")
+            Darwin.exit(1)
         }
     }
 
@@ -226,6 +300,9 @@ struct FluidHelperMain {
 
               fluid-helper --transcribe <wav> [--version v3|ultra] [--models-dir <dir>]
                 One-shot mode: load model, transcribe <wav>, print single 'result' JSON line to stdout, and exit.
+
+              fluid-helper diarize --audio <16k mono wav> --models-dir <dir> [--num-speakers N]
+                One-shot diarization: run offline speaker diarization on <wav> and print a single JSON object to stdout.
             """
         StderrLogger.log(usage)
     }

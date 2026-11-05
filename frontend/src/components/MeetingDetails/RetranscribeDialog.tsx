@@ -25,7 +25,7 @@ import { useConfig } from '@/contexts/ConfigContext';
 import { LANGUAGES } from '@/constants/languages';
 import { useTranscriptionModels, ModelOption } from '@/hooks/useTranscriptionModels';
 import { isAutoLanguageOnlyProvider } from '@/lib/transcription-model-readiness';
-import { configService } from '@/services/configService';
+import { configService, EmbeddingModelOption } from '@/services/configService';
 import Analytics from '@/lib/analytics';
 
 interface RetranscribeDialogProps {
@@ -81,7 +81,7 @@ interface DiarizeOptions {
   enabled: boolean;
   numSpeakers: number | null;
   threshold: number | null;
-  embeddingModel: string | null;
+  embeddingModel: EmbeddingModelOption | null;
   llmRefine: boolean | null;
 }
 
@@ -113,9 +113,13 @@ export function RetranscribeDialog({
   const [diarizeEnabled, setDiarizeEnabled] = useState(true);
   const [numSpeakers, setNumSpeakers] = useState('');
   const [sensitivity, setSensitivity] = useState<SensitivityOption>('balanced');
-  const [embeddingModel, setEmbeddingModel] = useState<string>('campplus');
+  const [embeddingModel, setEmbeddingModel] = useState<EmbeddingModelOption>('campplus');
+  const [fluidAvailable, setFluidAvailable] = useState(false);
   const [llmRefine, setLlmRefine] = useState(true);
   const [llmRepair, setLlmRepair] = useState(true);
+
+  const effectiveEmbeddingModel: EmbeddingModelOption =
+    embeddingModel === 'fluidAudio' && !fluidAvailable ? 'campplus' : embeddingModel;
 
   // Use centralized model fetching hook
   const {
@@ -137,12 +141,21 @@ export function RetranscribeDialog({
   const prevOpenRef = useRef(false);
 
   const loadDiarizationDefaults = async () => {
+    const available = await invoke<boolean>('fluid_is_available')
+      .then((res) => Boolean(res))
+      .catch(() => false);
+    setFluidAvailable(available);
+
     try {
       const settings = await configService.getDiarizationSettings();
       setDiarizeEnabled(settings.enabled);
       setNumSpeakers(settings.numSpeakers != null ? String(settings.numSpeakers) : '');
       setSensitivity(settings.sensitivity);
-      setEmbeddingModel(settings.embeddingModel);
+      const resolvedModel: EmbeddingModelOption =
+        settings.embeddingModel === 'fluidAudio' && !available
+          ? 'campplus'
+          : settings.embeddingModel;
+      setEmbeddingModel(resolvedModel);
     } catch (err) {
       console.error('Failed to load diarization settings:', err);
       setDiarizeEnabled(true);
@@ -286,7 +299,7 @@ export function RetranscribeDialog({
         enabled: diarizeEnabled,
         numSpeakers: diarizeEnabled && parsedNumSpeakers && parsedNumSpeakers > 0 ? parsedNumSpeakers : null,
         threshold: diarizeEnabled ? SENSITIVITY_THRESHOLDS[sensitivity] : null,
-        embeddingModel: diarizeEnabled ? embeddingModel : null,
+        embeddingModel: diarizeEnabled ? effectiveEmbeddingModel : null,
         llmRefine: diarizeEnabled ? llmRefine : null,
       };
 
@@ -508,6 +521,26 @@ export function RetranscribeDialog({
                         <SelectItem value="split">Split-prone (more speakers)</SelectItem>
                       </SelectContent>
                     </Select>
+                  </div>
+                  <div className="space-y-1">
+                    <span className="text-xs font-medium">Speaker model</span>
+                    <Select value={effectiveEmbeddingModel} onValueChange={(v) => setEmbeddingModel(v as EmbeddingModelOption)}>
+                      <SelectTrigger className="w-full">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        <SelectItem value="campplus">Fast (recommended)</SelectItem>
+                        <SelectItem value="eres2net">Alternative (slower)</SelectItem>
+                        {fluidAvailable && (
+                          <SelectItem value="fluidAudio">Speaker voices — Neural Engine (macOS, fastest)</SelectItem>
+                        )}
+                      </SelectContent>
+                    </Select>
+                    {effectiveEmbeddingModel === 'fluidAudio' && (
+                      <p className="text-xs text-muted-foreground">
+                        Uses a separate voice library: speakers named with the standard model need naming once more.
+                      </p>
+                    )}
                   </div>
                   <div className="flex items-center justify-between gap-2">
                     <div className="space-y-0.5">

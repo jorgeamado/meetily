@@ -381,6 +381,7 @@ public actor ProtocolSession {
 public enum CLIOptions: Sendable, Equatable {
     case protocolLoop
     case oneShot(wavPath: String, version: ModelVersion, modelsDir: String)
+    case diarize(audioPath: String, modelsDir: String, numSpeakers: Int?)
     case help
 
     public static let defaultModelsRelativePath = "Library/Application Support/com.meetily.ai/models/fluidaudio"
@@ -418,6 +419,10 @@ public enum CLIOptions: Sendable, Equatable {
 
         if arguments.contains("--help") || arguments.contains("-h") {
             return .help
+        }
+
+        if arguments.first == "diarize" {
+            return try parseDiarize(arguments: Array(arguments.dropFirst()))
         }
 
         var wavPath: String?
@@ -471,5 +476,69 @@ public enum CLIOptions: Sendable, Equatable {
         }
 
         return .oneShot(wavPath: resolvedWavPath, version: version, modelsDir: modelsDir)
+    }
+
+    private static func parseDiarize(arguments: [String]) throws -> CLIOptions {
+        var audioPath: String?
+        var modelsDir: String?
+        var numSpeakers: Int?
+
+        var index = 0
+        while index < arguments.count {
+            let arg = arguments[index]
+            switch arg {
+            case "--audio":
+                guard index + 1 < arguments.count else {
+                    throw ProtocolError.missingField("--audio")
+                }
+                let candidate = arguments[index + 1].trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !candidate.isEmpty, !candidate.hasPrefix("--") else {
+                    throw ProtocolError.invalidField(field: "--audio", reason: "requires a WAV file path")
+                }
+                audioPath = (candidate as NSString).expandingTildeInPath
+                index += 2
+
+            case "--models-dir":
+                guard index + 1 < arguments.count else {
+                    throw ProtocolError.missingField("--models-dir")
+                }
+                let rawDir = arguments[index + 1].trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !rawDir.isEmpty, !rawDir.hasPrefix("--") else {
+                    throw ProtocolError.invalidField(field: "--models-dir", reason: "requires a directory path")
+                }
+                modelsDir = (rawDir as NSString).expandingTildeInPath
+                index += 2
+
+            case "--num-speakers":
+                guard index + 1 < arguments.count else {
+                    throw ProtocolError.missingField("--num-speakers")
+                }
+                let rawNum = arguments[index + 1].trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let parsed = Int(rawNum), parsed > 0 else {
+                    throw ProtocolError.invalidField(
+                        field: "--num-speakers",
+                        reason: "must be a positive integer"
+                    )
+                }
+                numSpeakers = parsed
+                index += 2
+
+            default:
+                throw ProtocolError.invalidField(field: arg, reason: "unknown command-line argument")
+            }
+        }
+
+        guard let resolvedAudioPath = audioPath else {
+            throw ProtocolError.missingField("--audio")
+        }
+        guard let resolvedModelsDir = modelsDir else {
+            throw ProtocolError.missingField("--models-dir")
+        }
+
+        return .diarize(
+            audioPath: resolvedAudioPath,
+            modelsDir: resolvedModelsDir,
+            numSpeakers: numSpeakers
+        )
     }
 }

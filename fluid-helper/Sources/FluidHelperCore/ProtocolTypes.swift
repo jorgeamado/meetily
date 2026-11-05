@@ -389,6 +389,17 @@ public enum ProtocolCodec {
         return line
     }
 
+    /// Encode a `DiarizeOutput` as a compact single-line UTF-8 JSON string (without trailing newline).
+    public static func encodeDiarizeOutput(_ output: DiarizeOutput) throws -> String {
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.withoutEscapingSlashes]
+        let data = try encoder.encode(output)
+        guard let line = String(data: data, encoding: .utf8) else {
+            throw ProtocolError.malformedJSON("Failed to encode diarize output as UTF-8")
+        }
+        return line
+    }
+
     /// Format any `Error` into a human-readable message suitable for `Response.error`.
     public static func describeError(_ error: Error) -> String {
         if let protocolError = error as? ProtocolError, let description = protocolError.errorDescription {
@@ -418,5 +429,189 @@ public enum ProtocolCodec {
         @unknown default:
             return error.localizedDescription
         }
+    }
+}
+
+// MARK: - One-Shot Diarization Output Types
+
+/// Raw speaker turn produced by FluidAudio's offline diarizer prior to index mapping and centroid computation.
+public struct RawSpeakerSegment: Sendable, Equatable {
+    public let speakerId: String
+    public let startTimeSeconds: Float
+    public let endTimeSeconds: Float
+    public let embedding: [Float]
+
+    public init(
+        speakerId: String,
+        startTimeSeconds: Float,
+        endTimeSeconds: Float,
+        embedding: [Float]
+    ) {
+        self.speakerId = speakerId
+        self.startTimeSeconds = startTimeSeconds
+        self.endTimeSeconds = endTimeSeconds
+        self.embedding = embedding
+    }
+}
+
+/// Diarized speech segment in the `diarize-helper` stdout JSON format.
+public struct DiarizeSegmentItem: Codable, Sendable, Equatable {
+    public let start: Float
+    public let end: Float
+    public let speaker: Int
+    public let voice: Bool
+
+    public init(start: Float, end: Float, speaker: Int, voice: Bool = false) {
+        self.start = start
+        self.end = end
+        self.speaker = speaker
+        self.voice = voice
+    }
+}
+
+/// Per-speaker L2-normalised centroid in the `diarize-helper` stdout JSON format.
+public struct DiarizeCentroidItem: Codable, Sendable, Equatable {
+    public let speaker: Int
+    public let cleanSecs: Float
+    public let embedding: [Float]
+
+    private enum CodingKeys: String, CodingKey {
+        case speaker
+        case cleanSecs = "clean_secs"
+        case embedding
+    }
+
+    public init(speaker: Int, cleanSecs: Float, embedding: [Float]) {
+        self.speaker = speaker
+        self.cleanSecs = cleanSecs
+        self.embedding = embedding
+    }
+}
+
+/// Top-level stdout JSON object emitted by `fluid-helper diarize`.
+public struct DiarizeOutput: Codable, Sendable, Equatable {
+    public let segments: [DiarizeSegmentItem]
+    public let numSpeakers: Int
+    public let centroids: [DiarizeCentroidItem]
+
+    private enum CodingKeys: String, CodingKey {
+        case segments
+        case numSpeakers = "num_speakers"
+        case centroids
+    }
+
+    public init(
+        segments: [DiarizeSegmentItem],
+        numSpeakers: Int,
+        centroids: [DiarizeCentroidItem]
+    ) {
+        self.segments = segments
+        self.numSpeakers = numSpeakers
+        self.centroids = centroids
+    }
+}
+
+/// Pure post-processing for converting raw FluidAudio segments into the `diarize-helper` output schema.
+public enum DiarizationPostProcessor {
+    /// Sort segments by start time, map `speakerId` strings to 0-based integers in order of first appearance,
+    /// and compute duration-weighted L2-normalised centroids per speaker.
+    public static func buildOutput(from rawSegments: [RawSpeakerSegment]) -> DiarizeOutput {
+        guard !rawSegments.isEmpty else {
+            return DiarizeOutput(segments: [], numSpeakers: 0, centroids: [])
+        }
+
+        let sortedIndexed = rawSegments.enumerated().sorted { lhs, rhs in
+            if lhs.element.startTimeSeconds != rhs.element.startTimeSeconds {
+                return lhs.element.startTimeSeconds < rhs.element.startTimeSeconds
+            }
+            if lhs.element.endTimeSeconds != rhs.element.endTimeSeconds {
+                return lhs.element.endTimeSeconds < rhs.element.endTimeSeconds
+            }
+            return lhs.offset < rhs.offset
+        }
+
+        var speakerIndexById: [String: Int] = [:]
+        var nextSpeakerIndex = 0
+        var mappedSegments: [DiarizeSegmentItem] = []
+        mappedSegments.reserveCapacity(sortedIndexed.count)
+
+        var segmentsBySpeaker: [[RawSpeakerSegment]] = []
+
+        for (_, raw) in sortedIndexed {
+            let speakerIdx: Int
+            if let existing = speakerIndexById[raw.speakerId] {
+                speakerIdx = existing
+            } else {
+                speakerIdx = nextSpeakerIndex
+                speakerIndexById[raw.speakerId] = speakerIdx
+                nextSpeakerIndex += 1
+                segmentsBySpeaker.append([])
+            }
+
+            mappedSegments.append(
+                DiarizeSegmentItem(
+                    start: raw.startTimeSeconds,
+                    end: raw.endTimeSeconds,
+                    speaker: speakerIdx,
+                    voice: false
+                )
+            )
+            segmentsBySpeaker[speakerIdx].append(raw)
+        }
+
+        var centroids: [DiarizeCentroidItem] = []
+        centroids.reserveCapacity(nextSpeakerIndex)
+
+        for speakerIdx in 0..<nextSpeakerIndex {
+            let speakerSegments = segmentsBySpeaker[speakerIdx]
+            var cleanSecs: Float = 0.0
+            var weightedSum: [Float] = []
+            var weightedDuration: Float = 0.0
+
+            for segment in speakerSegments {
+                let duration = max(0.0, segment.endTimeSeconds - segment.startTimeSeconds)
+                cleanSecs += duration
+
+                guard duration > 0.0, !segment.embedding.isEmpty, segment.embedding.allSatisfy(\.isFinite) else {
+                    continue
+                }
+
+                if weightedSum.isEmpty {
+                    weightedSum = segment.embedding.map { $0 * duration }
+                    weightedDuration = duration
+                } else if segment.embedding.count == weightedSum.count {
+                    for index in 0..<weightedSum.count {
+                        weightedSum[index] += segment.embedding[index] * duration
+                    }
+                    weightedDuration += duration
+                }
+            }
+
+            guard !weightedSum.isEmpty, weightedDuration > 0.0 else {
+                continue
+            }
+
+            let mean = weightedSum.map { $0 / weightedDuration }
+            let squaredNorm = mean.reduce(Float(0.0)) { $0 + $1 * $1 }
+            let norm = squaredNorm.squareRoot()
+            guard norm > 1e-6 else {
+                continue
+            }
+
+            let normalized = mean.map { $0 / norm }
+            centroids.append(
+                DiarizeCentroidItem(
+                    speaker: speakerIdx,
+                    cleanSecs: cleanSecs,
+                    embedding: normalized
+                )
+            )
+        }
+
+        return DiarizeOutput(
+            segments: mappedSegments,
+            numSpeakers: nextSpeakerIndex,
+            centroids: centroids
+        )
     }
 }

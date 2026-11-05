@@ -804,6 +804,174 @@ struct FluidHelperCoreTests {
         #expect(tracker.isIdleExpired(timeoutSeconds: 10, now: t0.advanced(by: .seconds(110))))
     }
 
+    // MARK: - Diarize CLI Parsing & Post-Processing Tests
+
+    @Test("Diarize CLI subcommand parsing and validation")
+    func diarizeCLIParsing() throws {
+        let diarizeAuto = try CLIOptions.parse(
+            arguments: ["diarize", "--audio", "/tmp/meeting.wav", "--models-dir", "/tmp/diar-models"]
+        )
+        #expect(
+            diarizeAuto
+                == .diarize(
+                    audioPath: "/tmp/meeting.wav",
+                    modelsDir: "/tmp/diar-models",
+                    numSpeakers: nil
+                )
+        )
+
+        let diarizeFixedSpeakers = try CLIOptions.parse(
+            arguments: [
+                "diarize",
+                "--audio", "/tmp/meeting.wav",
+                "--models-dir", "/tmp/diar-models",
+                "--num-speakers", "3",
+            ]
+        )
+        #expect(
+            diarizeFixedSpeakers
+                == .diarize(
+                    audioPath: "/tmp/meeting.wav",
+                    modelsDir: "/tmp/diar-models",
+                    numSpeakers: 3
+                )
+        )
+
+        #expect(throws: ProtocolError.missingField("--audio")) {
+            _ = try CLIOptions.parse(arguments: ["diarize", "--models-dir", "/tmp/diar-models"])
+        }
+
+        #expect(throws: ProtocolError.missingField("--models-dir")) {
+            _ = try CLIOptions.parse(arguments: ["diarize", "--audio", "/tmp/meeting.wav"])
+        }
+
+        #expect(
+            throws: ProtocolError.invalidField(
+                field: "--num-speakers",
+                reason: "must be a positive integer"
+            )
+        ) {
+            _ = try CLIOptions.parse(
+                arguments: [
+                    "diarize",
+                    "--audio", "/tmp/meeting.wav",
+                    "--models-dir", "/tmp/diar-models",
+                    "--num-speakers", "0",
+                ]
+            )
+        }
+
+        #expect(
+            throws: ProtocolError.invalidField(
+                field: "--num-speakers",
+                reason: "must be a positive integer"
+            )
+        ) {
+            _ = try CLIOptions.parse(
+                arguments: [
+                    "diarize",
+                    "--audio", "/tmp/meeting.wav",
+                    "--models-dir", "/tmp/diar-models",
+                    "--num-speakers", "abc",
+                ]
+            )
+        }
+
+        #expect(
+            throws: ProtocolError.invalidField(
+                field: "--bogus",
+                reason: "unknown command-line argument"
+            )
+        ) {
+            _ = try CLIOptions.parse(
+                arguments: [
+                    "diarize",
+                    "--audio", "/tmp/meeting.wav",
+                    "--models-dir", "/tmp/diar-models",
+                    "--bogus",
+                ]
+            )
+        }
+    }
+
+    @Test("Diarization speaker-id mapping, duration-weighted L2-normalised centroids, and JSON output encoding")
+    func diarizationPostProcessingAndEncoding() throws {
+        // Empty input produces empty output.
+        let emptyOutput = DiarizationPostProcessor.buildOutput(from: [])
+        #expect(emptyOutput == DiarizeOutput(segments: [], numSpeakers: 0, centroids: []))
+
+        // Input segments out of chronological order:
+        // - "S2" appears earliest at [0.5, 1.5] (duration 1.0, embedding [3, 0]) and later at [4.0, 7.0] (duration 3.0, embedding [0, 4])
+        //   Weighted mean for "S2": (1.0 * [3, 0] + 3.0 * [0, 4]) / 4.0 = [0.75, 3.0]
+        //   L2 norm of [3, 12] is sqrt(9 + 144) = sqrt(153); let's use exact 3-4-5 triangle weights:
+        //   Segment 1 for "S2": [0.5, 1.5] (duration 1.0), embedding [3.0, 0.0]
+        //   Segment 2 for "S2": [4.0, 6.0] (duration 2.0), embedding [0.0, 2.0]
+        //   Duration-weighted sum = 1.0 * [3, 0] + 2.0 * [0, 2] = [3.0, 4.0]
+        //   Duration-weighted mean = [1.0, 4.0/3.0], L2-normalised = [0.6, 0.8], clean_secs = 3.0.
+        // - "S1" appears second at [2.0, 3.5] (duration 1.5, embedding [0.0, -5.0])
+        //   L2-normalised = [0.0, -1.0], clean_secs = 1.5.
+        let rawSegments = [
+            RawSpeakerSegment(
+                speakerId: "S1",
+                startTimeSeconds: 2.0,
+                endTimeSeconds: 3.5,
+                embedding: [0.0, -5.0]
+            ),
+            RawSpeakerSegment(
+                speakerId: "S2",
+                startTimeSeconds: 4.0,
+                endTimeSeconds: 6.0,
+                embedding: [0.0, 2.0]
+            ),
+            RawSpeakerSegment(
+                speakerId: "S2",
+                startTimeSeconds: 0.5,
+                endTimeSeconds: 1.5,
+                embedding: [3.0, 0.0]
+            ),
+        ]
+
+        let output = DiarizationPostProcessor.buildOutput(from: rawSegments)
+        #expect(output.numSpeakers == 2)
+        #expect(
+            output.segments == [
+                DiarizeSegmentItem(start: 0.5, end: 1.5, speaker: 0, voice: false),
+                DiarizeSegmentItem(start: 2.0, end: 3.5, speaker: 1, voice: false),
+                DiarizeSegmentItem(start: 4.0, end: 6.0, speaker: 0, voice: false),
+            ]
+        )
+
+        #expect(output.centroids.count == 2)
+        #expect(output.centroids[0].speaker == 0)
+        #expect(abs(output.centroids[0].cleanSecs - 3.0) < 1e-5)
+        #expect(output.centroids[0].embedding.count == 2)
+        #expect(abs(output.centroids[0].embedding[0] - 0.6) < 1e-5)
+        #expect(abs(output.centroids[0].embedding[1] - 0.8) < 1e-5)
+
+        #expect(output.centroids[1].speaker == 1)
+        #expect(abs(output.centroids[1].cleanSecs - 1.5) < 1e-5)
+        #expect(output.centroids[1].embedding.count == 2)
+        #expect(abs(output.centroids[1].embedding[0] - 0.0) < 1e-5)
+        #expect(abs(output.centroids[1].embedding[1] - (-1.0)) < 1e-5)
+
+        // Verify JSON schema matches diarize-helper output format.
+        let jsonLine = try ProtocolCodec.encodeDiarizeOutput(output)
+        let obj = try parseJSONObject(jsonLine)
+        #expect(Set(obj.keys) == Set(["segments", "num_speakers", "centroids"]))
+        #expect(obj["num_speakers"] as? Int == 2)
+
+        let segmentsArray = try #require(obj["segments"] as? [[String: Any]])
+        #expect(segmentsArray.count == 3)
+        #expect(Set(segmentsArray[0].keys) == Set(["start", "end", "speaker", "voice"]))
+        #expect(segmentsArray[0]["speaker"] as? Int == 0)
+        #expect(segmentsArray[0]["voice"] as? Bool == false)
+
+        let centroidsArray = try #require(obj["centroids"] as? [[String: Any]])
+        #expect(centroidsArray.count == 2)
+        #expect(Set(centroidsArray[0].keys) == Set(["speaker", "clean_secs", "embedding"]))
+        #expect(centroidsArray[0]["speaker"] as? Int == 0)
+    }
+
     // MARK: - Helpers
 
     private func parseJSONObject(_ jsonLine: String) throws -> [String: Any] {
