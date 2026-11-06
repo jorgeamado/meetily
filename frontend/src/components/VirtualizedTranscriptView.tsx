@@ -295,8 +295,12 @@ export const VirtualizedTranscriptView: React.FC<VirtualizedTranscriptViewProps>
                     >
                         {virtualizer.getVirtualItems().map((virtualRow) => {
                             const segment = segments[virtualRow.index];
+                            // The virtualizer can lag one render behind when the list
+                            // shrinks (e.g. a ~170-row retranscription preview swapped for
+                            // the first 100-row page), handing out indices past the end
+                            if (!segment) return null;
                             const isStreaming = streamingSegmentId === segment.id;
-                            const previousSpeaker = virtualRow.index > 0 ? segments[virtualRow.index - 1].speaker : undefined;
+                            const previousSpeaker = virtualRow.index > 0 ? segments[virtualRow.index - 1]?.speaker : undefined;
 
                             return (
                                 <div
