@@ -54,6 +54,20 @@ export function SpeakerNameControl({
 
   const labelClass = `text-[10px] font-semibold uppercase tracking-wide ${getSpeakerColorClass(speaker)}`;
 
+  // Before any early return: hooks must run in the same order every render.
+  // A label can render without cluster info first (transcript rows refetched
+  // before speakers_overview) and gain it on the next render.
+  const rankedVoices = useMemo(() => {
+    const candidates = cluster?.candidates ?? [];
+    const display = cluster?.display.toLowerCase() ?? '';
+    const byName = new Map(candidates.map((c) => [c.name.toLowerCase(), c.strength]));
+    const named = candidates.filter((c) => c.strength !== 'weak').map((c) => c.name);
+    const rest = knownVoices.filter(
+      (n) => !named.some((m) => m.toLowerCase() === n.toLowerCase()) && n.toLowerCase() !== display
+    );
+    return { named, rest, strengthOf: (n: string) => byName.get(n.toLowerCase()) };
+  }, [cluster, knownVoices]);
+
   // Non-interactive cases: "You" (mic identity), no cluster info (old
   // meeting without speakers.json), or no meeting context.
   if (!cluster || speaker === 'You') {
@@ -66,15 +80,6 @@ export function SpeakerNameControl({
 
   const isNamed = cluster.source !== 'none';
   const suggestion = cluster.suggestion ?? null;
-
-  const rankedVoices = useMemo(() => {
-    const byName = new Map(cluster.candidates.map((c) => [c.name.toLowerCase(), c.strength]));
-    const named = cluster.candidates.filter((c) => c.strength !== 'weak').map((c) => c.name);
-    const rest = knownVoices.filter(
-      (n) => !named.some((m) => m.toLowerCase() === n.toLowerCase()) && n.toLowerCase() !== cluster.display.toLowerCase()
-    );
-    return { named, rest, strengthOf: (n: string) => byName.get(n.toLowerCase()) };
-  }, [cluster, knownVoices]);
 
   const apply = async (name: string, remember: boolean) => {
     const trimmed = name.trim();
